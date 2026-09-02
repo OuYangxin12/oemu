@@ -86,11 +86,15 @@ include/oemu/         Public headers. Consumers see only these.
   allocator.h         pluggable allocator (the test seam)
   check.h             OEMU_REQUIRE fatal contract macro
   buffer.h            worked example: growable byte buffer
+  regs.h              AArch64 register state: X0-X30, SP, PC, NZCV
 src/
   core/               status, version, allocator, check
   buffer/
     buffer.c          implementation
     buffer_internal.h internal interface, exposed for white-box tests
+  regs/
+    regs.c            register state, condition codes, flag derivation
+    regs_internal.h   pure helpers: truncation, cond table, AddWithCarry
   main.c              demo executable
 tests/
   support/            shared test doubles (tracking + failing allocators)

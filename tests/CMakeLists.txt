@@ -125,6 +125,11 @@ oemu_add_test(test_buffer
   LABELS unit
 )
 
+oemu_add_test(test_regs
+  SOURCES unit/test_regs.cpp
+  LABELS unit
+)
+
 # Death tests are separated out: they fork/re-exec and are slower, so a
 # developer can skip them with `ctest -LE death`.
 oemu_add_test(test_check
@@ -132,9 +137,23 @@ oemu_add_test(test_check
   LABELS "unit;death"
 )
 
+# Also death tests for the regs module.
+oemu_add_test(test_regs_check
+  SOURCES unit/test_regs_check.cpp
+  LABELS "unit;death"
+)
+
 # Reaches into src/buffer/buffer_internal.h to test the growth policy directly.
 oemu_add_test(test_buffer_internal
   SOURCES unit/test_buffer_internal.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
+# Reaches into src/regs/regs_internal.h: exhaustive condition-code table and the
+# carry/overflow derivation.
+oemu_add_test(test_regs_internal
+  SOURCES unit/test_regs_internal.cpp
   INTERNAL
   LABELS "unit;whitebox"
 )
@@ -154,6 +173,9 @@ add_dependencies(check
   test_buffer
   test_check
   test_buffer_internal
+  test_regs
+  test_regs_check
+  test_regs_internal
 )
 
 # Registers the `coverage` target now that the test targets exist.

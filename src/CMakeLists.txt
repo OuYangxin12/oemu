@@ -7,11 +7,13 @@ add_library(oemu
   core/status.c
   core/version.c
   buffer/buffer.c
+  regs/regs.c
 )
 
 # Internal headers, listed so IDEs pick them up.
 target_sources(oemu PRIVATE
   buffer/buffer_internal.h
+  regs/regs_internal.h
 )
 
 target_include_directories(oemu
@@ -22,6 +24,8 @@ target_include_directories(oemu
   PRIVATE
     # Lets buffer.c say #include "buffer_internal.h".
     ${CMAKE_CURRENT_SOURCE_DIR}/buffer
+    # Likewise for regs.c and "regs_internal.h".
+    ${CMAKE_CURRENT_SOURCE_DIR}/regs
 )
 
 target_link_libraries(oemu PUBLIC oemu_compiler_flags)
