@@ -130,6 +130,11 @@ oemu_add_test(test_regs
   LABELS unit
 )
 
+oemu_add_test(test_decode
+  SOURCES unit/test_decode.cpp
+  LABELS unit
+)
+
 # Death tests are separated out: they fork/re-exec and are slower, so a
 # developer can skip them with `ctest -LE death`.
 oemu_add_test(test_check
@@ -158,6 +163,14 @@ oemu_add_test(test_regs_internal
   LABELS "unit;whitebox"
 )
 
+# Reaches into src/decode/decode_internal.h: sign-extension at every encoded
+# width, and DecodeBitMasks swept across its whole input space.
+oemu_add_test(test_decode_internal
+  SOURCES unit/test_decode_internal.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.
@@ -176,6 +189,8 @@ add_dependencies(check
   test_regs
   test_regs_check
   test_regs_internal
+  test_decode
+  test_decode_internal
 )
 
 # Registers the `coverage` target now that the test targets exist.
