@@ -1,11 +1,55 @@
 # oemu
 
-Infrastructure skeleton for a pure C11 project, centred on a local GoogleTest
-harness.
+An emulator for the **ARMv8-A AArch64 user-mode subset**, built on a pure C11
+core with a local GoogleTest harness.
 
 Production code is C11 with hidden visibility and no C++ dependency. Only the
 test translation units are C++17, linking against the C library through
 `extern "C"` declarations.
+
+## Emulation target
+
+ARM is not one instruction set but a family: several architecture generations,
+three profiles (A/R/M), and three distinct encodings (A32, T32/Thumb, A64).
+Picking a subset up front is what keeps the decoder tractable, so oemu commits
+to exactly one:
+
+| Axis | Choice |
+| --- | --- |
+| Architecture | ARMv8-A (the 64-bit baseline, v8.0) |
+| Profile | A — Application |
+| Encoding | **A64 only** — fixed 32-bit instructions |
+| Privilege | EL0 (user mode) only |
+| Register width | 64-bit `X0`–`X30`, `SP`, `PC`, `NZCV` |
+| Memory model | little-endian, flat address space |
+
+### In scope
+
+- The A64 base integer instruction set: data processing (immediate, register,
+  shifted/extended), loads and stores including the addressing modes and
+  pair/exclusive forms, branches, conditional selects, and the `NZCV` flag
+  semantics.
+- `SVC`-based system-call entry, so a static user-mode binary can make
+  progress against a host-provided syscall layer.
+
+### Out of scope
+
+Deliberately excluded, because each one multiplies decoder and state size
+without changing the core design:
+
+- **A32 and T32/Thumb.** A64 is a separate encoding; supporting the 32-bit
+  ones means a second decoder, not an extension of the first. Interworking
+  (`AArch32` execution state) is therefore absent too.
+- **EL1–EL3, MMU, TrustZone, virtualisation.** User mode needs no page tables,
+  exception levels, or secure world.
+- **Optional extensions:** AdvSIMD/NEON, floating point, SVE/SVE2, SME,
+  Crypto, Pointer Authentication, MTE, and the v8.1+ / v9 feature increments.
+- **Self-modifying code and cache maintenance semantics.** Instruction-cache
+  coherency operations are accepted and ignored rather than modelled.
+
+Anything outside the subset must be reported as an `oemu_status` decode or
+unimplemented-instruction error, never silently executed as something else.
+Extensions can be added later; none of them may be assumed present today.
 
 ## Requirements
 
