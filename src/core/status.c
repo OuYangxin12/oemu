@@ -12,6 +12,10 @@ const char *oemu_status_str(oemu_status status) {
       return "size overflow";
     case OEMU_ERR_RANGE:
       return "out of range";
+    case OEMU_ERR_DECODE:
+      return "undefined instruction encoding";
+    case OEMU_ERR_UNSUPPORTED:
+      return "instruction outside the emulated subset";
     default:
       break;
   }
