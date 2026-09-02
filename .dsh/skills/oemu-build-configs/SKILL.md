@@ -45,7 +45,7 @@ Use `make <target> PRESET=<preset>` to point a target at another preset.
 ## Verification expectation
 
 All five test-running presets must report `100% tests passed` (84 cases).
-Coverage is ~93%.
+Coverage is 95.8% of lines and 100% of functions.
 
 Run `make test` **and** `make asan` before claiming a change works. For
 allocation, lifetime, or arithmetic changes, ASan is mandatory. Run `make clang`
@@ -134,9 +134,9 @@ make coverage-summary   # per-file text summary; needs only gcov
 make coverage           # HTML in build/coverage/coverage-html; needs lcov
 ```
 
-`lcov` is not installed in this environment, so `make coverage` fails with an
-explicit install hint. Use `coverage-summary` and report those numbers instead
-of claiming an HTML report exists.
+Both work here (lcov 2.0). Current numbers: **95.8% lines, 100% functions,
+93.2% branches**. The two paths must agree on the line count — a mismatch means
+one of them is filtering differently.
 
 `cmake/GcovSummary.cmake` runs in CMake script mode, invokes `gcov` per `.gcda`,
 and filters to `src/` and `include/` so system headers, GoogleTest and the test
@@ -144,6 +144,17 @@ files do not dilute the result.
 
 Coverage builds force `-O0 -fno-inline` for accurate line mapping, so those
 numbers say nothing about optimised behaviour.
+
+### A function that aborts reads as 0% unless it dumps counters
+
+`abort()` terminates the process abnormally, so the gcov runtime never writes its
+counters. `oemu_check_fail` therefore reported **0% despite being exercised by
+all 8 death tests**, and dragged function coverage down to 95.7%.
+
+The fix, in `src/core/check.c`, is to call `__gcov_dump()` immediately before
+`abort()`, guarded by `OEMU_COVERAGE`. Note that **GCC defines no macro of its
+own for `--coverage`** — `cmake/Coverage.cmake` has to define one explicitly.
+Any future function that terminates the process needs the same treatment.
 
 Low coverage in a file whose logic is exercised indirectly usually means a
 default implementation was replaced by a test double — `src/core/allocator.c`

@@ -194,6 +194,14 @@ make coverage-summary   # per-file text summary; needs only gcov
 make coverage           # HTML report in build/coverage/coverage-html; needs lcov
 ```
 
+Current: **95.8% of lines, 100% of functions, 93.2% of branches.**
+
+One wrinkle worth knowing if you add a function that terminates the process:
+`abort()` prevents the gcov runtime from writing its counters, so such a function
+reports 0% even when death tests cover it thoroughly. `src/core/check.c` calls
+`__gcov_dump()` before aborting, guarded by `OEMU_COVERAGE` — a macro
+`cmake/Coverage.cmake` has to define because GCC provides none for `--coverage`.
+
 ## Code quality
 
 ```bash

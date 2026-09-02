@@ -219,6 +219,13 @@ Death tests belong in their own file, labelled `death`, with
 `::testing::FLAGS_gtest_death_test_style = "threadsafe"` set in `SetUp` — the
 default `fast` style can report spurious leaks from the aborted child under ASan.
 
+**A function that terminates the process must flush gcov counters.** `abort()`
+ends the process abnormally, so the coverage runtime never writes its data and
+the function reads as 0% even when every death test exercises it. Follow
+`src/core/check.c`: call `__gcov_dump()` immediately before `abort()`, guarded by
+`#if defined(OEMU_COVERAGE)`. GCC defines no macro of its own for `--coverage`,
+which is why `cmake/Coverage.cmake` defines that one.
+
 ## Registering the module
 
 `src/CMakeLists.txt`:

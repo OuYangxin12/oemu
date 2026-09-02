@@ -57,11 +57,11 @@ Two environment problems are already solved in the build files; do not
 - **conda shadows the system GoogleTest.** `CONDA_PREFIX` is added to `CMAKE_IGNORE_PREFIX_PATH` in the top-level `CMakeLists.txt`. Configure output names the selected GoogleTest; it must be the one under `/usr/lib`.
 - **TSan aborts under Linux 6.x ASLR.** `cmake/Sanitizers.cmake` routes test binaries through `setarch -R` via `CROSSCOMPILING_EMULATOR`.
 
-`lcov` is **not installed** in this environment, so `make coverage` (HTML) fails;
-`make coverage-summary` works with plain gcov. `clang-format` and `clang-tidy`
-are available, so `make format-check` and `make tidy` must both be clean before
-you push — CI's `lint` job runs exactly those. Do not report a result you could
-not actually produce.
+`lcov`, `clang-format` and `clang-tidy` are all available. `make format-check`
+and `make tidy` must both be clean before you push — CI's `lint` job runs exactly
+those. `make coverage` produces the HTML report; `make coverage-summary` is the
+lighter gcov-only alternative. Do not report a result you could not actually
+produce.
 
 ## Style
 

@@ -15,6 +15,11 @@ function(oemu_enable_coverage target)
   target_compile_options(${target} INTERFACE --coverage -O0 -g -fno-inline)
   target_link_options(${target} INTERFACE --coverage)
 
+  # GCC defines no macro of its own for --coverage, so code that needs to know
+  # (see oemu_check_fail, which must flush counters before abort()) relies on
+  # this one.
+  target_compile_definitions(${target} INTERFACE OEMU_COVERAGE=1)
+
   message(STATUS "oemu: coverage instrumentation enabled")
 endfunction()
 
