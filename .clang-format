@@ -1,0 +1,66 @@
+# Based on Google style, adjusted for a C project.
+# Run `make format` to apply, `make format-check` to verify.
+---
+Language: Cpp
+BasedOnStyle: Google
+
+ColumnLimit: 96
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+ContinuationIndentWidth: 4
+
+# C code reads better with pointers bound to the name: `char *p`.
+DerivePointerAlignment: false
+PointerAlignment: Right
+
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+
+# Braces are mandatory in this codebase; never let clang-format hide that.
+InsertBraces: true
+
+AlignAfterOpenBracket: Align
+AlignConsecutiveMacros: Consecutive
+AlignEscapedNewlines: Left
+AlignTrailingComments: true
+
+BinPackArguments: true
+BinPackParameters: true
+
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive
+IncludeCategories:
+  # The module's own header comes first (Google convention).
+  - Regex: '^"oemu/[a-z_]+\.h"$'
+    Priority: 1
+  # C standard library.
+  - Regex: '^<(assert|ctype|errno|inttypes|limits|stdarg|stdbool|stddef|stdint|stdio|stdlib|string|time)\.h>$'
+    Priority: 2
+  # C++ standard library (test files only).
+  - Regex: '^<c[a-z]+>$'
+    Priority: 3
+  - Regex: '^<[a-z_]+>$'
+    Priority: 3
+  # Third-party, e.g. gtest.
+  - Regex: '^<gtest/|^<gmock/'
+    Priority: 4
+  # Project-local quoted includes.
+  - Regex: '^"'
+    Priority: 5
+  - Regex: '.*'
+    Priority: 6
+
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+SpacesInParentheses: false
+
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+
+ReflowComments: true
+---
+# Test translation units are C++; keep them consistent with the C style above.
+Language: Cpp

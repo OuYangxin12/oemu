@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Matrix over compiler and configuration. Runs exactly the same commands a
+  # developer runs locally: cmake --preset ... && ctest --preset ...
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc-debug
+            preset: debug
+          - name: clang-debug
+            preset: clang
+          - name: release
+            preset: release
+          - name: asan-ubsan
+            preset: asan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libgtest-dev libgmock-dev clang
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build build/${{ matrix.preset }} --parallel
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} --parallel 2
+        env:
+          # Make sanitizer findings fail the job loudly.
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libgtest-dev libgmock-dev lcov
+
+      - name: Configure and build
+        run: |
+          cmake --preset coverage
+          cmake --build build/coverage --parallel
+
+      - name: Generate coverage report
+        run: cmake --build build/coverage --target coverage
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: build/coverage/coverage-html
+          if-no-files-found: error
+
+  lint:
+    name: format and static analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libgtest-dev libgmock-dev clang-format clang-tidy
+
+      - name: Check formatting
+        run: make format-check
+
+      - name: Configure for clang-tidy
+        run: cmake --preset debug
+
+      - name: Run clang-tidy
+        run: clang-tidy -p build/debug $(find src -name '*.c')

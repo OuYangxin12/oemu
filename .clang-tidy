@@ -1,0 +1,51 @@
+# clang-tidy configuration for the C sources.
+# Run with `make tidy` (requires compile_commands.json, which `make compile-db`
+# links into the project root).
+---
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-function-cognitive-complexity,
+  -readability-isolate-declaration,
+  -bugprone-easily-swappable-parameters,
+  -misc-include-cleaner,
+  -cert-err33-c,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+
+# Only our own headers are diagnosed; system and gtest headers are noise here.
+HeaderFilterRegex: '(src|include)/.*\.h$'
+
+WarningsAsErrors: ''
+
+FormatStyle: file
+
+CheckOptions:
+  # Naming convention: lower_snake_case throughout, macros in upper case.
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key: readability-identifier-naming.StructCase
+    value: lower_case
+  - key: readability-identifier-naming.EnumCase
+    value: lower_case
+  - key: readability-identifier-naming.EnumConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.TypedefCase
+    value: lower_case
+  - key: readability-identifier-naming.GlobalVariablePrefix
+    value: 'g_'
+  # Allow the early-return style used across the module implementations.
+  - key: readability-else-after-return.WarnOnUnfixable
+    value: 'false'

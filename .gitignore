@@ -1,0 +1,60 @@
+# Build trees
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake artefacts left behind by in-source configure attempts
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+*.cmake.stamp
+
+# Compilation database (symlinked by `make compile-db`)
+compile_commands.json
+.cache/
+
+# Object files, libraries, executables
+*.o
+*.obj
+*.lo
+*.slo
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Coverage data
+*.gcno
+*.gcda
+*.gcov
+coverage.info
+coverage.info.raw
+coverage-html/
+
+# Sanitizer / profiler output
+*.log
+callgrind.out.*
+massif.out.*
+perf.data*
+vgcore.*
+# Anchored to the repository root and restricted to files: a bare `core`
+# pattern would also exclude the src/core/ source directory.
+/core
+/core.*
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

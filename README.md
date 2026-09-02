@@ -1,0 +1,252 @@
+# oemu
+
+Infrastructure skeleton for a pure C11 project, centred on a local GoogleTest
+harness.
+
+Production code is C11 with hidden visibility and no C++ dependency. Only the
+test translation units are C++17, linking against the C library through
+`extern "C"` declarations.
+
+## Requirements
+
+| Tool | Purpose | Notes |
+| --- | --- | --- |
+| CMake ≥ 3.20 | build system | 3.23+ recommended (needed to skip a conda prefix) |
+| Ninja | generator used by the presets | any generator works if you invoke CMake directly |
+| GCC or Clang | C11 + C++17 | GCC 13 / Clang 18 verified |
+| GoogleTest ≥ 1.11 | test framework | `sudo apt install libgtest-dev libgmock-dev` |
+| lcov | HTML coverage report | optional; `make coverage-summary` needs only gcov |
+| clang-format, clang-tidy | style and static analysis | optional |
+
+## Quick start
+
+```bash
+make test          # configure, build and run the whole suite
+make help          # list every target
+```
+
+Behind the scenes that is just CMake:
+
+```bash
+cmake --preset debug
+cmake --build build/debug
+ctest --preset debug
+```
+
+## Layout
+
+```
+include/oemu/         Public headers. Consumers see only these.
+  macros.h            extern "C" guards and attribute helpers
+  status.h            oemu_status result codes
+  allocator.h         pluggable allocator (the test seam)
+  check.h             OEMU_REQUIRE fatal contract macro
+  buffer.h            worked example: growable byte buffer
+src/
+  core/               status, version, allocator, check
+  buffer/
+    buffer.c          implementation
+    buffer_internal.h internal interface, exposed for white-box tests
+  main.c              demo executable
+tests/
+  support/            shared test doubles (tracking + failing allocators)
+  unit/               one test file per module
+cmake/
+  CompilerWarnings.cmake  central warning set
+  Sanitizers.cmake        ASan/UBSan/TSan wiring
+  Coverage.cmake          gcov instrumentation + report targets
+  GcovSummary.cmake       text coverage summary, no lcov required
+AGENTS.md             Baseline instructions for coding agents.
+.dsh/skills/          Task-specific agent skills; see .dsh/README.md
+```
+
+## Coding agents
+
+`AGENTS.md` holds the always-loaded project rules. Four skills under
+`.dsh/skills/` cover the recurring workflows: `oemu-run-tests`,
+`oemu-build-configs`, `oemu-add-c-module` and `oemu-ci-workflow`. See
+[`.dsh/README.md`](.dsh/README.md) for the format and discovery rules.
+
+These are useful documentation for humans too — the build and test skills record
+the environment-specific workarounds and their reasons.
+
+
+## Build configurations
+
+Each preset builds into its own tree under `build/`, so they coexist.
+
+| Preset | Purpose |
+| --- | --- |
+| `debug` | unoptimised, warnings as errors |
+| `release` | `RelWithDebInfo`, tests still enabled |
+| `asan` | AddressSanitizer + UndefinedBehaviorSanitizer |
+| `tsan` | ThreadSanitizer |
+| `coverage` | gcov instrumentation |
+| `clang` | debug build on the Clang toolchain |
+
+```bash
+make            # debug (default target is `test`)
+make asan       # run the suite under ASan + UBSan
+make tsan
+make release
+make clang
+make coverage-summary   # text coverage, gcov only
+make coverage           # HTML report, needs lcov
+```
+
+## Running tests
+
+`gtest_discover_tests` registers every `TEST()` as its own CTest case, so
+failures name the exact case and selections are precise.
+
+```bash
+ctest --test-dir build/debug -N                  # list all cases
+ctest --test-dir build/debug -R Buffer           # run by name regex
+ctest --test-dir build/debug -L whitebox         # run by label
+ctest --test-dir build/debug -LE death           # skip the slow death tests
+ctest --test-dir build/debug --rerun-failed      # only what failed last time
+
+make test-fast     # same as -LE death
+make test-death    # only the death tests
+make retest        # rerun failures
+```
+
+Labels in use: `unit` on everything, plus `whitebox` and `death` where
+applicable.
+
+A test binary can also be run directly for gtest's own flags:
+
+```bash
+./build/debug/bin/test_buffer --gtest_filter='BufferOom.*' --gtest_brief=1
+```
+
+## Writing tests
+
+Add a `.cpp` file under `tests/unit/` and register it in `tests/CMakeLists.txt`:
+
+```cmake
+oemu_add_test(test_mymodule
+  SOURCES unit/test_mymodule.cpp
+  LABELS unit
+)
+```
+
+Options: `INTERNAL` grants access to `src/<module>/<module>_internal.h`;
+`LABELS` sets the CTest labels.
+
+### Making C code testable
+
+Four conventions carry the whole harness. They are the substance of this
+skeleton — the CMake plumbing is secondary.
+
+**1. Public headers must be C++-safe.** Every public header wraps its
+declarations in `OEMU_BEGIN_DECLS` / `OEMU_END_DECLS` (`extern "C"`), otherwise
+the C++ test would emit mangled symbol references and fail to link. Keep
+designated initialisers, VLAs, `restrict` and `_Generic` out of public headers:
+C++ cannot parse them.
+
+**2. Internal logic goes in `<module>_internal.h`, not `static`.** A `static`
+function is unreachable from a test. Rather than making tests
+`#include "buffer.c"`, each module publishes its internals in a private header
+that only the module and its tests include. See
+`src/buffer/buffer_internal.h` and `tests/unit/test_buffer_internal.cpp`, which
+tests the capacity growth policy directly, including overflow behaviour near
+`SIZE_MAX`.
+
+**3. Allocation goes through a seam.** gmock cannot mock C free functions — it
+needs virtual dispatch. So the library routes all allocation through
+`oemu_allocator`, and tests swap the implementation:
+
+- `TrackingAllocator` counts allocations and frees, and detects leaks;
+- `FailingAllocator` fails the Nth allocation, making out-of-memory branches
+  reachable.
+
+```cpp
+TEST(BufferOom, AppendReportsGrowthFailure) {
+  oemu_test::FailingAllocator failing(oemu_test::FailingAllocator::kNever);
+  oemu_buffer buf{};
+  ASSERT_EQ(OEMU_OK, oemu_buffer_init(&buf, 0));
+
+  failing.set_fail_on_call(1);
+  EXPECT_EQ(OEMU_ERR_NO_MEMORY, oemu_buffer_append_str(&buf, "data"));
+  EXPECT_EQ(0u, oemu_buffer_len(&buf));
+
+  oemu_buffer_dispose(&buf);
+}
+```
+
+Both install themselves on construction and restore the previous allocator on
+destruction, so a failing test cannot leak its override into the next one.
+
+**4. Fatal contracts are verified with death tests.** `OEMU_REQUIRE` aborts on
+programming errors. gtest runs each death test in a forked child, so the abort
+is observed without killing the test binary — a capability plain C assertion
+frameworks lack. `tests/unit/test_check.cpp` selects the `threadsafe` death-test
+style, which avoids spurious leak reports from the aborted child under ASan.
+
+Recoverable failures should return `oemu_status` instead, which keeps them
+assertable in ordinary tests.
+
+## Coverage
+
+```bash
+make coverage-summary   # per-file text summary; needs only gcov
+make coverage           # HTML report in build/coverage/coverage-html; needs lcov
+```
+
+## Code quality
+
+```bash
+make format         # apply clang-format
+make format-check   # fail on any deviation
+make tidy           # clang-tidy over the C sources
+make compile-db     # symlink compile_commands.json for clangd
+```
+
+## CI
+
+`.github/workflows/ci.yml` runs the same commands as local development: a
+matrix over `debug`, `clang`, `release` and `asan`, plus separate coverage and
+lint jobs.
+
+## Notes and gotchas
+
+Two environment-specific problems are already handled; both cost real debugging
+time to find.
+
+**An active conda environment shadows the system GoogleTest.** `CONDA_PREFIX`
+sits on `CMAKE_PREFIX_PATH`, so `find_package(GTest)` picks up conda's older
+build (1.11) instead of the system one (1.14), potentially against a different
+C++ runtime. The top-level `CMakeLists.txt` adds that prefix to
+`CMAKE_IGNORE_PREFIX_PATH`; set `-DOEMU_IGNORE_CONDA_PREFIX=OFF` to opt out.
+The configure output names the GoogleTest that was selected.
+
+**CTest labels must be a single composite label.** CMake flattens the
+`PROPERTIES` argument of `gtest_discover_tests` into a semicolon-separated list,
+so a genuine multi-value `LABELS` property cannot survive: the extra values get
+misread as further property names and silently dropped. Because `ctest -L`
+matches by regex, `oemu_add_test` joins the components into one label
+(`unit.death`), which keeps `-L unit`, `-L death` and `-LE death` all working.
+
+**ThreadSanitizer aborts on modern kernels.** Linux 6.x (including WSL2) uses
+more ASLR entropy than TSan's shadow-memory layout expects, so every binary dies
+with `FATAL: ThreadSanitizer: unexpected memory mapping`. `Sanitizers.cmake`
+detects the TSan build and routes the test binaries through `setarch -R` via the
+`CROSSCOMPILING_EMULATOR` target property — which matters because
+`gtest_discover_tests` runs each binary at discovery time too, not just during
+the test run. The alternative is `sudo sysctl vm.mmap_rnd_bits=28`.
+
+Other details worth knowing:
+
+- C-only warnings such as `-Wstrict-prototypes` are guarded with
+  `$<COMPILE_LANGUAGE:C>`; without that GCC warns on every C++ test file.
+- ASan and TSan are mutually exclusive; `Sanitizers.cmake` rejects the
+  combination at configure time.
+- UBSan runs with `-fno-sanitize-recover=all` so undefined behaviour actually
+  fails the test run instead of only printing.
+
+## Using GoogleTest from source instead
+
+To pin a specific version rather than use the system package, replace the
+`find_package(GTest REQUIRED)` call in `tests/CMakeLists.txt` with the
+`FetchContent` block documented at the bottom of that file.

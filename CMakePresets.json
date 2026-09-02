@@ -1,0 +1,131 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "OEMU_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug",
+      "description": "Unoptimised build with assertions and the full test suite",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "OEMU_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release",
+      "description": "Optimised build, tests still enabled",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "OEMU_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "inherits": "base",
+      "displayName": "ASan + UBSan",
+      "description": "Address and undefined-behaviour sanitizers",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "OEMU_SANITIZERS": "address;undefined",
+        "OEMU_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "displayName": "TSan",
+      "description": "Thread sanitizer; cannot be combined with ASan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "OEMU_SANITIZERS": "thread"
+      }
+    },
+    {
+      "name": "coverage",
+      "inherits": "base",
+      "displayName": "Coverage",
+      "description": "gcov instrumentation; build the `coverage` target for an HTML report",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "OEMU_ENABLE_COVERAGE": "ON"
+      }
+    },
+    {
+      "name": "clang",
+      "inherits": "debug",
+      "displayName": "Debug (clang)",
+      "description": "Debug build forced onto the clang toolchain",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "coverage", "configurePreset": "coverage" },
+    { "name": "clang", "configurePreset": "clang" }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false
+      }
+    },
+    { "name": "debug", "inherits": "base", "configurePreset": "debug" },
+    { "name": "release", "inherits": "base", "configurePreset": "release" },
+    { "name": "asan", "inherits": "base", "configurePreset": "asan" },
+    { "name": "tsan", "inherits": "base", "configurePreset": "tsan" },
+    { "name": "coverage", "inherits": "base", "configurePreset": "coverage" },
+    { "name": "clang", "inherits": "base", "configurePreset": "clang" },
+    {
+      "name": "unit",
+      "inherits": "base",
+      "configurePreset": "debug",
+      "displayName": "Fast tests only",
+      "description": "Skips the slower death tests",
+      "filter": {
+        "exclude": {
+          "label": "death"
+        }
+      }
+    },
+    {
+      "name": "death",
+      "inherits": "base",
+      "configurePreset": "debug",
+      "displayName": "Death tests only",
+      "filter": {
+        "include": {
+          "label": "death"
+        }
+      }
+    }
+  ]
+}
