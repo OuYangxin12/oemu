@@ -5,13 +5,14 @@
 // Instead of marking these helpers `static` (unreachable from a test) or having
 // the test #include "buffer.c" (fragile), the module publishes its internals in
 // a private header that only tests and the module itself consume.
-#include <gtest/gtest.h>
+#include "oemu/status.h"
 
 #include <cstdint>
 #include <limits>
 
+#include <gtest/gtest.h>
+
 #include "buffer/buffer_internal.h"
-#include "oemu/status.h"
 
 namespace {
 
@@ -112,12 +113,13 @@ TEST_P(GrowCapacityInvariant, ResultCoversRequirementAndNeverShrinks) {
   EXPECT_GE(out, current) << "capacity must never shrink";
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    Sweep, GrowCapacityInvariant,
-    ::testing::Values(std::make_pair(0u, 0u), std::make_pair(0u, 1u),
-                      std::make_pair(0u, 15u), std::make_pair(0u, 16u),
-                      std::make_pair(0u, 17u), std::make_pair(16u, 17u),
-                      std::make_pair(16u, 4096u), std::make_pair(1024u, 1025u),
-                      std::make_pair(kSizeMax, 1u), std::make_pair(kSizeMax / 2, kSizeMax / 2 + 1)));
+INSTANTIATE_TEST_SUITE_P(Sweep, GrowCapacityInvariant,
+                         ::testing::Values(std::make_pair(0u, 0u), std::make_pair(0u, 1u),
+                                           std::make_pair(0u, 15u), std::make_pair(0u, 16u),
+                                           std::make_pair(0u, 17u), std::make_pair(16u, 17u),
+                                           std::make_pair(16u, 4096u),
+                                           std::make_pair(1024u, 1025u),
+                                           std::make_pair(kSizeMax, 1u),
+                                           std::make_pair(kSizeMax / 2, kSizeMax / 2 + 1)));
 
 }  // namespace

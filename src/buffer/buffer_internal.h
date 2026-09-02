@@ -13,11 +13,11 @@
 #ifndef OEMU_SRC_BUFFER_INTERNAL_H
 #define OEMU_SRC_BUFFER_INTERNAL_H
 
-#include <stddef.h>
-
 #include "oemu/buffer.h"
 #include "oemu/macros.h"
 #include "oemu/status.h"
+
+#include <stddef.h>
 
 OEMU_BEGIN_DECLS
 
@@ -34,8 +34,7 @@ OEMU_BEGIN_DECLS
  * exhaustively without allocating anything.
  */
 OEMU_NODISCARD oemu_status oemu_buffer_internal_grow_capacity(size_t current_cap,
-                                                              size_t required,
-                                                              size_t *out_cap);
+                                                              size_t required, size_t *out_cap);
 
 /*
  * Checked addition used by the append paths. Returns OEMU_ERR_OVERFLOW when

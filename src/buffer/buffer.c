@@ -1,12 +1,13 @@
 #include "oemu/buffer.h"
 
+#include "oemu/allocator.h"
+
 #include <stdarg.h>
 #include <stdint.h> /* SIZE_MAX */
 #include <stdio.h>
 #include <string.h>
 
 #include "buffer_internal.h"
-#include "oemu/allocator.h"
 
 /* --- internal helpers (exposed via buffer_internal.h for white-box tests) --- */
 
@@ -22,7 +23,7 @@ oemu_status oemu_buffer_internal_checked_add(size_t a, size_t b, size_t *out) {
 }
 
 oemu_status oemu_buffer_internal_grow_capacity(size_t current_cap, size_t required,
-                                              size_t *out_cap) {
+                                               size_t *out_cap) {
   if (out_cap == NULL) {
     return OEMU_ERR_INVALID_ARG;
   }
@@ -36,7 +37,7 @@ oemu_status oemu_buffer_internal_grow_capacity(size_t current_cap, size_t requir
 
   /* Geometric 1.5x growth, guarding every step against wrap-around. */
   while (cap < required) {
-    size_t half = cap / 2u;
+    size_t half = cap / 2U;
     if (cap > SIZE_MAX - half) {
       /* Cannot grow geometrically any further: fall back to the exact size. */
       cap = required;
@@ -187,7 +188,7 @@ oemu_status oemu_buffer_appendf(oemu_buffer *buf, const char *fmt, ...) {
 
   /* +1 for the NUL that vsnprintf always writes; it is not part of len. */
   size_t with_nul = 0;
-  oemu_status status = oemu_buffer_internal_checked_add(needed_sz, 1u, &with_nul);
+  oemu_status status = oemu_buffer_internal_checked_add(needed_sz, 1U, &with_nul);
   if (status != OEMU_OK) {
     return status;
   }
@@ -215,7 +216,7 @@ const char *oemu_buffer_cstr(oemu_buffer *buf) {
   }
 
   /* Reserve one byte for the terminator without counting it in len. */
-  if (buffer_grow(buf, 1u) != OEMU_OK) {
+  if (buffer_grow(buf, 1U) != OEMU_OK) {
     return NULL;
   }
 
@@ -223,9 +224,13 @@ const char *oemu_buffer_cstr(oemu_buffer *buf) {
   return (const char *)buf->data;
 }
 
-size_t oemu_buffer_len(const oemu_buffer *buf) { return (buf != NULL) ? buf->len : 0u; }
+size_t oemu_buffer_len(const oemu_buffer *buf) {
+  return (buf != NULL) ? buf->len : 0U;
+}
 
-size_t oemu_buffer_capacity(const oemu_buffer *buf) { return (buf != NULL) ? buf->cap : 0u; }
+size_t oemu_buffer_capacity(const oemu_buffer *buf) {
+  return (buf != NULL) ? buf->cap : 0U;
+}
 
 const unsigned char *oemu_buffer_data(const oemu_buffer *buf) {
   return (buf != NULL) ? buf->data : NULL;

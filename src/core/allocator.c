@@ -27,7 +27,9 @@ static const oemu_allocator g_default_allocator = {
 /* Indirection point the tests swap out; never NULL. */
 static const oemu_allocator *g_current_allocator = &g_default_allocator;
 
-const oemu_allocator *oemu_allocator_default(void) { return &g_default_allocator; }
+const oemu_allocator *oemu_allocator_default(void) {
+  return &g_default_allocator;
+}
 
 const oemu_allocator *oemu_allocator_set(const oemu_allocator *allocator) {
   const oemu_allocator *previous = g_current_allocator;
@@ -35,4 +37,6 @@ const oemu_allocator *oemu_allocator_set(const oemu_allocator *allocator) {
   return previous;
 }
 
-const oemu_allocator *oemu_allocator_get(void) { return g_current_allocator; }
+const oemu_allocator *oemu_allocator_get(void) {
+  return g_current_allocator;
+}

@@ -2,11 +2,11 @@
  * Tiny demo entry point: proves the library links and gives `make run`
  * something to execute. Real projects would replace this wholesale.
  */
-#include <stdio.h>
-
 #include "oemu/buffer.h"
 #include "oemu/status.h"
 #include "oemu/version.h"
+
+#include <stdio.h>
 
 int main(void) {
   oemu_buffer buf;

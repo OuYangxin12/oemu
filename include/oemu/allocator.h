@@ -9,9 +9,9 @@
 #ifndef OEMU_ALLOCATOR_H
 #define OEMU_ALLOCATOR_H
 
-#include <stddef.h>
-
 #include "oemu/macros.h"
+
+#include <stddef.h>
 
 OEMU_BEGIN_DECLS
 

@@ -1,12 +1,13 @@
 // Black-box tests for the public buffer API, including out-of-memory paths
 // injected through the allocator seam.
-#include <gtest/gtest.h>
+#include "oemu/buffer.h"
+#include "oemu/status.h"
 
 #include <cstring>
 #include <string>
 
-#include "oemu/buffer.h"
-#include "oemu/status.h"
+#include <gtest/gtest.h>
+
 #include "support/tracking_allocator.h"
 
 namespace {
@@ -181,7 +182,9 @@ TEST_F(BufferTest, CstrOnEmptyBufferReturnsEmptyString) {
   EXPECT_STREQ("", s);
 }
 
-TEST_F(BufferTest, CstrRejectsNullBuffer) { EXPECT_EQ(nullptr, oemu_buffer_cstr(nullptr)); }
+TEST_F(BufferTest, CstrRejectsNullBuffer) {
+  EXPECT_EQ(nullptr, oemu_buffer_cstr(nullptr));
+}
 
 TEST_F(BufferTest, AppendAfterCstrOverwritesTerminator) {
   ASSERT_EQ(OEMU_OK, oemu_buffer_append_str(&buf_, "ab"));
@@ -229,7 +232,9 @@ TEST_F(BufferTest, ClearResetsLengthButKeepsCapacity) {
   EXPECT_EQ(reallocs, tracker_.realloc_count());
 }
 
-TEST_F(BufferTest, ClearIsNullSafe) { oemu_buffer_clear(nullptr); }
+TEST_F(BufferTest, ClearIsNullSafe) {
+  oemu_buffer_clear(nullptr);
+}
 
 // --- accessors on NULL -------------------------------------------------------
 

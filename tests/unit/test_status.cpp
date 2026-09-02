@@ -1,9 +1,9 @@
 // Tests for oemu_status_str.
-#include <gtest/gtest.h>
+#include "oemu/status.h"
 
 #include <string>
 
-#include "oemu/status.h"
+#include <gtest/gtest.h>
 
 namespace {
 
@@ -34,8 +34,7 @@ TEST_P(StatusStrContract, NeverReturnsNullOrEmpty) {
 }
 
 INSTANTIATE_TEST_SUITE_P(AllCodes, StatusStrContract,
-                         ::testing::Values(OEMU_OK, OEMU_ERR_INVALID_ARG,
-                                           OEMU_ERR_NO_MEMORY, OEMU_ERR_OVERFLOW,
-                                           OEMU_ERR_RANGE));
+                         ::testing::Values(OEMU_OK, OEMU_ERR_INVALID_ARG, OEMU_ERR_NO_MEMORY,
+                                           OEMU_ERR_OVERFLOW, OEMU_ERR_RANGE));
 
 }  // namespace

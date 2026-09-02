@@ -11,9 +11,9 @@
 #ifndef OEMU_TESTS_TRACKING_ALLOCATOR_H
 #define OEMU_TESTS_TRACKING_ALLOCATOR_H
 
-#include <cstddef>
-
 #include "oemu/allocator.h"
+
+#include <cstddef>
 
 namespace oemu_test {
 

@@ -10,11 +10,11 @@
 //     threaded suites;
 //   - under ASan the default "fast" death-test style can report leaks from the
 //     aborted child, so this file selects the "threadsafe" style.
-#include <gtest/gtest.h>
+#include "oemu/check.h"
 
 #include <ctime>
 
-#include "oemu/check.h"
+#include <gtest/gtest.h>
 
 namespace {
 
@@ -38,8 +38,9 @@ TEST_F(CheckDeathTest, FailingConditionAborts) {
 
 TEST_F(CheckDeathTest, DiagnosticIncludesExpressionAndMessage) {
   const int value = 0;
-  EXPECT_DEATH({ OEMU_REQUIRE(value != 0, "value must be non-zero"); },
-               "value != 0: value must be non-zero");
+  EXPECT_DEATH(
+      { OEMU_REQUIRE(value != 0, "value must be non-zero"); },
+      "value != 0: value must be non-zero");
 }
 
 TEST_F(CheckDeathTest, DiagnosticNamesTheSourceFile) {

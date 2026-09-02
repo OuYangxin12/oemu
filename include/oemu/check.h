@@ -28,11 +28,11 @@ void oemu_check_fail(const char *file, int line, const char *expr_text, const ch
  * Aborts with a diagnostic when `expr` is false. Use for programming errors that
  * cannot be reported to the caller; use status codes for anything recoverable.
  */
-#define OEMU_REQUIRE(expr, message)                                     \
-  do {                                                                  \
-    if (!(expr)) {                                                      \
-      oemu_check_fail(__FILE__, __LINE__, #expr, (message));            \
-    }                                                                   \
+#define OEMU_REQUIRE(expr, message)                          \
+  do {                                                       \
+    if (!(expr)) {                                           \
+      oemu_check_fail(__FILE__, __LINE__, #expr, (message)); \
+    }                                                        \
   } while (0)
 
 OEMU_END_DECLS

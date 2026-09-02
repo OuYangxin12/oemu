@@ -60,8 +60,7 @@ void TrackingAllocator::Free(void *ptr, void *user_data) {
 
 // --- FailingAllocator --------------------------------------------------------
 
-FailingAllocator::FailingAllocator(std::size_t fail_on_call)
-    : fail_on_call_(fail_on_call) {
+FailingAllocator::FailingAllocator(std::size_t fail_on_call) : fail_on_call_(fail_on_call) {
   allocator_.alloc = &FailingAllocator::Alloc;
   allocator_.realloc = &FailingAllocator::Realloc;
   allocator_.free = &FailingAllocator::Free;
@@ -69,7 +68,9 @@ FailingAllocator::FailingAllocator(std::size_t fail_on_call)
   previous_ = oemu_allocator_set(&allocator_);
 }
 
-FailingAllocator::~FailingAllocator() { oemu_allocator_set(previous_); }
+FailingAllocator::~FailingAllocator() {
+  oemu_allocator_set(previous_);
+}
 
 void FailingAllocator::set_fail_on_call(std::size_t fail_on_call) {
   fail_on_call_ = fail_on_call;

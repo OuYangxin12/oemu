@@ -1,8 +1,9 @@
 // Tests for the allocator seam itself: install/restore semantics and the
 // behaviour of the test doubles other suites depend on.
+#include "oemu/allocator.h"
+
 #include <gtest/gtest.h>
 
-#include "oemu/allocator.h"
 #include "support/tracking_allocator.h"
 
 namespace {

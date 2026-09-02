@@ -43,12 +43,20 @@ UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
 
 ## Failures that only happen in CI
 
-**The `lint` job fails but works locally.** `clang-format` and `clang-tidy` are
-not installed in this environment, so `make format-check` and `make tidy` cannot
-run here — the CI runner installs them. Do not claim lint passes locally.
-Either install them (`sudo apt install clang-format clang-tidy`) or reason
-directly from the CI log. Formatting rules are in `.clang-format`, checks in
-`.clang-tidy`.
+**The `lint` job fails.** Reproduce it exactly:
+
+```sh
+make format-check
+make tidy
+```
+
+Both are runnable locally, so a lint failure should never reach CI. Two
+config-level traps produce failures that look like code problems but are not:
+
+- `Error reading .clang-format: Invalid argument` on *every* file means the config itself is unparseable, not that the code is misformatted. Keep `.clang-format` a single YAML document; a second document repeating `Language: Cpp` breaks it.
+- clang-tidy reporting `unknown warning option '-Wlogical-op'` as an **error** comes from the GCC-generated `compile_commands.json`. `make tidy` already passes `--extra-arg=-Wno-unknown-warning-option`; invoking `clang-tidy` by hand without it reproduces the noise.
+
+Formatting rules live in `.clang-format`, checks in `.clang-tidy`.
 
 **The `coverage` job fails but `make coverage-summary` works.** `make coverage`
 needs `lcov`, which is absent locally; the runner installs it.

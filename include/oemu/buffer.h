@@ -9,10 +9,10 @@
 #ifndef OEMU_BUFFER_H
 #define OEMU_BUFFER_H
 
-#include <stddef.h>
-
 #include "oemu/macros.h"
 #include "oemu/status.h"
+
+#include <stddef.h>
 
 OEMU_BEGIN_DECLS
 

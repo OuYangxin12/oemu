@@ -1,9 +1,9 @@
 // Tests that the version string stays in sync with the version macros.
-#include <gtest/gtest.h>
+#include "oemu/version.h"
 
 #include <string>
 
-#include "oemu/version.h"
+#include <gtest/gtest.h>
 
 namespace {
 

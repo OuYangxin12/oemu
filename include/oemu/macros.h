@@ -9,21 +9,20 @@
 #define OEMU_MACROS_H
 
 #ifdef __cplusplus
-#  define OEMU_BEGIN_DECLS extern "C" {
-#  define OEMU_END_DECLS   }
+#define OEMU_BEGIN_DECLS extern "C" {
+#define OEMU_END_DECLS   }
 #else
-#  define OEMU_BEGIN_DECLS
-#  define OEMU_END_DECLS
+#define OEMU_BEGIN_DECLS
+#define OEMU_END_DECLS
 #endif
 
 /* Warn when a status return value is ignored at a call site. */
 #if defined(__GNUC__) || defined(__clang__)
-#  define OEMU_NODISCARD __attribute__((warn_unused_result))
-#  define OEMU_PRINTF(fmt_index, first_arg) \
-     __attribute__((format(printf, fmt_index, first_arg)))
+#define OEMU_NODISCARD                    __attribute__((warn_unused_result))
+#define OEMU_PRINTF(fmt_index, first_arg) __attribute__((format(printf, fmt_index, first_arg)))
 #else
-#  define OEMU_NODISCARD
-#  define OEMU_PRINTF(fmt_index, first_arg)
+#define OEMU_NODISCARD
+#define OEMU_PRINTF(fmt_index, first_arg)
 #endif
 
 #endif /* OEMU_MACROS_H */

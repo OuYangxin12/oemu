@@ -1,5 +1,9 @@
 # Based on Google style, adjusted for a C project.
 # Run `make format` to apply, `make format-check` to verify.
+#
+# Single document on purpose: `Language: Cpp` covers both the C sources and the
+# C++ test files. A second document repeating the same Language makes
+# clang-format reject the whole file with "Invalid argument".
 ---
 Language: Cpp
 BasedOnStyle: Google
@@ -61,6 +65,3 @@ KeepEmptyLinesAtTheStartOfBlocks: false
 MaxEmptyLinesToKeep: 1
 
 ReflowComments: true
----
-# Test translation units are C++; keep them consistent with the C style above.
-Language: Cpp
