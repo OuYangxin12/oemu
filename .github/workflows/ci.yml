@@ -93,8 +93,10 @@ jobs:
       - name: Check formatting
         run: make format-check
 
-      - name: Configure for clang-tidy
-        run: cmake --preset debug
-
+      # Runs the same Makefile target a developer runs. Invoking clang-tidy
+      # directly here would drop the flags that target sets -- notably
+      # -Wno-unknown-warning-option, needed because the GCC-generated
+      # compile_commands.json carries GCC-only warning flags that Clang rejects
+      # as errors.
       - name: Run clang-tidy
-        run: clang-tidy -p build/debug $(find src -name '*.c')
+        run: make tidy
