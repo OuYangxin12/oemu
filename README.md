@@ -1,11 +1,94 @@
 # oemu
 
-Infrastructure skeleton for a pure C11 project, centred on a local GoogleTest
-harness.
+An emulator for the **ARMv8-A AArch64 user-mode subset**, built on a pure C11
+core with a local GoogleTest harness.
 
 Production code is C11 with hidden visibility and no C++ dependency. Only the
 test translation units are C++17, linking against the C library through
 `extern "C"` declarations.
+
+## Emulation target
+
+ARM is not one instruction set but a family: several architecture generations,
+three profiles (A/R/M), and three distinct encodings (A32, T32/Thumb, A64).
+Picking a subset up front is what keeps the decoder tractable, so oemu commits
+to exactly one:
+
+| Axis | Choice |
+| --- | --- |
+| Architecture | ARMv8-A (the 64-bit baseline, v8.0) |
+| Profile | A — Application |
+| Encoding | **A64 only** — fixed 32-bit instructions |
+| Privilege | EL0 (user mode) only |
+| Register width | 64-bit `X0`–`X30`, `SP`, `PC`, `NZCV` |
+| Memory model | little-endian, flat address space |
+
+### In scope
+
+- The A64 base integer instruction set: data processing (immediate, register,
+  shifted/extended), loads and stores including the addressing modes and
+  pair/exclusive forms, branches, conditional selects, and the `NZCV` flag
+  semantics.
+- `SVC`-based system-call entry, so a static user-mode binary can make
+  progress against a host-provided syscall layer.
+
+### Out of scope
+
+Deliberately excluded, because each one multiplies decoder and state size
+without changing the core design:
+
+- **A32 and T32/Thumb.** A64 is a separate encoding; supporting the 32-bit
+  ones means a second decoder, not an extension of the first. Interworking
+  (`AArch32` execution state) is therefore absent too.
+- **EL1–EL3, MMU, TrustZone, virtualisation.** User mode needs no page tables,
+  exception levels, or secure world.
+- **Optional extensions:** AdvSIMD/NEON, floating point, SVE/SVE2, SME,
+  Crypto, Pointer Authentication, MTE, and the v8.1+ / v9 feature increments.
+- **Self-modifying code and cache maintenance semantics.** Instruction-cache
+  coherency operations are accepted and ignored rather than modelled.
+
+Anything outside the subset must be reported as an `oemu_status` decode or
+unimplemented-instruction error, never silently executed as something else.
+Extensions can be added later; none of them may be assumed present today.
+
+## Decoding
+
+`src/decode/decode.c` turns one 32-bit word plus the current `PC` into an
+`oemu_insn`. It is structured to follow the decode tree in the ARM Architecture
+Reference Manual rather than to be short, because that tree is the only complete
+list of which bit patterns are legal; a decoder organised any other way has to
+re-derive those constraints and will get some of them wrong.
+
+Two decisions in that file are load-bearing and easy to undo by accident:
+
+**Reserved does not mean plausible.** An encoding whose reserved bits are
+non-zero, or whose combination of otherwise-valid fields the architecture leaves
+unallocated, returns `OEMU_ERR_DECODE` — undefined encoding, the guest is wrong.
+A valid instruction the subset excludes (anything SIMD/FP, `ERET`, the
+pointer-authentication branches) returns `OEMU_ERR_UNSUPPORTED` — the guest is
+fine, oemu is incomplete. Collapsing the two would let an absent feature look
+like a corrupt binary, which is the wrong diagnosis to act on.
+
+**`0b1111` means *always*, not *never*.** A four-bit condition field's all-ones
+value is not a sixteenth condition but the `NV` mnemonic, and in AArch64 it
+behaves exactly like `AL`. Reading it as "never" is a silent misexecution rather
+than a crash, so the decoder keeps the raw encoding (`OEMU_COND_NV`) and
+`oemu_regs_cond_holds` treats it as taken. The distinction stays visible instead
+of being folded away at decode time.
+
+Register fields use 5 bits, and value `0b11111` means the zero register or the
+stack pointer depending on the instruction form. That distinction is not
+derivable from `oemu_insn` alone, so the decoder records it as the
+`rn_is_sp_form` and `rd_is_sp_form` flags, and `oemu_regs` provides two accessor
+families (`oemu_regs_read` and `oemu_regs_read_sp_form`) rather than guessing.
+
+Tests are driven by a golden corpus of 198 instruction words obtained from
+`llvm-mc -triple=aarch64 -show-encoding`, so the expected mnemonic of every
+corpus entry comes from an independent assembler and not from whoever wrote the
+decoder, plus a pseudo-random sweep over the encoding space that checks the
+invariants which must hold for *any* input: a failed decode leaves the output
+untouched, register fields never exceed 31, and only PC-relative forms depend on
+`PC`.
 
 ## Requirements
 
@@ -42,11 +125,19 @@ include/oemu/         Public headers. Consumers see only these.
   allocator.h         pluggable allocator (the test seam)
   check.h             OEMU_REQUIRE fatal contract macro
   buffer.h            worked example: growable byte buffer
+  regs.h              AArch64 register state: X0-X30, SP, PC, NZCV
+  decode.h            A64 decoder: decoded instruction record and status codes
 src/
   core/               status, version, allocator, check
   buffer/
     buffer.c          implementation
     buffer_internal.h internal interface, exposed for white-box tests
+  regs/
+    regs.c            register state, condition codes, flag derivation
+    regs_internal.h   pure helpers: truncation, cond table, AddWithCarry
+  decode/
+    decode.c          A64 instruction decoder, mirroring the ARM ARM decode tree
+    decode_internal.h bit primitives: extract, sign-extend, rotate, mask expand
   main.c              demo executable
 tests/
   support/            shared test doubles (tracking + failing allocators)
@@ -136,8 +227,9 @@ Options: `INTERNAL` grants access to `src/<module>/<module>_internal.h`;
 
 ### Making C code testable
 
-Four conventions carry the whole harness. They are the substance of this
-skeleton — the CMake plumbing is secondary.
+Four conventions carry the whole harness. They matter more than the CMake
+plumbing, and they are what will keep the A64 decoder and CPU state testable as
+they grow.
 
 **1. Public headers must be C++-safe.** Every public header wraps its
 declarations in `OEMU_BEGIN_DECLS` / `OEMU_END_DECLS` (`extern "C"`), otherwise
@@ -194,7 +286,9 @@ make coverage-summary   # per-file text summary; needs only gcov
 make coverage           # HTML report in build/coverage/coverage-html; needs lcov
 ```
 
-Current: **95.8% of lines, 100% of functions, 93.2% of branches.**
+Current: **99.5% of lines, 100% of functions, 97.2% of branches.** The seven
+uncovered lines are all in `buffer.c` and `check.c`; `decode.c` and `regs.c` are
+at 100% of lines and functions.
 
 One wrinkle worth knowing if you add a function that terminates the process:
 `abort()` prevents the gcov runtime from writing its counters, so such a function

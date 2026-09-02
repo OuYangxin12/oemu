@@ -13,13 +13,22 @@ TEST(StatusStr, ReturnsDescriptionForEveryKnownCode) {
   EXPECT_STREQ("out of memory", oemu_status_str(OEMU_ERR_NO_MEMORY));
   EXPECT_STREQ("size overflow", oemu_status_str(OEMU_ERR_OVERFLOW));
   EXPECT_STREQ("out of range", oemu_status_str(OEMU_ERR_RANGE));
+  EXPECT_STREQ("undefined instruction encoding", oemu_status_str(OEMU_ERR_DECODE));
+  EXPECT_STREQ("instruction outside the emulated subset",
+               oemu_status_str(OEMU_ERR_UNSUPPORTED));
+}
+
+TEST(StatusStr, DecodeAndUnsupportedAreDistinct) {
+  // The two decoder failures must not read alike: one means the guest is wrong,
+  // the other that oemu is incomplete.
+  EXPECT_STRNE(oemu_status_str(OEMU_ERR_DECODE), oemu_status_str(OEMU_ERR_UNSUPPORTED));
 }
 
 TEST(StatusStr, ReturnsFallbackForUnknownCode) {
   // Uses the value right after the last enumerator: it is unmapped, yet still
   // inside the enum's representable range, so the conversion is well defined.
   // A far-out value such as 9999 would be an unspecified conversion (-Wconversion).
-  const auto unmapped = static_cast<oemu_status>(static_cast<int>(OEMU_ERR_RANGE) + 1);
+  const auto unmapped = static_cast<oemu_status>(static_cast<int>(OEMU_ERR_UNSUPPORTED) + 1);
   EXPECT_STREQ("unknown status", oemu_status_str(unmapped));
 }
 
@@ -35,6 +44,7 @@ TEST_P(StatusStrContract, NeverReturnsNullOrEmpty) {
 
 INSTANTIATE_TEST_SUITE_P(AllCodes, StatusStrContract,
                          ::testing::Values(OEMU_OK, OEMU_ERR_INVALID_ARG, OEMU_ERR_NO_MEMORY,
-                                           OEMU_ERR_OVERFLOW, OEMU_ERR_RANGE));
+                                           OEMU_ERR_OVERFLOW, OEMU_ERR_RANGE, OEMU_ERR_DECODE,
+                                           OEMU_ERR_UNSUPPORTED));
 
 }  // namespace
