@@ -171,6 +171,36 @@ oemu_add_test(test_decode_internal
   LABELS "unit;whitebox"
 )
 
+# The region-table memory model, including the OOM paths the allocator seam
+# exposes. Reaches into src/memory/memory_internal.h for the containment and
+# overlap arithmetic, so it counts as white-box.
+oemu_add_test(test_memory
+  SOURCES unit/test_memory.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
+# The four-syscall guest ABI: write capture, clock layout, exit, errno fidelity.
+oemu_add_test(test_sysenv
+  SOURCES unit/test_sysenv.cpp
+  LABELS unit
+)
+
+# End-to-end interpreter: small hand-assembled programs driven through
+# oemu_exec_step / oemu_exec_run.
+oemu_add_test(test_exec
+  SOURCES unit/test_exec.cpp
+  LABELS unit
+)
+
+# Reaches into src/exec/exec_internal.h: the shifted/extended operand edges,
+# the 128-bit-free multiply, one-source helpers, and single-opcode dispatch.
+oemu_add_test(test_exec_internal
+  SOURCES unit/test_exec_internal.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.
@@ -191,6 +221,10 @@ add_dependencies(check
   test_regs_internal
   test_decode
   test_decode_internal
+  test_memory
+  test_sysenv
+  test_exec
+  test_exec_internal
 )
 
 # Registers the `coverage` target now that the test targets exist.

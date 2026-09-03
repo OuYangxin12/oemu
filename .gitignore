@@ -51,6 +51,13 @@ vgcore.*
 /core
 /core.*
 
+# Guest benchmark build output and the fetched CoreMark tree. Both are
+# regenerable (bench/guest/build.sh, bench/guest/fetch-coremark.sh); the
+# corpus blobs under bench/corpus/blob are committed on purpose and are not
+# ignored.
+bench/guest/build/
+bench/guest/coremark-src/
+
 # Editor and OS noise
 .vscode/
 .idea/
@@ -58,3 +65,6 @@ vgcore.*
 *.swo
 *~
 .DS_Store
+
+# clangd editor config (machine-absolute paths); regenerate locally
+/.clangd

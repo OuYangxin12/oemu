@@ -86,6 +86,24 @@ test-death: build ## Run only the death tests
 run: build ## Run the demo executable
 	$(BUILD)/bin/oemu
 
+# --- benchmarks ---------------------------------------------------------------
+
+.PHONY: bench
+bench: build ## Run the decode-throughput benchmark over bench/corpus blobs
+	$(BUILD)/bin/oemu-bench-decode
+
+.PHONY: bench-exec
+bench-exec: build ## Run the end-to-end executor-throughput benchmark
+	$(BUILD)/bin/oemu-bench-exec
+
+.PHONY: bench-corpus
+bench-corpus: ## Regenerate the corpus blobs (needs clang with an AArch64 backend)
+	bash bench/corpus/gen.sh
+
+.PHONY: bench-guest
+bench-guest: ## Cross-build the freestanding guest benchmark (needs an AArch64 linker)
+	bash bench/guest/build.sh
+
 .PHONY: compile-db
 compile-db: $(BUILD)/CMakeCache.txt ## Symlink compile_commands.json for clangd
 	ln -sf $(BUILD)/compile_commands.json compile_commands.json
@@ -93,8 +111,10 @@ compile-db: $(BUILD)/CMakeCache.txt ## Symlink compile_commands.json for clangd
 
 # --- code quality -------------------------------------------------------------
 
-# Tracked sources only; keeps generated build trees out of the way.
-SOURCES := $(shell find src include tests -type f \
+# Tracked sources only; keeps generated build trees out of the way. The bench
+# corpus/guest kernels are included: they are cross-compiled code, but they
+# live in this repository and must still satisfy clang-format.
+SOURCES := $(shell find src include tests bench -type f \
 	\( -name '*.c' -o -name '*.h' -o -name '*.cpp' -o -name '*.hpp' \) 2>/dev/null)
 
 .PHONY: format

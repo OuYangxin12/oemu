@@ -5,10 +5,13 @@ add_library(oemu
   core/allocator.c
   core/check.c
   core/status.c
+  core/sysenv.c
   core/version.c
   buffer/buffer.c
   regs/regs.c
   decode/decode.c
+  memory/memory.c
+  exec/exec.c
 )
 
 # Internal headers, listed so IDEs pick them up.
@@ -16,6 +19,8 @@ target_sources(oemu PRIVATE
   buffer/buffer_internal.h
   regs/regs_internal.h
   decode/decode_internal.h
+  memory/memory_internal.h
+  exec/exec_internal.h
 )
 
 target_include_directories(oemu
@@ -30,9 +35,17 @@ target_include_directories(oemu
     ${CMAKE_CURRENT_SOURCE_DIR}/regs
     # Likewise for decode.c and "decode_internal.h".
     ${CMAKE_CURRENT_SOURCE_DIR}/decode
+    # Likewise for memory.c / exec.c and their internal headers.
+    ${CMAKE_CURRENT_SOURCE_DIR}/memory
+    ${CMAKE_CURRENT_SOURCE_DIR}/exec
 )
 
 target_link_libraries(oemu PUBLIC oemu_compiler_flags)
+
+# sysenv.c is the one file that needs a POSIX symbol (clock_gettime). The
+# feature-test macro is supplied here rather than in the source so the source
+# stays free of a reserved _-prefixed macro definition (cert-dcl37-c).
+set_source_files_properties(core/sysenv.c PROPERTIES COMPILE_DEFINITIONS _POSIX_C_SOURCE=2008090L)
 
 set_target_properties(oemu PROPERTIES
   VERSION ${PROJECT_VERSION}

@@ -972,6 +972,8 @@ TEST(DecodeInvariants, NeverReportsAnUnexpectedStatus) {
       case OEMU_ERR_NO_MEMORY:
       case OEMU_ERR_OVERFLOW:
       case OEMU_ERR_RANGE:
+      case OEMU_ERR_FAULT:
+      case OEMU_ERR_TIMEOUT:
         FAIL() << "unexpected status " << oemu_status_str(status) << " for 0x" << std::hex
                << word;
     }
