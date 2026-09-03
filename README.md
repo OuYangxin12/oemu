@@ -90,6 +90,64 @@ invariants which must hold for *any* input: a failed decode leaves the output
 untouched, register fields never exceed 31, and only PC-relative forms depend on
 `PC`.
 
+## Execution
+
+`src/exec/exec.c` is the fetch–decode–dispatch loop. One `oemu_cpu` is one
+single-threaded AArch64 core at EL0: the `oemu_regs` state plus the two pieces
+an instruction can observe that the register module deliberately does not model
+-- the exclusive-access monitor and `TPIDRUR_EL0`. The struct is not opaque so it
+lives on the stack, and **no step ever allocates**, which is what lets the
+executor be driven from a leak-checked test fixture. `oemu_exec_step` runs
+exactly one instruction (optionally handing back the decoded `oemu_insn` even
+when it then faults, so a caller can show the offending instruction);
+`oemu_exec_run` loops it until the guest exits, a budget is spent, or an error
+surfaces. Decoding is not reimplemented here -- the executor calls
+`oemu_decode`, so the two agree by construction.
+
+**Faults are precise, including the awkward instructions.** When a step returns
+`OEMU_ERR_FAULT` (bad address, bad permission, misaligned fetch, `BRK`/`HLT`) or
+`OEMU_ERR_UNSUPPORTED`, the `PC` still points at the faulting instruction and no
+architectural register has moved. That holds even for instructions that touch
+several locations -- `STP` writeback, `LDP` post-index, `LDPSW` -- which is why
+every memory reference is validated before the first commit and multi-transfer
+forms stage through locals rather than writing one half and failing on the
+other. A partially-applied store is the kind of bug that never shows up until a
+guest misbehaves hours later, so the design refuses to allow it.
+
+**Only the EL0-visible system registers are honoured.** `MRS`/`MSR` accept a
+small whitelist -- `NZCV`, `SP_EL0`, `TPIDRRO_EL0`, `TPIDRUR_EL0`, and a read of
+`CurrentEL` that answers EL0. Any other register, in particular anything at
+EL1+, is `OEMU_ERR_UNSUPPORTED` and the destination register is left exactly as
+it was: a refusal must not clobber state.
+
+**The syscall surface is the four calls a static benchmark actually needs**
+(`src/core/sysenv.c`), at their honest Linux AArch64 numbers so a guest built
+against them also runs on real hardware: `exit` (93), `exit_group` (94),
+`write` (64) and `clock_gettime` (113). Guest buffer pointers are validated
+against mapped, readable regions, so a wild pointer returns `-EFAULT` instead of
+corrupting the host; `write` only accepts fds 1 and 2; unknown numbers come back
+as `-ENOSYS`; failures are negative errnos in `x0`, the way Linux reports them.
+
+### Limitations, stated plainly
+
+Each of these is a real gap, not a TODO comment, and each is invisible only for
+as long as the assumptions below hold:
+
+- **No memory-ordering model.** `LDXR`/`STXR` reservations and `STLR` store-release
+  are tracked, but the acquire-release *ordering* is not: on one in-order core no
+  barrier semantics are observable, so the pair behaves correctly by accident of
+  single-threading. A future multithreaded host would need real fences.
+- **SP alignment is not checked.** A misaligned SP-based memory access proceeds
+  rather than raising the `SPAlignmentFault` a real core would take.
+- **No ELF loader yet.** `oemu_cli` cannot boot a file from disk; the executor is
+  driven programmatically -- by the test suite and by `bench/c/exec_bench.c`,
+  which builds its own guest. The freestanding guest under `bench/guest/` is
+  waiting on exactly this.
+- **Wrapped bitfield aliases are unverified.** Plain `UBFM`/`BFM`/`SBFM` (and
+  `EXTR`) are exercised; the `UBFIZ`/`SBFIZ` spellings an assembler emits for the
+  wrapped `msb < lsb` encodings are decoded identically but that equivalence was
+  not checked against a reference, so those forms are treated as unverified.
+
 ## Requirements
 
 | Tool | Purpose | Notes |
@@ -105,6 +163,7 @@ untouched, register fields never exceed 31, and only PC-relative forms depend on
 
 ```bash
 make test          # configure, build and run the whole suite
+make bench-exec    # end-to-end interpreter throughput (see bench/README.md)
 make help          # list every target
 ```
 
@@ -127,8 +186,11 @@ include/oemu/         Public headers. Consumers see only these.
   buffer.h            worked example: growable byte buffer
   regs.h              AArch64 register state: X0-X30, SP, PC, NZCV
   decode.h            A64 decoder: decoded instruction record and status codes
+  memory.h            flat guest address space: map, alias, read/write/fetch
+  sysenv.h            the four-call SVC surface the guest runs against
+  exec.h              the CPU: register bag plus the step/run interpreter loop
 src/
-  core/               status, version, allocator, check
+  core/               status, version, allocator, check, sysenv
   buffer/
     buffer.c          implementation
     buffer_internal.h internal interface, exposed for white-box tests
@@ -138,6 +200,12 @@ src/
   decode/
     decode.c          A64 instruction decoder, mirroring the ARM ARM decode tree
     decode_internal.h bit primitives: extract, sign-extend, rotate, mask expand
+  memory/
+    memory.c          region table, permission checks, endian-aware accessors
+    memory_internal.h internal region layout and validation helpers
+  exec/
+    exec.c            fetch-decode-dispatch loop, precise faults, sysreg whitelist
+    exec_internal.h   pure helpers: shifts, extends, NZCV, bit reversal, bitfield
   main.c              demo executable
 tests/
   support/            shared test doubles (tracking + failing allocators)
@@ -286,9 +354,18 @@ make coverage-summary   # per-file text summary; needs only gcov
 make coverage           # HTML report in build/coverage/coverage-html; needs lcov
 ```
 
-Current: **99.5% of lines, 100% of functions, 97.2% of branches.** The seven
-uncovered lines are all in `buffer.c` and `check.c`; `decode.c` and `regs.c` are
-at 100% of lines and functions.
+Current, by new line coverage: **decode 100%, regs 100%, exec 96%, memory 98%,
+sysenv 93%, allocator/version 100%; TOTAL 98% of lines.** The uncovered exec
+lines are defensive arms a correct decoder never produces -- `operand2`'s
+extended/none operand kinds, the dispatch `default:` (`"a newer decoder cannot
+outdate this switch"`), and the `INT64_MIN / -1` divide edge -- so they read
+`#####` precisely because they are unreachable, not because they are untested.
+
+One tooling caveat so the number is read correctly: `make coverage-summary`
+currently omits `src/memory/memory.c` -- `file(STRINGS)` mis-parses that one
+`.gcov`, so the script's TOTAL understates by memory's 135 lines. The figure
+above adds memory back from a direct `gcov` run (97.8% of 135 lines, 100% of
+branches taken); it is a real measurement, not a guess.
 
 One wrinkle worth knowing if you add a function that terminates the process:
 `abort()` prevents the gcov runtime from writing its counters, so such a function
