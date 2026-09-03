@@ -28,7 +28,17 @@ typedef enum oemu_status {
    * FP/SIMD, an EL1+ operation, an excluded extension. Reported rather than
    * silently executed as something else; see the README's scope section.
    */
-  OEMU_ERR_UNSUPPORTED = 6
+  OEMU_ERR_UNSUPPORTED = 6,
+  /*
+   * The guest triggered an architectural fault that this emulator reports
+   * instead of delivering: an unmapped or under-permissioned memory access, a
+   * misaligned instruction fetch, or a deliberate trap (BRK/HLT). Precise by
+   * contract -- the faulting instruction has not changed any architectural
+   * state when this status comes back.
+   */
+  OEMU_ERR_FAULT = 7,
+  /* A run reached its instruction budget without the guest having exited. */
+  OEMU_ERR_TIMEOUT = 8
 } oemu_status;
 
 /* Returns a stable, never-NULL description for any oemu_status value. */

@@ -28,7 +28,7 @@ TEST(StatusStr, ReturnsFallbackForUnknownCode) {
   // Uses the value right after the last enumerator: it is unmapped, yet still
   // inside the enum's representable range, so the conversion is well defined.
   // A far-out value such as 9999 would be an unspecified conversion (-Wconversion).
-  const auto unmapped = static_cast<oemu_status>(static_cast<int>(OEMU_ERR_UNSUPPORTED) + 1);
+  const auto unmapped = static_cast<oemu_status>(static_cast<int>(OEMU_ERR_TIMEOUT) + 1);
   EXPECT_STREQ("unknown status", oemu_status_str(unmapped));
 }
 
