@@ -114,7 +114,8 @@ void oemu_memory_dispose(oemu_memory *mem) {
 }
 
 static oemu_status memory_map(oemu_memory *mem, uint64_t gva, void *host, uint64_t size,
-                              uint32_t perms, bool owned) {
+                              uint32_t perms, bool owned, const void *contents,
+                              uint64_t contents_size) {
   if (mem == NULL || mem->regions == NULL) {
     return OEMU_ERR_INVALID_ARG;
   }
@@ -133,13 +134,20 @@ static oemu_status memory_map(oemu_memory *mem, uint64_t gva, void *host, uint64
   }
 
   if (owned) {
+    if (contents_size > size || (contents == NULL && contents_size > 0U)) {
+      return OEMU_ERR_INVALID_ARG;
+    }
     void *block = mem->allocator->alloc((size_t)size, mem->allocator->user_data);
     if (block == NULL) {
       return OEMU_ERR_NO_MEMORY;
     }
     /* Backing memory starts zeroed so a mapped-but-unwritten guest region
-     * reads back deterministically regardless of what malloc handed us. */
+     * reads back deterministically regardless of what malloc handed us; a file
+     * slice then overwrites its prefix, leaving any .bss tail zero. */
     (void)memset(block, 0, (size_t)size);
+    if (contents_size > 0U) {
+      (void)memcpy(block, contents, (size_t)contents_size);
+    }
     host = block;
   }
 
@@ -154,7 +162,12 @@ static oemu_status memory_map(oemu_memory *mem, uint64_t gva, void *host, uint64
 }
 
 oemu_status oemu_memory_map(oemu_memory *mem, uint64_t gva, uint64_t size, uint32_t perms) {
-  return memory_map(mem, gva, NULL, size, perms, true);
+  return memory_map(mem, gva, NULL, size, perms, true, NULL, 0U);
+}
+
+oemu_status oemu_memory_map_image(oemu_memory *mem, uint64_t gva, uint64_t size, uint32_t perms,
+                                  const void *contents, uint64_t contents_size) {
+  return memory_map(mem, gva, NULL, size, perms, true, contents, contents_size);
 }
 
 oemu_status oemu_memory_map_alias(oemu_memory *mem, uint64_t gva, void *host, uint64_t size,
@@ -162,7 +175,7 @@ oemu_status oemu_memory_map_alias(oemu_memory *mem, uint64_t gva, void *host, ui
   if (host == NULL) {
     return OEMU_ERR_INVALID_ARG;
   }
-  return memory_map(mem, gva, host, size, perms, false);
+  return memory_map(mem, gva, host, size, perms, false, NULL, 0U);
 }
 
 oemu_status oemu_memory_validate(const oemu_memory *mem, uint64_t gva, uint64_t size,

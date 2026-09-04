@@ -12,6 +12,7 @@ add_library(oemu
   decode/decode.c
   memory/memory.c
   exec/exec.c
+  elf/elf.c
 )
 
 # Internal headers, listed so IDEs pick them up.
@@ -21,6 +22,7 @@ target_sources(oemu PRIVATE
   decode/decode_internal.h
   memory/memory_internal.h
   exec/exec_internal.h
+  elf/elf_internal.h
 )
 
 target_include_directories(oemu
@@ -38,6 +40,8 @@ target_include_directories(oemu
     # Likewise for memory.c / exec.c and their internal headers.
     ${CMAKE_CURRENT_SOURCE_DIR}/memory
     ${CMAKE_CURRENT_SOURCE_DIR}/exec
+    # Likewise for elf.c and "elf_internal.h".
+    ${CMAKE_CURRENT_SOURCE_DIR}/elf
 )
 
 target_link_libraries(oemu PUBLIC oemu_compiler_flags)

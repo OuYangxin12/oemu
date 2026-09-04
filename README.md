@@ -139,14 +139,41 @@ as long as the assumptions below hold:
   single-threading. A future multithreaded host would need real fences.
 - **SP alignment is not checked.** A misaligned SP-based memory access proceeds
   rather than raising the `SPAlignmentFault` a real core would take.
-- **No ELF loader yet.** `oemu_cli` cannot boot a file from disk; the executor is
-  driven programmatically -- by the test suite and by `bench/c/exec_bench.c`,
-  which builds its own guest. The freestanding guest under `bench/guest/` is
-  waiting on exactly this.
+- **ELF loading covers static `ET_EXEC` only.** See the next section: the loader
+  maps a non-PIE AArch64 executable's `PT_LOAD` segments. A position-independent
+  `ET_DYN` image (which needs relocations applied) and dynamic linking are
+  deliberately `OEMU_ERR_UNSUPPORTED`, not half-implemented.
 - **Wrapped bitfield aliases are unverified.** Plain `UBFM`/`BFM`/`SBFM` (and
   `EXTR`) are exercised; the `UBFIZ`/`SBFIZ` spellings an assembler emits for the
   wrapped `msb < lsb` encodings are decoded identically but that equivalence was
   not checked against a reference, so those forms are treated as unverified.
+
+## Loading an ELF image
+
+`src/elf/elf.c` turns a static AArch64 executable into mapped guest memory.
+`oemu_elf_load` parses the file as little-endian bytes at explicit offsets -- it
+never casts the image to an `Elf64_*` struct, which would be an alignment and
+strict-aliasing violation and would let the host's byte order change what a guest
+image means -- validates that it is exactly what the emulator runs, then maps
+each `PT_LOAD` segment through `oemu_memory_map_image` and returns the entry
+point and the loaded address range.
+
+**Validate everything before touching memory.** Every check that does not need to
+mutate `oemu_memory` -- header identity, the whole program-header table's bounds,
+each segment's size consistency, segment overlap, region-table capacity -- runs
+in a first pass; only a fully validated segment set is mapped in a second pass.
+`oemu_memory` has no unmap, so a rejected image would otherwise leave the guest
+address space half-loaded. The one failure that can still arrive mid-map is the
+allocator (`OEMU_ERR_NO_MEMORY`); the contract is then to dispose the whole model
+and retry, which the loader makes safe by freeing its scratch before returning.
+
+**`oemu_memory_map_image` exists because the loader must be able to install
+read-only text.** A file-backed segment is copied at page-installation time, not
+as a guest store, so the region can carry the exact permissions it will run under
+-- including `R`-without-`W`. Populating it through the ordinary
+`oemu_memory_write_bytes` would demand `WRITE`, which is exactly what the loader
+must not require of `.text`. The span past the file slice stays zero, so a `.bss`
+tail needs no separate handling.
 
 ## Requirements
 
@@ -189,6 +216,7 @@ include/oemu/         Public headers. Consumers see only these.
   memory.h            flat guest address space: map, alias, read/write/fetch
   sysenv.h            the four-call SVC surface the guest runs against
   exec.h              the CPU: register bag plus the step/run interpreter loop
+  elf.h               load a static AArch64 ET_EXEC image into guest memory
 src/
   core/               status, version, allocator, check, sysenv
   buffer/
@@ -206,6 +234,9 @@ src/
   exec/
     exec.c            fetch-decode-dispatch loop, precise faults, sysreg whitelist
     exec_internal.h   pure helpers: shifts, extends, NZCV, bit reversal, bitfield
+  elf/
+    elf.c             static AArch64 ET_EXEC loader: validate, then map PT_LOAD
+    elf_internal.h    pure helpers: little-endian readers, segment validation
   main.c              demo executable
 tests/
   support/            shared test doubles (tracking + failing allocators)
@@ -354,18 +385,20 @@ make coverage-summary   # per-file text summary; needs only gcov
 make coverage           # HTML report in build/coverage/coverage-html; needs lcov
 ```
 
-Current, by new line coverage: **decode 100%, regs 100%, exec 96%, memory 98%,
-sysenv 93%, allocator/version 100%; TOTAL 98% of lines.** The uncovered exec
-lines are defensive arms a correct decoder never produces -- `operand2`'s
-extended/none operand kinds, the dispatch `default:` (`"a newer decoder cannot
-outdate this switch"`), and the `INT64_MIN / -1` divide edge -- so they read
-`#####` precisely because they are unreachable, not because they are untested.
+Current, by new line coverage: **decode 100%, regs 100%, exec 96%, elf 96%,
+memory 98%, sysenv 93%, allocator/version 100%; TOTAL 98% of lines.** The
+uncovered exec and elf lines are defensive arms a correct caller never produces:
+for exec, `operand2`'s extended/none operand kinds, the dispatch `default:`
+(`"a newer decoder cannot outdate this switch"`), and the `INT64_MIN / -1` divide
+edge; for elf, the single combined `status` guard after each batched little-endian
+read, which cannot fail once the whole header table has been bounds-checked. They
+read `#####` precisely because they are unreachable, not because they are untested.
 
 One tooling caveat so the number is read correctly: `make coverage-summary`
 currently omits `src/memory/memory.c` -- `file(STRINGS)` mis-parses that one
-`.gcov`, so the script's TOTAL understates by memory's 135 lines. The figure
-above adds memory back from a direct `gcov` run (97.8% of 135 lines, 100% of
-branches taken); it is a real measurement, not a guess.
+`.gcov`, so the script's TOTAL understates by memory's lines. The figure above
+adds memory back from a direct `gcov` run (98% of 141 lines); it is a real
+measurement, not a guess.
 
 One wrinkle worth knowing if you add a function that terminates the process:
 `abort()` prevents the gcov runtime from writing its counters, so such a function
