@@ -201,6 +201,21 @@ oemu_add_test(test_exec_internal
   LABELS "unit;whitebox"
 )
 
+# Black-box ELF loader tests: images are assembled byte-by-byte in the test,
+# covering the whole status contract and a load-then-run integration case.
+oemu_add_test(test_elf
+  SOURCES unit/test_elf.cpp
+  LABELS unit
+)
+
+# Reaches into src/elf/elf_internal.h: little-endian readers at odd offsets,
+# bounds/overflow edges, the segment validator and range-overlap.
+oemu_add_test(test_elf_internal
+  SOURCES unit/test_elf_internal.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.
@@ -225,6 +240,8 @@ add_dependencies(check
   test_sysenv
   test_exec
   test_exec_internal
+  test_elf
+  test_elf_internal
 )
 
 # Registers the `coverage` target now that the test targets exist.

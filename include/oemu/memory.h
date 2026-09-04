@@ -109,9 +109,28 @@ OEMU_NODISCARD oemu_status oemu_memory_write(const oemu_memory *mem, uint64_t gv
                                              oemu_mem_size size, uint64_t value);
 
 /*
- * Copies `size` bytes from `src` to the guest range; the loader primitive.
- * Validates the whole range before the first byte, so a partial copy is not
- * observable. OEMU_ERR_INVALID_ARG for a NULL source with nonzero size.
+ * Maps an owned, zero-filled region exactly like oemu_memory_map, but installs
+ * `contents` (of `contents_size <= size` bytes) at its front before the region
+ * becomes reachable. This is the file-backed-segment primitive a loader needs:
+ * the copy happens at installation time rather than as a guest store, so it
+ * succeeds even when the region's final `perms` omit WRITE -- which
+ * oemu_memory_write_bytes would reject for read-only text. The span past
+ * `contents_size` stays zero, so a .bss tail needs no separate handling.
+ *
+ * Same errors as oemu_memory_map for the region itself, plus
+ * OEMU_ERR_INVALID_ARG when `contents` is NULL with a nonzero `contents_size`,
+ * or when `contents_size` exceeds `size`.
+ */
+OEMU_NODISCARD oemu_status oemu_memory_map_image(oemu_memory *mem, uint64_t gva, uint64_t size,
+                                                 uint32_t perms, const void *contents,
+                                                 uint64_t contents_size);
+
+/*
+ * Copies `size` bytes from `src` into the guest range. Validates the whole range
+ * before the first byte, so a partial copy is not observable. This is a guest
+ * store and requires WRITE; to load file-backed read-only text use
+ * oemu_memory_map_image instead. OEMU_ERR_INVALID_ARG for a NULL source with a
+ * nonzero size.
  */
 OEMU_NODISCARD oemu_status oemu_memory_write_bytes(const oemu_memory *mem, uint64_t gva,
                                                    const void *src, uint64_t size);

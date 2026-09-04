@@ -73,6 +73,58 @@ TEST_F(MemoryTest, MapBacksRegionWithZeroes) {
   EXPECT_EQ(value, 0U);
 }
 
+TEST_F(MemoryTest, MapImageInstallsContentsUnderReadOnlyPerms) {
+  /* The loader's primitive: contents go in at installation time, so a region
+   * that the guest may only read still gets populated -- and stays unwritable. */
+  const uint8_t payload[4] = {0xDEU, 0xADU, 0xBEU, 0xEFU};
+  ASSERT_EQ(oemu_memory_map_image(&mem_, kBase, 0x1000U, OEMU_PERM_READ, payload, 4U), OEMU_OK);
+  uint64_t value = 0U;
+  ASSERT_EQ(oemu_memory_read(&mem_, kBase, OEMU_MEM_WORD, false, &value), OEMU_OK);
+  EXPECT_EQ(value, UINT64_C(0xEFBEADDE)); /* little-endian byte order */
+  EXPECT_EQ(oemu_memory_write(&mem_, kBase, OEMU_MEM_WORD, 0U), OEMU_ERR_FAULT);
+  /* The .bss tail past the file slice is zero. */
+  ASSERT_EQ(oemu_memory_read(&mem_, kBase + 0x800U, OEMU_MEM_DWORD, false, &value), OEMU_OK);
+  EXPECT_EQ(value, 0U);
+}
+
+TEST_F(MemoryTest, MapImageContentsExactlyFillRegion) {
+  const uint8_t payload[8] = {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U};
+  ASSERT_EQ(
+      oemu_memory_map_image(&mem_, kBase, 8U, OEMU_PERM_READ | OEMU_PERM_WRITE, payload, 8U),
+      OEMU_OK);
+  uint64_t value = 0U;
+  ASSERT_EQ(oemu_memory_read(&mem_, kBase, OEMU_MEM_DWORD, false, &value), OEMU_OK);
+  EXPECT_EQ(value, UINT64_C(0x0807060504030201)); /* {1..8} little-endian */
+}
+
+TEST_F(MemoryTest, MapImageRejectsBadContents) {
+  const uint8_t payload[4] = {0U};
+  /* Contents larger than the region. */
+  EXPECT_EQ(oemu_memory_map_image(&mem_, kBase, 4U, OEMU_PERM_READ, payload, 8U),
+            OEMU_ERR_INVALID_ARG);
+  /* Nonzero contents size with no source pointer. */
+  EXPECT_EQ(oemu_memory_map_image(&mem_, kBase, 4U, OEMU_PERM_READ, nullptr, 4U),
+            OEMU_ERR_INVALID_ARG);
+  /* A null model. */
+  EXPECT_EQ(oemu_memory_map_image(nullptr, kBase, 4U, OEMU_PERM_READ, nullptr, 0U),
+            OEMU_ERR_INVALID_ARG);
+  EXPECT_EQ(mem_.region_count, 0U);
+}
+
+TEST_F(MemoryTest, MapImageFailsWhenBackingAllocationFails) {
+  oemu_memory_dispose(&mem_);
+  {
+    const oemu_test::FailingAllocator failing(2U); /* call 1 table, call 2 block */
+    const uint8_t payload[4] = {1U};
+    ASSERT_EQ(oemu_memory_init(&mem_, 1U), OEMU_OK);
+    EXPECT_EQ(oemu_memory_map_image(&mem_, kBase, 0x1000U, OEMU_PERM_ALL, payload, 4U),
+              OEMU_ERR_NO_MEMORY);
+    EXPECT_EQ(mem_.region_count, 0U);
+    oemu_memory_dispose(&mem_);
+  }
+  ASSERT_EQ(oemu_memory_init(&mem_, 8U), OEMU_OK); /* restore for TearDown */
+}
+
 TEST_F(MemoryTest, MapFailsWhenBackingAllocationFails) {
   /* Start from a fresh, minimal table so the failing call lines up exactly:
    * call 1 is the table, call 2 the region's backing block. Dispose before
