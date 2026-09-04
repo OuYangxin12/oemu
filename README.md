@@ -190,9 +190,28 @@ tail needs no separate handling.
 
 ```bash
 make test          # configure, build and run the whole suite
+make run GUEST=path/to/prog.elf   # boot a static AArch64 ELF under the CLI
 make bench-exec    # end-to-end interpreter throughput (see bench/README.md)
 make help          # list every target
 ```
+
+### Running a binary
+
+The `oemu` executable boots a static AArch64 `ET_EXEC` image:
+
+```bash
+./build/debug/bin/oemu run prog.elf            # run to completion, exit status
+./build/debug/bin/oemu run prog.elf --max-insns 1000000
+./build/debug/bin/oemu run prog.elf | diff - expected.txt   # stdout passes through
+```
+
+It prints nothing on a clean run and exits with the guest's own exit code. The
+process exit status is `1` (load/read/run failure), `2` (bad usage) or `3`
+(instruction budget spent) when the guest never reached `exit`; otherwise it is
+whatever the guest asked for. `make run` and `make bench-e2e` are thin wrappers
+around `oemu run $(GUEST)`; `GUEST` defaults to the freestanding guest under
+`bench/guest/`, so `make bench-guest && make bench-e2e` boots that guest (and
+skips cleanly when no AArch64 linker is available).
 
 Behind the scenes that is just CMake:
 
@@ -237,7 +256,7 @@ src/
   elf/
     elf.c             static AArch64 ET_EXEC loader: validate, then map PT_LOAD
     elf_internal.h    pure helpers: little-endian readers, segment validation
-  main.c              demo executable
+  main.c              the `oemu` CLI: load an ELF from disk, map a stack, run it
 tests/
   support/            shared test doubles (tracking + failing allocators)
   unit/               one test file per module
@@ -386,13 +405,18 @@ make coverage           # HTML report in build/coverage/coverage-html; needs lco
 ```
 
 Current, by new line coverage: **decode 100%, regs 100%, exec 96%, elf 96%,
-memory 98%, sysenv 93%, allocator/version 100%; TOTAL 98% of lines.** The
-uncovered exec and elf lines are defensive arms a correct caller never produces:
-for exec, `operand2`'s extended/none operand kinds, the dispatch `default:`
-(`"a newer decoder cannot outdate this switch"`), and the `INT64_MIN / -1` divide
-edge; for elf, the single combined `status` guard after each batched little-endian
-read, which cannot fail once the whole header table has been bounds-checked. They
-read `#####` precisely because they are unreachable, not because they are untested.
+memory 98%, sysenv 93%, main 84%, allocator/version 100%; TOTAL 97% of lines.**
+The uncovered exec and elf lines are defensive arms a correct caller never
+produces: for exec, `operand2`'s extended/none operand kinds, the dispatch
+`default:` (`"a newer decoder cannot outdate this switch"`), and the
+`INT64_MIN / -1` divide edge; for elf, the single combined `status` guard after
+each batched little-endian read, which cannot fail once the whole header table has
+been bounds-checked. `main.c` is the CLI entry point, driven end-to-end by the
+forking `test_cli` (which runs the real binary); its uncovered lines are the rarer
+error arms -- allocation failure, a faulting or unsupported guest instruction, a
+stack map that collides -- not the happy path or the exit-code contract, which the
+subprocess tests cover. These read `#####` precisely because they are hard to
+reach on purpose, not because they are untested.
 
 One tooling caveat so the number is read correctly: `make coverage-summary`
 currently omits `src/memory/memory.c` -- `file(STRINGS)` mis-parses that one

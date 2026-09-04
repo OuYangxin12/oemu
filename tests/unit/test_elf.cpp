@@ -1,11 +1,11 @@
 /*
  * Black-box tests for the ELF loader.
  *
- * Every image is assembled byte-by-byte in this file (no external .elf), so a
- * failure names exactly the header field that caused it, and the malformed
- * cases that a real assembler would never emit are as easy to write as the
- * well-formed ones. Encodings baked into the integration test's payload were
- * verified against the host assembler (see the repo's GAS-discipline note):
+ * Images are assembled byte-by-byte via the shared support/elf_builder.h (no
+ * external .elf), so a failure names exactly the header field that caused it, and
+ * the malformed cases that a real assembler would never emit are as easy to write
+ * as the well-formed ones. Encodings baked into the integration test's payload
+ * were verified against the host assembler (see the repo's GAS-discipline note):
  *   mov x8,#94 = 0xd2800bc8   mov x0,#7 = 0xd28000e0   svc #0 = 0xd4000001
  */
 #include "oemu/elf.h"
@@ -21,121 +21,12 @@
 
 #include <gtest/gtest.h>
 
+#include "support/elf_builder.h"
 #include "support/tracking_allocator.h"
 
 namespace {
 
-/* ELF64 / program-header geometry, mirrored from the on-disk format so the
- * builder can lay bytes down without depending on the library's internals. */
-constexpr uint64_t kEHdrSize = 64U;
-constexpr uint64_t kPhdrSize = 56U;
-constexpr uint64_t kOffType = 16U;
-constexpr uint64_t kOffMachine = 18U;
-constexpr uint64_t kOffEntry = 24U;
-constexpr uint64_t kOffPhoff = 32U;
-constexpr uint64_t kOffPhentsize = 54U;
-constexpr uint64_t kOffPhnum = 56U;
-constexpr uint64_t kOffEiClass = 4U;
-constexpr uint64_t kOffEiData = 5U;
-
-constexpr uint64_t kPhType = 0U;
-constexpr uint64_t kPhFlags = 4U;
-constexpr uint64_t kPhOffset = 8U;
-constexpr uint64_t kPhVaddr = 16U;
-constexpr uint64_t kPhFilesz = 32U;
-constexpr uint64_t kPhMemsz = 40U;
-constexpr uint64_t kPhAlign = 48U;
-
-constexpr uint8_t kClass64 = 2U;
-constexpr uint8_t kDataLsb = 1U;
-constexpr uint16_t kTypeExec = 2U;
-constexpr uint16_t kMachineA64 = 183U;
-constexpr uint32_t kTypeLoad = 1U;
-constexpr uint32_t kFlagRx = 5U; /* PF_R|PF_X */
-
-void put16(std::vector<uint8_t> &v, uint64_t off, uint16_t value) {
-  v[off] = (uint8_t)(value & 0xFFU);
-  v[off + 1U] = (uint8_t)((value >> 8) & 0xFFU);
-}
-void put32(std::vector<uint8_t> &v, uint64_t off, uint32_t value) {
-  for (unsigned i = 0U; i < 4U; i++) {
-    v[off + i] = (uint8_t)((value >> (8U * i)) & 0xFFU);
-  }
-}
-void put64(std::vector<uint8_t> &v, uint64_t off, uint64_t value) {
-  for (unsigned i = 0U; i < 8U; i++) {
-    v[off + i] = (uint8_t)((value >> (8U * i)) & 0xFFU);
-  }
-}
-
-struct SegmentSpec {
-  uint64_t vaddr;
-  std::vector<uint8_t> data; /* becomes the file slice; filesz = data.size() */
-  uint64_t memsz;            /* mapping size; > data.size() adds a zero bss tail */
-  uint32_t flags = kFlagRx;
-  uint32_t type = kTypeLoad; /* PT_LOAD unless a test exercises a skipped header */
-  uint64_t align = 0x1000U;
-};
-
-/* A 64-byte ELF64 header with an empty program-header table. */
-std::vector<uint8_t> bare_header(uint16_t phnum) {
-  std::vector<uint8_t> v(kEHdrSize, 0U);
-  v[0] = 0x7FU;
-  v[1] = 'E';
-  v[2] = 'L';
-  v[3] = 'F';
-  v[kOffEiClass] = kClass64;
-  v[kOffEiData] = kDataLsb;
-  put16(v, kOffType, kTypeExec);
-  put16(v, kOffMachine, kMachineA64);
-  put64(v, kOffEntry, 0U);
-  put64(v, kOffPhoff, kEHdrSize);
-  put16(v, kOffPhentsize, (uint16_t)kPhdrSize);
-  put16(v, kOffPhnum, phnum);
-  return v;
-}
-
-/* Assembles a well-formed image: header, `segs.size()` PT_LOAD entries at
- * phoff=64, then the payloads. memsz may exceed the payload size to model .bss. */
-std::vector<uint8_t> build_image(const std::vector<SegmentSpec> &segs, uint64_t entry) {
-  const uint64_t phnum = (uint64_t)segs.size();
-  const uint64_t data_start = kEHdrSize + phnum * kPhdrSize;
-  std::vector<uint8_t> v = bare_header((uint16_t)phnum);
-  v.resize(data_start, 0U);
-
-  uint64_t cursor = data_start;
-  std::vector<uint64_t> offsets;
-  for (const SegmentSpec &s : segs) {
-    offsets.push_back(cursor);
-    v.insert(v.end(), s.data.begin(), s.data.end());
-    cursor += s.data.size();
-  }
-
-  put64(v, kOffEntry, entry);
-  for (uint64_t i = 0U; i < phnum; i++) {
-    const SegmentSpec &s = segs[i];
-    const uint64_t ph = kEHdrSize + i * kPhdrSize;
-    put32(v, ph + kPhType, s.type);
-    put32(v, ph + kPhFlags, s.flags);
-    put64(v, ph + kPhOffset, offsets[i]);
-    put64(v, ph + kPhVaddr, s.vaddr);
-    put64(v, ph + kPhFilesz, (uint64_t)s.data.size());
-    put64(v, ph + kPhMemsz, s.memsz);
-    put64(v, ph + kPhAlign, s.align);
-  }
-  return v;
-}
-
-/* Little-endian 32-bit words -> file-order bytes. */
-std::vector<uint8_t> to_bytes(const std::vector<uint32_t> &words) {
-  std::vector<uint8_t> out;
-  for (uint32_t w : words) {
-    for (unsigned i = 0U; i < 4U; i++) {
-      out.push_back((uint8_t)((w >> (8U * i)) & 0xFFU));
-    }
-  }
-  return out;
-}
+using namespace oemu_test::elf;
 
 class ElfTest : public ::testing::Test {
  protected:
@@ -277,7 +168,6 @@ TEST_F(ElfTest, TwoSegmentsWithBssTailAreZeroFilled) {
 TEST_F(ElfTest, IgnoresNonLoadProgramHeaders) {
   /* A PT_NOTE alongside a PT_LOAD: only the load segment is mapped, and the
    * note is stepped over without disturbing the count. */
-  constexpr uint32_t kTypeNote = 4U;
   oemu_memory mem{};
   ASSERT_EQ(oemu_memory_init(&mem, 8U), OEMU_OK);
   const std::vector<uint8_t> note = to_bytes({0U, 0U});
