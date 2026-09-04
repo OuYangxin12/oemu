@@ -12,6 +12,11 @@ JOBS    ?= $(shell nproc 2>/dev/null || echo 4)
 # Extra arguments forwarded to ctest, e.g. `make test ARGS="-R Buffer"`.
 ARGS ?=
 
+# The ELF that `make run` / `make bench-e2e` boot. Defaults to the freestanding
+# guest benchmark; build it first with `make bench-guest` (needs an AArch64
+# linker), or point GUEST at any static ET_EXEC AArch64 image.
+GUEST ?= bench/guest/build/oemu-guest-bench
+
 .DEFAULT_GOAL := test
 
 .PHONY: help
@@ -83,8 +88,8 @@ test-death: build ## Run only the death tests
 	$(CTEST) --test-dir $(BUILD) --output-on-failure -L death
 
 .PHONY: run
-run: build ## Run the demo executable
-	$(BUILD)/bin/oemu
+run: build ## Run the CLI on $(GUEST)
+	$(BUILD)/bin/oemu run $(GUEST)
 
 # --- benchmarks ---------------------------------------------------------------
 
@@ -95,6 +100,22 @@ bench: build ## Run the decode-throughput benchmark over bench/corpus blobs
 .PHONY: bench-exec
 bench-exec: build ## Run the end-to-end executor-throughput benchmark
 	$(BUILD)/bin/oemu-bench-exec
+
+# Boots the freestanding guest under the oemu CLI and lets its stdout through.
+# The guest is cross-built; build.sh exits 3 when no AArch64 linker is present,
+# which is treated here as a clean skip so this target never reports a false
+# failure on a host (or CI runner) that lacks one. Byte-comparing the guest's
+# stdout against a recorded golden is the follow-up step and needs the golden
+# generated on a machine that has the linker.
+.PHONY: bench-e2e
+bench-e2e: build ## Run the guest under oemu (skips cleanly with no AArch64 linker)
+	@bash bench/guest/build.sh; rc=$$?; \
+	if [ $$rc -eq 3 ]; then \
+		echo "bench-e2e: skipped -- no AArch64 linker (see bench/guest/build.sh)"; \
+		exit 0; \
+	fi; \
+	if [ $$rc -ne 0 ]; then echo "bench-e2e: guest build failed (exit $$rc)" >&2; exit $$rc; fi; \
+	$(BUILD)/bin/oemu run $(GUEST)
 
 .PHONY: bench-corpus
 bench-corpus: ## Regenerate the corpus blobs (needs clang with an AArch64 backend)

@@ -216,6 +216,16 @@ oemu_add_test(test_elf_internal
   LABELS "unit;whitebox"
 )
 
+# Black-box tests for the `oemu run` CLI: fork/exec the real binary against
+# byte-built ELF files and check the exit-code contract. Needs the oemu binary
+# built first, so it depends on that target (the target is `oemu_cli`; its
+# OUTPUT_NAME is `oemu`).
+oemu_add_test(test_cli
+  SOURCES unit/test_cli.cpp
+  LABELS unit
+)
+add_dependencies(test_cli oemu_cli)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.
@@ -242,6 +252,7 @@ add_dependencies(check
   test_exec_internal
   test_elf
   test_elf_internal
+  test_cli
 )
 
 # Registers the `coverage` target now that the test targets exist.
