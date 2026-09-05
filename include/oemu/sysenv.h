@@ -25,6 +25,7 @@
 #define OEMU_SYSENV_H
 
 #include "oemu/macros.h"
+#include "oemu/memops.h" /* the environment view returned by oemu_sysenv_envops */
 #include "oemu/memory.h"
 #include "oemu/status.h"
 
@@ -76,6 +77,14 @@ int oemu_sysenv_exit_code(const oemu_sysenv *env);
  */
 int64_t oemu_sysenv_syscall(oemu_sysenv *env, oemu_memory *mem, uint64_t nr,
                             const uint64_t args[6]);
+
+/*
+ * An environment view of this sysenv: an oemu_env_ops whose syscall adapter
+ * calls oemu_sysenv_syscall through whatever bus it is given, and whose
+ * halted adapter reports oemu_sysenv_exited. The view borrows: `env` must
+ * outlive it. Constructing it allocates nothing.
+ */
+OEMU_NODISCARD oemu_env_ops oemu_sysenv_envops(oemu_sysenv *env);
 
 OEMU_END_DECLS
 

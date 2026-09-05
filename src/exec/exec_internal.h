@@ -91,6 +91,18 @@ uint64_t oemu_exec_internal_rev32(uint64_t value);
 OEMU_NODISCARD oemu_status oemu_exec_internal_dispatch(oemu_cpu *cpu, oemu_memory *mem,
                                                        oemu_sysenv *env, const oemu_insn *insn);
 
+/*
+ * The bus-seam dispatch: same contract, but over memops/envops views. The
+ * wrapper above is a thin adapter that builds a pair of views and calls
+ * this. `mem` must be non-NULL with all four callbacks set; `env` may be
+ * NULL (or have a NULL syscall), either of which makes SVC
+ * OEMU_ERR_UNSUPPORTED, exactly as before.
+ */
+OEMU_NODISCARD oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu,
+                                                           const oemu_memops *mem,
+                                                           const oemu_env_ops *env,
+                                                           const oemu_insn *insn);
+
 OEMU_END_DECLS
 
 #endif /* OEMU_SRC_EXEC_INTERNAL_H */

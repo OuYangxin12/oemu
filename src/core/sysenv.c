@@ -36,7 +36,7 @@ int oemu_sysenv_exit_code(const oemu_sysenv *env) {
   return (env != NULL && env->exited) ? env->exit_code : 0;
 }
 
-static int64_t sys_write(oemu_sysenv *env, oemu_memory *mem, uint64_t fd, uint64_t buf,
+static int64_t sys_write(oemu_sysenv *env, const oemu_memops *mem, uint64_t fd, uint64_t buf,
                          uint64_t count) {
   if (fd != 1ULL && fd != 2ULL) {
     return -OEMU_EBADF;
@@ -44,14 +44,17 @@ static int64_t sys_write(oemu_sysenv *env, oemu_memory *mem, uint64_t fd, uint64
   if (count == 0ULL) {
     return 0;
   }
+  if (mem == NULL) {
+    return -OEMU_EFAULT;
+  }
   if (count > (UINT64_MAX - buf)) {
     return -OEMU_EFAULT; /* the range wraps; no region can contain it */
   }
-  if (oemu_memory_validate(mem, buf, count, OEMU_PERM_READ) != OEMU_OK) {
+  if (mem->validate(mem->ctx, buf, count, OEMU_PERM_READ) != OEMU_OK) {
     return -OEMU_EFAULT;
   }
   /* Read the bytes out of the guest one at a time into a small bounce buffer:
-   * the region API has no raw-host-pointer entry point, and a syscall is
+   * the bus seam has no raw-host-pointer entry point, and a syscall is
    * nowhere near the hot path where that would matter. */
   FILE *stream = (env->out != NULL) ? env->out : stdout;
   uint8_t chunk[256];
@@ -63,7 +66,7 @@ static int64_t sys_write(oemu_sysenv *env, oemu_memory *mem, uint64_t fd, uint64
     }
     for (uint64_t i = 0; i < want; i++) {
       uint64_t byte = 0U;
-      if (oemu_memory_read(mem, buf + written + i, OEMU_MEM_BYTE, false, &byte) != OEMU_OK) {
+      if (mem->read(mem->ctx, buf + written + i, OEMU_MEM_BYTE, false, &byte) != OEMU_OK) {
         return (written > 0ULL) ? (int64_t)written : -OEMU_EFAULT;
       }
       chunk[i] = (uint8_t)(byte & UINT64_C(0xFF));
@@ -77,7 +80,7 @@ static int64_t sys_write(oemu_sysenv *env, oemu_memory *mem, uint64_t fd, uint64
   return (int64_t)written;
 }
 
-static int64_t sys_clock_gettime(oemu_memory *mem, uint64_t clock_id, uint64_t ts_gva) {
+static int64_t sys_clock_gettime(const oemu_memops *mem, uint64_t clock_id, uint64_t ts_addr) {
   struct timespec ts;
   if (clock_id != OEMU_CLOCK_REALTIME && clock_id != OEMU_CLOCK_MONOTONIC) {
     return -OEMU_EINVAL;
@@ -85,21 +88,27 @@ static int64_t sys_clock_gettime(oemu_memory *mem, uint64_t clock_id, uint64_t t
   if (clock_gettime((clockid_t)clock_id, &ts) != 0) {
     return -OEMU_EFAULT;
   }
-  /* struct timespec in the guest is two 64-bit fields, seconds then
-   * nanoseconds; both happen to match the host on AArch64 LP64. */
-  if (oemu_memory_validate(mem, ts_gva, 8ULL, OEMU_PERM_WRITE) != OEMU_OK ||
-      oemu_memory_validate(mem, ts_gva + 8ULL, 8ULL, OEMU_PERM_WRITE) != OEMU_OK) {
+  if (mem == NULL) {
     return -OEMU_EFAULT;
   }
-  if (oemu_memory_write(mem, ts_gva, OEMU_MEM_DWORD, (uint64_t)ts.tv_sec) != OEMU_OK ||
-      oemu_memory_write(mem, ts_gva + 8ULL, OEMU_MEM_DWORD, (uint64_t)ts.tv_nsec) != OEMU_OK) {
+  /* struct timespec in the guest is two 64-bit fields, seconds then
+   * nanoseconds; both happen to match the host on AArch64 LP64. */
+  if (mem->validate(mem->ctx, ts_addr, 8ULL, OEMU_PERM_WRITE) != OEMU_OK ||
+      mem->validate(mem->ctx, ts_addr + 8ULL, 8ULL, OEMU_PERM_WRITE) != OEMU_OK) {
+    return -OEMU_EFAULT;
+  }
+  if (mem->write(mem->ctx, ts_addr, OEMU_MEM_DWORD, (uint64_t)ts.tv_sec) != OEMU_OK ||
+      mem->write(mem->ctx, ts_addr + 8ULL, OEMU_MEM_DWORD, (uint64_t)ts.tv_nsec) != OEMU_OK) {
     return -OEMU_EFAULT;
   }
   return 0;
 }
 
-int64_t oemu_sysenv_syscall(oemu_sysenv *env, oemu_memory *mem, uint64_t nr,
-                            const uint64_t args[6]) {
+/* The seam-level core: everything below the public entry point works through
+ * oemu_memops, so the same table serves a flat oemu_memory guest and, from
+ * M2 on, a full-system machine's physical bus. */
+static int64_t sysenv_syscall_ops(oemu_sysenv *env, const oemu_memops *mem, uint64_t nr,
+                                  const uint64_t args[6]) {
   if (env == NULL || args == NULL) {
     return -OEMU_EINVAL;
   }
@@ -116,4 +125,28 @@ int64_t oemu_sysenv_syscall(oemu_sysenv *env, oemu_memory *mem, uint64_t nr,
     default:
       return -OEMU_ENOSYS;
   }
+}
+
+int64_t oemu_sysenv_syscall(oemu_sysenv *env, oemu_memory *mem, uint64_t nr,
+                            const uint64_t args[6]) {
+  /* The view is built even for a NULL `mem`: the adapters pass the NULL
+   * context through and every entry point rejects it, which is exactly the
+   * -EFAULT the old direct call produced. */
+  const oemu_memops bus = oemu_memory_memops(mem);
+  return sysenv_syscall_ops(env, &bus, nr, args);
+}
+
+/* --- environment view ---------------------------------------------------------- */
+
+static int64_t envops_syscall(void *ctx, const oemu_memops *mem, uint64_t nr,
+                              const uint64_t args[6]) {
+  return sysenv_syscall_ops((oemu_sysenv *)ctx, mem, nr, args);
+}
+
+static bool envops_halted(const void *ctx) {
+  return oemu_sysenv_exited((const oemu_sysenv *)ctx);
+}
+
+oemu_env_ops oemu_sysenv_envops(oemu_sysenv *env) {
+  return (oemu_env_ops){.ctx = env, .syscall = envops_syscall, .halted = envops_halted};
 }
