@@ -11,6 +11,8 @@ add_library(oemu
   regs/regs.c
   decode/decode.c
   memory/memory.c
+  aspace/aspace.c
+  machine/machine.c
   exec/exec.c
   elf/elf.c
 )
@@ -21,6 +23,7 @@ target_sources(oemu PRIVATE
   regs/regs_internal.h
   decode/decode_internal.h
   memory/memory_internal.h
+  aspace/aspace_internal.h
   exec/exec_internal.h
   elf/elf_internal.h
 )
@@ -39,6 +42,8 @@ target_include_directories(oemu
     ${CMAKE_CURRENT_SOURCE_DIR}/decode
     # Likewise for memory.c / exec.c and their internal headers.
     ${CMAKE_CURRENT_SOURCE_DIR}/memory
+    # Likewise for aspace.c and "aspace_internal.h".
+    ${CMAKE_CURRENT_SOURCE_DIR}/aspace
     ${CMAKE_CURRENT_SOURCE_DIR}/exec
     # Likewise for elf.c and "elf_internal.h".
     ${CMAKE_CURRENT_SOURCE_DIR}/elf
