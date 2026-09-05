@@ -251,6 +251,27 @@ oemu_add_test(test_cli
 )
 add_dependencies(test_cli oemu_cli)
 
+# System-register state: boot PSTATE, the identification block and the
+# table-driven MRS/MSR contract, including the two Undefined signals.
+oemu_add_test(test_sysreg
+  SOURCES unit/test_sysreg.cpp
+  LABELS unit
+)
+
+# Reaches into src/sysreg/sysreg_internal.h: table-wide row well-formedness,
+# assembler-harvested encoding pins, and init's reset sweep.
+oemu_add_test(test_sysreg_internal
+  SOURCES unit/test_sysreg_internal.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
+# Death tests for the sysreg module's fatal contracts (EL2 boot, NULL state).
+oemu_add_test(test_sysreg_check
+  SOURCES unit/test_sysreg_check.cpp
+  LABELS "unit;death"
+)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.
@@ -281,6 +302,9 @@ add_dependencies(check
   test_elf
   test_elf_internal
   test_cli
+  test_sysreg
+  test_sysreg_internal
+  test_sysreg_check
 )
 
 # Registers the `coverage` target now that the test targets exist.
