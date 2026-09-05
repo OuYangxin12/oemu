@@ -13,6 +13,7 @@ add_library(oemu
   memory/memory.c
   aspace/aspace.c
   machine/machine.c
+  sysreg/sysreg.c
   exec/exec.c
   elf/elf.c
 )
@@ -26,6 +27,7 @@ target_sources(oemu PRIVATE
   aspace/aspace_internal.h
   exec/exec_internal.h
   elf/elf_internal.h
+  sysreg/sysreg_internal.h
 )
 
 target_include_directories(oemu
@@ -47,6 +49,8 @@ target_include_directories(oemu
     ${CMAKE_CURRENT_SOURCE_DIR}/exec
     # Likewise for elf.c and "elf_internal.h".
     ${CMAKE_CURRENT_SOURCE_DIR}/elf
+    # Likewise for sysreg.c and "sysreg_internal.h".
+    ${CMAKE_CURRENT_SOURCE_DIR}/sysreg
 )
 
 target_link_libraries(oemu PUBLIC oemu_compiler_flags)
