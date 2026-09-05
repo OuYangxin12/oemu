@@ -180,6 +180,22 @@ oemu_add_test(test_memory
   LABELS "unit;whitebox"
 )
 
+# The system-mode bus: RAM regions, MMIO device regions and the fake device
+# double. Reaches into src/aspace/aspace_internal.h for the region-table
+# helpers and byte assembly, so it counts as white-box.
+oemu_add_test(test_aspace
+  SOURCES unit/test_aspace.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
+# The machine: its two allocations, their failure paths, and the sticky
+# lifecycle events.
+oemu_add_test(test_machine
+  SOURCES unit/test_machine.cpp
+  LABELS unit
+)
+
 # The four-syscall guest ABI: write capture, clock layout, exit, errno fidelity.
 oemu_add_test(test_sysenv
   SOURCES unit/test_sysenv.cpp
@@ -247,6 +263,8 @@ add_dependencies(check
   test_decode
   test_decode_internal
   test_memory
+  test_aspace
+  test_machine
   test_sysenv
   test_exec
   test_exec_internal
