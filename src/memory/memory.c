@@ -253,3 +253,33 @@ oemu_status oemu_memory_fetch32(const oemu_memory *mem, uint64_t pc, uint32_t *w
   *word_out = (uint32_t)oemu_memory_internal_disassemble(bytes, sizeof(bytes));
   return OEMU_OK;
 }
+
+/* --- bus view ------------------------------------------------------------------ */
+
+/* Thin casts onto the entry points above: the view adds no behaviour of its
+ * own, so anything proven about oemu_memory_* holds through it verbatim. */
+static oemu_status memory_ops_fetch32(void *ctx, uint64_t pa, uint32_t *word_out) {
+  return oemu_memory_fetch32((const oemu_memory *)ctx, pa, word_out);
+}
+
+static oemu_status memory_ops_read(void *ctx, uint64_t pa, oemu_mem_size size, bool sign_extend,
+                                   uint64_t *value_out) {
+  return oemu_memory_read((const oemu_memory *)ctx, pa, size, sign_extend, value_out);
+}
+
+static oemu_status memory_ops_write(void *ctx, uint64_t pa, oemu_mem_size size,
+                                    uint64_t value) {
+  return oemu_memory_write((const oemu_memory *)ctx, pa, size, value);
+}
+
+static oemu_status memory_ops_validate(void *ctx, uint64_t pa, uint64_t size, uint32_t perms) {
+  return oemu_memory_validate((const oemu_memory *)ctx, pa, size, perms);
+}
+
+oemu_memops oemu_memory_memops(oemu_memory *mem) {
+  return (oemu_memops){.ctx = mem,
+                       .fetch32 = memory_ops_fetch32,
+                       .read = memory_ops_read,
+                       .write = memory_ops_write,
+                       .validate = memory_ops_validate};
+}

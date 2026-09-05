@@ -20,6 +20,7 @@
 #include "oemu/allocator.h"
 #include "oemu/decode.h" /* oemu_mem_size: the transfer-size selector */
 #include "oemu/macros.h"
+#include "oemu/memops.h" /* the bus view returned by oemu_memory_memops */
 #include "oemu/status.h"
 
 #include <stdbool.h>
@@ -142,6 +143,14 @@ OEMU_NODISCARD oemu_status oemu_memory_write_bytes(const oemu_memory *mem, uint6
  */
 OEMU_NODISCARD oemu_status oemu_memory_fetch32(const oemu_memory *mem, uint64_t pc,
                                                uint32_t *word_out);
+
+/*
+ * A bus view of this memory: an oemu_memops whose callbacks call straight
+ * back into the entry points above, for handing to the executor's
+ * oemu_exec_step_bus() or to a syscall. The view borrows: `mem` must outlive
+ * it. Constructing it allocates nothing.
+ */
+OEMU_NODISCARD oemu_memops oemu_memory_memops(oemu_memory *mem);
 
 OEMU_END_DECLS
 
