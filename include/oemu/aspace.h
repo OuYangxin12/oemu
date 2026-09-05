@@ -20,6 +20,7 @@
 #include "oemu/decode.h" /* oemu_mem_size: the transfer-size selector */
 #include "oemu/device.h"
 #include "oemu/macros.h"
+#include "oemu/memops.h" /* the bus view returned by oemu_aspace_memops */
 #include "oemu/memory.h" /* the OEMU_PERM_* bits are shared vocabulary */
 #include "oemu/status.h"
 
@@ -127,6 +128,15 @@ OEMU_NODISCARD oemu_status oemu_aspace_write(const oemu_aspace *as, uint64_t pa,
  */
 OEMU_NODISCARD oemu_status oemu_aspace_fetch32(const oemu_aspace *as, uint64_t pa,
                                                uint32_t *word_out);
+
+/*
+ * A bus view of this address space: an oemu_memops whose callbacks call
+ * straight back into the entry points above, for handing to
+ * oemu_exec_step_bus(). The view borrows: `as` must outlive it, and later
+ * map/attach calls are visible through it (the callbacks re-read the table).
+ * Constructing it allocates nothing.
+ */
+OEMU_NODISCARD oemu_memops oemu_aspace_memops(oemu_aspace *as);
 
 OEMU_END_DECLS
 

@@ -2,6 +2,10 @@
  * A64 interpreter core. See include/oemu/exec.h for the contract and
  * src/exec/exec_internal.h for what each helper means.
  *
+ * Every memory reference goes through the oemu_memops seam, never at a
+ * concrete bus type: the same interpreter drives a flat test memory, a
+ * physical address space, or (from M2 on) a machine's own bus.
+ *
  * The dispatch order discipline that keeps faults precise:
  *
  *   1. read all sources into locals;
@@ -50,10 +54,9 @@ static void write_g(oemu_cpu *cpu, unsigned n, bool sp_form, oemu_reg_width widt
 }
 
 /*
- * After oemu_memory_validate succeeded, an access with the same arguments
- * cannot fail -- the model never allocates or re-shapes between calls. A
- * failure here is therefore a bug in oemu, not a guest event, and is reported
- * as one.
+ * After the bus's validate succeeded, an access with the same arguments
+ * cannot fail -- no provider allocates or re-shapes between calls. A failure
+ * here is therefore a bug in oemu, not a guest event, and is reported as one.
  */
 static void access_or_panic(oemu_status st) {
   OEMU_REQUIRE(st == OEMU_OK, "validated memory access failed");
@@ -386,8 +389,8 @@ static oemu_status do_msr(oemu_cpu *cpu, const oemu_insn *in) {
   return OEMU_OK;
 }
 
-static oemu_status do_svc(oemu_cpu *cpu, oemu_sysenv *env, oemu_memory *mem) {
-  if (env == NULL) {
+static oemu_status do_svc(oemu_cpu *cpu, const oemu_env_ops *env, const oemu_memops *mem) {
+  if ((env == NULL) || (env->syscall == NULL)) {
     return OEMU_ERR_UNSUPPORTED;
   }
   uint64_t args[6];
@@ -395,7 +398,7 @@ static oemu_status do_svc(oemu_cpu *cpu, oemu_sysenv *env, oemu_memory *mem) {
     args[i] = oemu_regs_read(&cpu->regs, i, OEMU_REG_W64);
   }
   const uint64_t nr = oemu_regs_read(&cpu->regs, 8U, OEMU_REG_W64);
-  const int64_t result = oemu_sysenv_syscall(env, mem, nr, args);
+  const int64_t result = env->syscall(env->ctx, mem, nr, args);
   /* Linux returns in x0, 64 bits wide: an errno arrives sign-negative. */
   oemu_regs_write(&cpu->regs, 0U, OEMU_REG_W64, (uint64_t)result);
   return OEMU_OK;
@@ -425,7 +428,7 @@ static uint64_t pair_transfer(const oemu_insn *in) {
   return UINT64_C(1) << (unsigned)in->mem_size;
 }
 
-static oemu_status do_pair(oemu_cpu *cpu, oemu_memory *mem, const oemu_insn *in) {
+static oemu_status do_pair(oemu_cpu *cpu, const oemu_memops *mem, const oemu_insn *in) {
   uint64_t addr;
   uint64_t writeback;
   (void)resolve_mem_addr(cpu, in, &addr, &writeback);
@@ -434,11 +437,11 @@ static oemu_status do_pair(oemu_cpu *cpu, oemu_memory *mem, const oemu_insn *in)
 
   /* Validate both transfers before touching anything, so a fault on the
    * second one cannot commit the first. */
-  oemu_status st = oemu_memory_validate(
-      mem, addr, transfer, (in->op == OEMU_OP_STP) ? OEMU_PERM_WRITE : OEMU_PERM_READ);
+  oemu_status st = mem->validate(mem->ctx, addr, transfer,
+                                 (in->op == OEMU_OP_STP) ? OEMU_PERM_WRITE : OEMU_PERM_READ);
   if (st == OEMU_OK) {
-    st = oemu_memory_validate(mem, addr2, transfer,
-                              (in->op == OEMU_OP_STP) ? OEMU_PERM_WRITE : OEMU_PERM_READ);
+    st = mem->validate(mem->ctx, addr2, transfer,
+                       (in->op == OEMU_OP_STP) ? OEMU_PERM_WRITE : OEMU_PERM_READ);
   }
   if (st != OEMU_OK) {
     return OEMU_ERR_FAULT;
@@ -449,12 +452,12 @@ static oemu_status do_pair(oemu_cpu *cpu, oemu_memory *mem, const oemu_insn *in)
   if (in->op == OEMU_OP_STP) {
     v1 = read_g(cpu, in->rd, false, in->width);
     v2 = read_g(cpu, in->rt2, false, in->width);
-    access_or_panic(oemu_memory_write(mem, addr, in->mem_size, v1));
-    access_or_panic(oemu_memory_write(mem, addr2, in->mem_size, v2));
+    access_or_panic(mem->write(mem->ctx, addr, in->mem_size, v1));
+    access_or_panic(mem->write(mem->ctx, addr2, in->mem_size, v2));
     note_store(cpu, addr, transfer * 2U);
   } else {
-    access_or_panic(oemu_memory_read(mem, addr, in->mem_size, in->is_signed_load, &v1));
-    access_or_panic(oemu_memory_read(mem, addr2, in->mem_size, in->is_signed_load, &v2));
+    access_or_panic(mem->read(mem->ctx, addr, in->mem_size, in->is_signed_load, &v1));
+    access_or_panic(mem->read(mem->ctx, addr2, in->mem_size, in->is_signed_load, &v2));
     write_g(cpu, in->rd, false, in->width, v1);
     write_g(cpu, in->rt2, false, in->width, v2);
   }
@@ -464,7 +467,7 @@ static oemu_status do_pair(oemu_cpu *cpu, oemu_memory *mem, const oemu_insn *in)
   return OEMU_OK;
 }
 
-static oemu_status do_single_mem(oemu_cpu *cpu, oemu_memory *mem, const oemu_insn *in) {
+static oemu_status do_single_mem(oemu_cpu *cpu, const oemu_memops *mem, const oemu_insn *in) {
   const bool is_store = (in->op == OEMU_OP_STR || in->op == OEMU_OP_STLR);
   const oemu_mem_size size = in->mem_size;
   const uint64_t nbytes = UINT64_C(1) << (unsigned)size;
@@ -480,7 +483,7 @@ static oemu_status do_single_mem(oemu_cpu *cpu, oemu_memory *mem, const oemu_ins
   }
 
   const oemu_status st =
-      oemu_memory_validate(mem, addr, nbytes, is_store ? OEMU_PERM_WRITE : OEMU_PERM_READ);
+      mem->validate(mem->ctx, addr, nbytes, is_store ? OEMU_PERM_WRITE : OEMU_PERM_READ);
   if (st != OEMU_OK) {
     return OEMU_ERR_FAULT;
   }
@@ -488,10 +491,10 @@ static oemu_status do_single_mem(oemu_cpu *cpu, oemu_memory *mem, const oemu_ins
   uint64_t value = 0U;
   if (is_store) {
     value = read_g(cpu, in->rd, false, in->width);
-    access_or_panic(oemu_memory_write(mem, addr, size, value));
+    access_or_panic(mem->write(mem->ctx, addr, size, value));
     note_store(cpu, addr, nbytes);
   } else {
-    access_or_panic(oemu_memory_read(mem, addr, size, in->is_signed_load, &value));
+    access_or_panic(mem->read(mem->ctx, addr, size, in->is_signed_load, &value));
     write_g(cpu, in->rd, false, in->width, value);
   }
   if (has_writeback) {
@@ -500,20 +503,20 @@ static oemu_status do_single_mem(oemu_cpu *cpu, oemu_memory *mem, const oemu_ins
   return OEMU_OK;
 }
 
-static oemu_status do_exclusive(oemu_cpu *cpu, oemu_memory *mem, const oemu_insn *in) {
+static oemu_status do_exclusive(oemu_cpu *cpu, const oemu_memops *mem, const oemu_insn *in) {
   const uint64_t nbytes = UINT64_C(1) << (unsigned)in->mem_size;
   const bool is_load = (in->op == OEMU_OP_LDXR);
   const uint64_t addr = read_g(cpu, in->rn, true, OEMU_REG_W64);
 
   const oemu_status st =
-      oemu_memory_validate(mem, addr, nbytes, is_load ? OEMU_PERM_READ : OEMU_PERM_WRITE);
+      mem->validate(mem->ctx, addr, nbytes, is_load ? OEMU_PERM_READ : OEMU_PERM_WRITE);
   if (st != OEMU_OK) {
     return OEMU_ERR_FAULT;
   }
 
   if (is_load) {
     uint64_t value = 0U;
-    access_or_panic(oemu_memory_read(mem, addr, in->mem_size, false, &value));
+    access_or_panic(mem->read(mem->ctx, addr, in->mem_size, false, &value));
     write_g(cpu, in->rd, false, in->width, value);
     cpu->monitor_addr = addr;
     cpu->monitor_size = nbytes;
@@ -528,7 +531,7 @@ static oemu_status do_exclusive(oemu_cpu *cpu, oemu_memory *mem, const oemu_insn
   cpu->monitor_valid = false;
   if (success) {
     const uint64_t value = read_g(cpu, in->rd, false, in->width);
-    access_or_panic(oemu_memory_write(mem, addr, in->mem_size, value));
+    access_or_panic(mem->write(mem->ctx, addr, in->mem_size, value));
   }
   write_g(cpu, in->rm, false, OEMU_REG_W32, success ? UINT64_C(0) : UINT64_C(1));
   return OEMU_OK;
@@ -612,9 +615,15 @@ static oemu_status do_ccmp(oemu_cpu *cpu, const oemu_insn *in) {
 
 /* --- the switch ---------------------------------------------------------------- */
 
-oemu_status oemu_exec_internal_dispatch(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env,
-                                        const oemu_insn *in) {
-  if (cpu == NULL || mem == NULL || in == NULL || in->op == OEMU_OP_UNKNOWN) {
+oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *mem,
+                                            const oemu_env_ops *env, const oemu_insn *in) {
+  if (cpu == NULL || in == NULL || in->op == OEMU_OP_UNKNOWN) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  /* A half-built view is a caller bug, and a NULL callback would otherwise
+   * surface far from where it was introduced. */
+  if ((mem == NULL) || (mem->fetch32 == NULL) || (mem->read == NULL) || (mem->write == NULL) ||
+      (mem->validate == NULL)) {
     return OEMU_ERR_INVALID_ARG;
   }
 
@@ -982,6 +991,16 @@ oemu_status oemu_exec_internal_dispatch(oemu_cpu *cpu, oemu_memory *mem, oemu_sy
   return OEMU_OK;
 }
 
+oemu_status oemu_exec_internal_dispatch(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env,
+                                        const oemu_insn *in) {
+  if (cpu == NULL || mem == NULL || in == NULL || in->op == OEMU_OP_UNKNOWN) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  const oemu_memops bus = oemu_memory_memops(mem);
+  const oemu_env_ops environment = oemu_sysenv_envops(env);
+  return oemu_exec_internal_dispatch_bus(cpu, &bus, (env != NULL) ? &environment : NULL, in);
+}
+
 oemu_status oemu_cpu_init(oemu_cpu *cpu, uint64_t entry_pc, uint64_t initial_sp) {
   if (cpu == NULL) {
     return OEMU_ERR_INVALID_ARG;
@@ -997,13 +1016,13 @@ oemu_status oemu_cpu_init(oemu_cpu *cpu, uint64_t entry_pc, uint64_t initial_sp)
   return OEMU_OK;
 }
 
-oemu_status oemu_exec_step(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env,
-                           oemu_insn *insn_out) {
+oemu_status oemu_exec_step_bus(oemu_cpu *cpu, const oemu_memops *mem, const oemu_env_ops *env,
+                               oemu_insn *insn_out) {
   if (cpu == NULL || mem == NULL) {
     return OEMU_ERR_INVALID_ARG;
   }
   uint32_t word = 0U;
-  const oemu_status fetch = oemu_memory_fetch32(mem, oemu_regs_pc(&cpu->regs), &word);
+  const oemu_status fetch = mem->fetch32(mem->ctx, oemu_regs_pc(&cpu->regs), &word);
   if (fetch != OEMU_OK) {
     return fetch;
   }
@@ -1015,14 +1034,21 @@ oemu_status oemu_exec_step(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env,
   if (dec != OEMU_OK) {
     return dec;
   }
-  return oemu_exec_internal_dispatch(cpu, mem, env, &insn);
+  return oemu_exec_internal_dispatch_bus(cpu, mem, env, &insn);
 }
 
-oemu_status oemu_exec_run(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env, uint64_t max_insns,
-                          uint64_t *completed_out) {
+/* Whether the environment says the guest has stopped. A missing environment
+ * or a missing callback is "still running", the same answer the concrete
+ * oemu_sysenv gives for a NULL pointer. */
+static bool envops_halted(const oemu_env_ops *env) {
+  return (env != NULL) && (env->halted != NULL) && env->halted(env->ctx);
+}
+
+oemu_status oemu_exec_run_bus(oemu_cpu *cpu, const oemu_memops *mem, const oemu_env_ops *env,
+                              uint64_t max_insns, uint64_t *completed_out) {
   uint64_t done = 0U;
   while (done < max_insns) {
-    const oemu_status st = oemu_exec_step(cpu, mem, env, NULL);
+    const oemu_status st = oemu_exec_step_bus(cpu, mem, env, NULL);
     if (st != OEMU_OK) {
       if (completed_out != NULL) {
         *completed_out = done;
@@ -1030,12 +1056,40 @@ oemu_status oemu_exec_run(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env, uin
       return st;
     }
     done++;
-    if (oemu_sysenv_exited(env)) {
+    if (envops_halted(env)) {
       break;
     }
   }
   if (completed_out != NULL) {
     *completed_out = done;
   }
-  return oemu_sysenv_exited(env) ? OEMU_OK : OEMU_ERR_TIMEOUT;
+  return envops_halted(env) ? OEMU_OK : OEMU_ERR_TIMEOUT;
+}
+
+/* --- concrete-bus wrappers ------------------------------------------------------ */
+
+/*
+ * The old entry points are now convenience over the seam: they build a view
+ * over a concrete oemu_memory/oemu_sysenv pair and hand it to the bus
+ * version. Building a view allocates nothing and costs a handful of pointer
+ * copies, which is nothing next to the instruction it drives. A NULL
+ * environment stays NULL so an SVC keeps reporting OEMU_ERR_UNSUPPORTED
+ * rather than reaching a half-valid envops.
+ */
+oemu_status oemu_exec_step(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env,
+                           oemu_insn *insn_out) {
+  if (cpu == NULL || mem == NULL) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  const oemu_memops bus = oemu_memory_memops(mem);
+  const oemu_env_ops environment = oemu_sysenv_envops(env);
+  return oemu_exec_step_bus(cpu, &bus, (env != NULL) ? &environment : NULL, insn_out);
+}
+
+oemu_status oemu_exec_run(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env, uint64_t max_insns,
+                          uint64_t *completed_out) {
+  const oemu_memops bus = oemu_memory_memops(mem);
+  const oemu_env_ops environment = oemu_sysenv_envops(env);
+  return oemu_exec_run_bus(cpu, &bus, (env != NULL) ? &environment : NULL, max_insns,
+                           completed_out);
 }

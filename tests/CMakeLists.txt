@@ -209,6 +209,15 @@ oemu_add_test(test_exec
   LABELS unit
 )
 
+# The bus seam: the memory and address-space views, the environment view, and
+# the executor driven over an oemu_aspace with an MMIO device. Reaches into
+# src/exec/exec_internal.h for the seam-level dispatch, so it is white-box.
+oemu_add_test(test_memops
+  SOURCES unit/test_memops.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
 # Reaches into src/exec/exec_internal.h: the shifted/extended operand edges,
 # the 128-bit-free multiply, one-source helpers, and single-opcode dispatch.
 oemu_add_test(test_exec_internal
@@ -266,6 +275,7 @@ add_dependencies(check
   test_aspace
   test_machine
   test_sysenv
+  test_memops
   test_exec
   test_exec_internal
   test_elf

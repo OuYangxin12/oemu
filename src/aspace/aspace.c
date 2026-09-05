@@ -350,3 +350,33 @@ oemu_status oemu_aspace_fetch32(const oemu_aspace *as, uint64_t pa, uint32_t *wo
   *word_out = (uint32_t)oemu_aspace_internal_disassemble(r->host + offset, 4);
   return OEMU_OK;
 }
+
+/* --- bus view ------------------------------------------------------------------ */
+
+/* Thin casts onto the entry points above, exactly as in memory.c: the view is
+ * behaviour-free, so oemu_aspace_* semantics hold through it verbatim. */
+static oemu_status aspace_ops_fetch32(void *ctx, uint64_t pa, uint32_t *word_out) {
+  return oemu_aspace_fetch32((const oemu_aspace *)ctx, pa, word_out);
+}
+
+static oemu_status aspace_ops_read(void *ctx, uint64_t pa, oemu_mem_size size, bool sign_extend,
+                                   uint64_t *value_out) {
+  return oemu_aspace_read((const oemu_aspace *)ctx, pa, size, sign_extend, value_out);
+}
+
+static oemu_status aspace_ops_write(void *ctx, uint64_t pa, oemu_mem_size size,
+                                    uint64_t value) {
+  return oemu_aspace_write((const oemu_aspace *)ctx, pa, size, value);
+}
+
+static oemu_status aspace_ops_validate(void *ctx, uint64_t pa, uint64_t size, uint32_t perms) {
+  return oemu_aspace_validate((const oemu_aspace *)ctx, pa, size, perms);
+}
+
+oemu_memops oemu_aspace_memops(oemu_aspace *as) {
+  return (oemu_memops){.ctx = as,
+                       .fetch32 = aspace_ops_fetch32,
+                       .read = aspace_ops_read,
+                       .write = aspace_ops_write,
+                       .validate = aspace_ops_validate};
+}

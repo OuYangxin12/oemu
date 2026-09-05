@@ -15,14 +15,16 @@
  * why every memory reference is validated before the first commit and
  * multi-transfer instructions stage through locals.
  *
- * The loop has no thread and no OS: the guest environment is whatever
- * oemu_sysenv implements, which today is the four-syscall benchmark ABI.
+ * The loop has no thread and no OS: the guest environment is whatever the
+ * oemu_env_ops it is handed implements, which today is oemu_sysenv's
+ * four-syscall benchmark ABI.
  */
 #ifndef OEMU_EXEC_H
 #define OEMU_EXEC_H
 
 #include "oemu/decode.h"
 #include "oemu/macros.h"
+#include "oemu/memops.h"
 #include "oemu/memory.h"
 #include "oemu/regs.h"
 #include "oemu/status.h"
@@ -75,6 +77,23 @@ OEMU_NODISCARD oemu_status oemu_exec_step(oemu_cpu *cpu, oemu_memory *mem, oemu_
  */
 OEMU_NODISCARD oemu_status oemu_exec_run(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env,
                                          uint64_t max_insns, uint64_t *completed_out);
+
+/*
+ * The bus-seam entries: the same two contracts, over any oemu_memops
+ * (oemu_memory_memops, oemu_aspace_memops, or a machine's own bus once M2
+ * lands) and any oemu_env_ops (oemu_sysenv_envops today, a PSCI-driven one
+ * later). `mem` must be non-NULL with all four callbacks set -- a view
+ * missing one is a caller bug, reported as OEMU_ERR_INVALID_ARG rather than
+ * called through. `env` may be NULL, in which case an SVC reports
+ * OEMU_ERR_UNSUPPORTED exactly as before and the run loop's halted check
+ * reads as false. The two entry points above are thin wrappers over these.
+ */
+OEMU_NODISCARD oemu_status oemu_exec_step_bus(oemu_cpu *cpu, const oemu_memops *mem,
+                                              const oemu_env_ops *env, oemu_insn *insn_out);
+
+OEMU_NODISCARD oemu_status oemu_exec_run_bus(oemu_cpu *cpu, const oemu_memops *mem,
+                                             const oemu_env_ops *env, uint64_t max_insns,
+                                             uint64_t *completed_out);
 
 OEMU_END_DECLS
 
