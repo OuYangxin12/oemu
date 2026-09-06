@@ -13,6 +13,11 @@ This file is the baseline context. Task-specific procedures live in
 | `oemu-add-c-module` | adding or changing a C module |
 | `oemu-ci-workflow` | touching CI, or reproducing a CI failure locally |
 
+Milestone work (M2c wrap-up, M3–M5) starts from
+`docs/verification-strategy.md`: read it before acting, and fill in a task
+card from `docs/templates/milestone-task-card.md` before writing code —
+acceptance commands and the test list come first, implementation second.
+
 ## What this project is
 
 - Production code is **C11**, compiled with hidden visibility and no C++ dependency.
