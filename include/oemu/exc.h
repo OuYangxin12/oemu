@@ -154,6 +154,12 @@ void oemu_exc_instruction_abort(oemu_regs *regs, oemu_sysregs *sysregs, uint64_t
 void oemu_exc_data_abort(oemu_regs *regs, oemu_sysregs *sysregs, uint64_t far,
                          unsigned log2_size, bool is_write, bool isv, uint8_t dfsc);
 
+/*
+ * Trap an EL1+ breakpoint-class source (BRK carries its own EC; HLT uses
+ * this one): ESR = EC 0x30, ISS = ISV=1, IDS=0, DFSC=0b000100 "software
+ * trigger", the layout every AArch64 debug entry shares. */
+void oemu_exc_breakpoint(oemu_regs *regs, oemu_sysregs *sysregs);
+
 /* A stable, never-NULL name for an EC value, for diagnostics and dumps. */
 const char *oemu_exc_ec_name(oemu_exc_ec ec);
 

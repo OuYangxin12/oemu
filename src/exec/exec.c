@@ -18,6 +18,8 @@
  * instruction whose address computation faults has committed nothing.
  */
 #include "oemu/check.h"
+#include "oemu/exc.h"
+#include "oemu/sysreg.h"
 
 #include "exec_internal.h"
 
@@ -611,6 +613,261 @@ static oemu_status do_ccmp(oemu_cpu *cpu, const oemu_insn *in) {
                                   : oemu_regs_add_with_carry(n, m, false, in->width);
   oemu_regs_set_nzcv(&cpu->regs, res.nzcv);
   return OEMU_OK;
+}
+
+/* --- system-mode (M2c) ---------------------------------------------------------- */
+/*
+ * The system dispatch adds no new instruction semantics: it answers the same
+ * opcodes at EL1+ where the architecture says so -- SVC/BRK/HLT/HVC/SMC trap
+ * into oemu/exc.h instead of returning a host-visible status, MRS/MSR go
+ * through the sysreg table instead of the EL0 whitelist, ERET returns, and a
+ * memory fault becomes a Data Abort with a FAR. Everything arithmetic or
+ * plain-memory stays in the shared switch below, so user mode and system mode
+ * cannot drift apart there.
+ */
+
+/* The op0=0b01 trap space is keyed by op1/CRn/CRm/op2; SEL carries them as
+ * [13:11]/[10:7]/[6:3]/[2:0] (the same split the sysreg rows use). */
+#define SYS_OP1(s) (((s) >> 11U) & 0x7U)
+#define SYS_CRN(s) (((s) >> 7U) & 0xFU)
+#define SYS_CRM(s) (((s) >> 3U) & 0xFU)
+#define SYS_OP2(s) ((s) & 0x7U)
+
+/* DC ZVA: op0=1 op1=3 CRn=7 CRm=4 op2=1 (Linux SYS_DC_ZVA, confirmed by the
+ * clang-harvested `dc zva, x3` = 0xD50B7423). */
+#define SYS_DC_ZVA ((uint32_t)0x1BA1U)
+/* A modelled cache line: matches the 64-byte line CCSIDR/CLIDR/CTR advertise. */
+#define EXEC_CACHE_LINE 64U
+
+oemu_exec_sys_action oemu_exec_internal_sys_action(uint32_t sel) {
+  const unsigned op1 = SYS_OP1(sel);
+  const unsigned crn = SYS_CRN(sel);
+  const unsigned crm = SYS_CRM(sel);
+
+  if (sel == SYS_DC_ZVA) {
+    return OEMU_EXEC_SYS_DC_ZVA;
+  }
+  /* TLBI, all privilege banks (op1 in {0,1,2,4,6}, CRn 8/9): pure
+   * invalidation, and oemu has no TLB yet (M3b), so a no-op is the
+   * architecturally correct answer. Unallocated holes in the space execute
+   * as no-ops too -- harmless while the space decodes as one class. */
+  if (((crn == 8U) || (crn == 9U)) &&
+      ((op1 == 0U) || (op1 == 1U) || (op1 == 2U) || (op1 == 4U))) {
+    return OEMU_EXEC_SYS_NOP;
+  }
+  /* AT (op1 in {0,4}, CRn 7, CRm 8/9: the full S1E* table of Linux
+   * asm/sysreg.h): a translation request needs the MMU (M3), and executing it
+   * as a no-op would silently lie about PAR_EL1. The GCS/SW DC ops share
+   * CRn 7 with CRm >= 10, which is why the window stops at 9. */
+  if ((crn == 7U) && ((crm == 8U) || (crm == 9U)) && ((op1 == 0U) || (op1 == 4U))) {
+    return OEMU_EXEC_SYS_TRAP;
+  }
+  /* DC and IC invalidation/clean space (CRn 7/10/11/15 with op1 in {0,3}):
+   * oemu models no caches and guest memory is the coherence point, so
+   * maintain-without-invalidate and invalidate are both honest no-ops. */
+  if ((op1 == 0U || op1 == 3U) &&
+      ((crn == 7U) || (crn == 10U) || (crn == 11U) || (crn == 15U))) {
+    return OEMU_EXEC_SYS_NOP;
+  }
+  /* Everything else -- AT variants above, SYS G0..G7 random generators,
+   * unallocated holes: not implemented, and the architecture's answer to an
+   * encoding the machine does not have is Undefined. */
+  return OEMU_EXEC_SYS_TRAP;
+}
+
+/* Re-assemble an op0=0b01 trap-space word from its selector and Rt. The
+ * caller normally has the fetched word already and should pass it; this
+ * exists for synthetic dispatch (white-box tests) that hand-builds an
+ * oemu_insn. Bits [29:21] are the group key (verified against the harvested
+ * encodings); SEL rides at [18:5], Rt at [4:0]. */
+uint32_t oemu_exec_internal_reencode_sys(uint32_t sel, unsigned rt) {
+  return 0xD5000000U | (1U << 19) | ((sel & SYSREG_MASK) << 5) | (rt & 0x1FU);
+}
+
+/* The address a memory instruction touched, for the Data Abort FAR. Only
+ * legal after a FAULT: the dispatch is precise, so the address inputs are
+ * still untouched and the same computation the access made can be redone. */
+static oemu_status fault_far_of(const oemu_cpu *cpu, const oemu_insn *in, uint64_t *far_out) {
+  if (in->operand_kind == OEMU_OPERAND_IMM) {
+    *far_out = (uint64_t)in->imm; /* LDR (literal): already PC-resolved */
+    return OEMU_OK;
+  }
+  if ((in->op == OEMU_OP_LDXR) || (in->op == OEMU_OP_STXR)) {
+    *far_out = read_g(cpu, in->rn, true, OEMU_REG_W64); /* base form, no offset */
+    return OEMU_OK;
+  }
+  uint64_t writeback = 0U;
+  (void)resolve_mem_addr(cpu, in, far_out, &writeback);
+  return OEMU_OK;
+}
+
+/* WnR for the data abort ISS: which memory ops transfer out of the core. */
+static bool op_is_store(oemu_opcode op) {
+  return (op == OEMU_OP_STR) || (op == OEMU_OP_STP) || (op == OEMU_OP_STLR) ||
+         (op == OEMU_OP_STXR);
+}
+
+/* MRS through the table. An encoding the table refuses (absent row, too low
+ * an EL for the row, read-only in the wrong direction) is the architecture's
+ * Undefined instruction, carrying the fetched encoding as ISS. */
+static oemu_status do_mrs_system(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_insn *in,
+                                 uint32_t word) {
+  const uint32_t sel = in->sysreg & SYSREG_MASK;
+  uint64_t value = 0U;
+  if (oemu_sysreg_read(sr, sel, &value) != OEMU_OK) {
+    oemu_exc_undefined(&cpu->regs, sr, word);
+    return OEMU_ERR_FAULT; /* delivered: the step consumed the instruction */
+  }
+  write_g(cpu, in->rd, false, OEMU_REG_W64, value);
+  return OEMU_OK;
+}
+
+static oemu_status do_msr_system(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_insn *in,
+                                 uint32_t word) {
+  const uint32_t sel = in->sysreg & SYSREG_MASK;
+  const uint64_t value = read_g(cpu, in->rd, false, OEMU_REG_W64);
+  if (oemu_sysreg_write(sr, sel, value) != OEMU_OK) {
+    oemu_exc_undefined(&cpu->regs, sr, word);
+    return OEMU_ERR_FAULT;
+  }
+  return OEMU_OK;
+}
+
+/* SYS op: DC/IC/TLBI policy is the classifier's; a trap is an Undefined with
+ * the fetched encoding as ISS. */
+static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *mem,
+                          const oemu_insn *in, uint32_t word) {
+  const uint32_t sel = in->sysreg & SYSREG_MASK;
+  switch (oemu_exec_internal_sys_action(sel)) {
+    case OEMU_EXEC_SYS_NOP:
+      return OEMU_OK;
+    case OEMU_EXEC_SYS_TRAP:
+      oemu_exc_undefined(&cpu->regs, sr, word);
+      return OEMU_ERR_FAULT;
+    case OEMU_EXEC_SYS_DC_ZVA:
+      break;
+  }
+
+  /* DC ZVA: the address must be 8-byte aligned (the alignment check is not
+   * gated on SCTLR.SA), then a whole cache line of zeroes. */
+  const uint64_t addr = read_g(cpu, in->rd, false, OEMU_REG_W64);
+  if ((addr & (UINT64_C(8) - UINT64_C(1))) != 0U) {
+    oemu_exc_data_abort(&cpu->regs, sr, addr, 3U, true, true, 0x01U);
+    return OEMU_ERR_FAULT;
+  }
+  const uint64_t line = addr & ~(uint64_t)(EXEC_CACHE_LINE - 1U);
+  if (mem->validate(mem->ctx, line, EXEC_CACHE_LINE, OEMU_PERM_WRITE) != OEMU_OK) {
+    /* Bus-level refusal: unmapped or read-only. The walk of M3 will tell
+     * permission from translation; at the seam both read as "no mapping
+     * covers this", the level -1 translation fault. */
+    oemu_exc_data_abort(&cpu->regs, sr, line, 3U, true, true, 0x2CU);
+    return OEMU_ERR_FAULT;
+  }
+  for (unsigned off = 0U; off < EXEC_CACHE_LINE; off += 8U) {
+    /* Validated above; a validated access cannot fail (no provider re-shapes
+     * between calls), so a refusal here is a bug, not a guest event. */
+    access_or_panic(mem->write(mem->ctx, line + off, OEMU_MEM_DWORD, 0U));
+  }
+  return OEMU_OK;
+}
+
+/*
+ * One instruction, at the current exception level, with system-mode
+ * semantics. `word` is the fetched encoding (used as the Undefined ISS when
+ * an instruction is refused, so the guest handler sees what hardware
+ * reports). Every fault the architecture would deliver is delivered here
+ * (via oemu/exc.h) and the function returns OEMU_OK so the run loop never
+ * has to know the difference between "instruction executed" and "exception
+ * taken": both are progress. A WFI/WFE with nothing to wake for returns
+ * OEMU_ERR_BLOCKED without moving the PC. No allocation, no environment.
+ */
+oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
+                                               const oemu_memops *mem, const oemu_insn *in,
+                                               uint32_t word) {
+  if ((cpu == NULL) || (sr == NULL) || (in == NULL) || (in->op == OEMU_OP_UNKNOWN)) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  if ((mem == NULL) || (mem->fetch32 == NULL) || (mem->read == NULL) || (mem->write == NULL) ||
+      (mem->validate == NULL)) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+
+  /* An if-chain, not a switch: -Wswitch-enum would demand every opcode be
+   * named here even though everything not listed is deliberately left to the
+   * shared switch below. */
+  if (in->op == OEMU_OP_SVC) {
+    oemu_exc_svc(&cpu->regs, sr, (uint16_t)in->imm);
+    return OEMU_OK;
+  }
+  if (in->op == OEMU_OP_BRK) {
+    oemu_exc_brk(&cpu->regs, sr, (uint16_t)in->imm);
+    return OEMU_OK;
+  }
+  if (in->op == OEMU_OP_HLT) {
+    oemu_exc_breakpoint(&cpu->regs, sr);
+    return OEMU_OK;
+  }
+  if (in->op == OEMU_OP_HVC) {
+    oemu_exc_hvc(&cpu->regs, sr, (uint16_t)in->imm);
+    return OEMU_OK;
+  }
+  if (in->op == OEMU_OP_SMC) {
+    oemu_exc_smc(&cpu->regs, sr, (uint16_t)in->imm);
+    return OEMU_OK;
+  }
+  if (in->op == OEMU_OP_ERET) {
+    /* oemu_exc_eret gates at EL0 itself (Undefined there). */
+    oemu_exc_eret(&cpu->regs, sr);
+    return OEMU_OK;
+  }
+  oemu_status sys = OEMU_OK;
+  bool intercept = true;
+  if (in->op == OEMU_OP_MRS) {
+    sys = do_mrs_system(cpu, sr, in, word);
+  } else if (in->op == OEMU_OP_MSR) {
+    sys = do_msr_system(cpu, sr, in, word);
+  } else if (in->op == OEMU_OP_SYS) {
+    sys = do_sys(cpu, sr, mem, in, word);
+  } else {
+    intercept = false;
+  }
+  if (intercept) {
+    if (sys == OEMU_ERR_FAULT) {
+      return OEMU_OK; /* an exception was delivered: PC is the vector */
+    }
+    if (sys != OEMU_OK) {
+      return sys; /* INVALID_ARG: a caller bug */
+    }
+    oemu_regs_advance_pc(&cpu->regs);
+    return OEMU_OK;
+  }
+
+  /* WFI/WFE reach the shared switch and execute as no-ops here: the
+   * wake-or-park decision belongs to the vCPU, which alone sees the
+   * interrupt pins and the event register. */
+  oemu_status st = oemu_exec_internal_dispatch_bus(cpu, mem, NULL, in);
+  if (st == OEMU_ERR_FAULT) {
+    /* Precise contract: the faulting instruction committed nothing, so the
+     * fault address can be recomputed from the same inputs. DFSC 0x2C
+     * (translation, level -1) is the bus-level truth -- no mapping covers
+     * the access -- and M3's walk will refine it per fault class. */
+    uint64_t far = 0U;
+    (void)fault_far_of(cpu, in, &far);
+    const bool is_write = op_is_store(in->op);
+    const bool is_pair =
+        (in->op == OEMU_OP_LDP) || (in->op == OEMU_OP_STP) || (in->op == OEMU_OP_LDPSW);
+    oemu_exc_data_abort(&cpu->regs, sr, far, (unsigned)in->mem_size, is_write, !is_pair, 0x2CU);
+    return OEMU_OK;
+  }
+  if (st == OEMU_ERR_UNSUPPORTED) {
+    /* An encoding outside the implemented subset (SIMD, atomics, ...): with
+     * the ID registers honestly advertising them absent, the architectural
+     * answer is Undefined, which is what QEMU delivers for disabled
+     * features too. */
+    oemu_exc_undefined(&cpu->regs, sr, word);
+    return OEMU_OK;
+  }
+  return st;
 }
 
 /* --- the switch ---------------------------------------------------------------- */

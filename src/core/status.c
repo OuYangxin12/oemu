@@ -20,6 +20,8 @@ const char *oemu_status_str(oemu_status status) {
       return "guest memory or trap fault";
     case OEMU_ERR_TIMEOUT:
       return "instruction budget exhausted";
+    case OEMU_ERR_BLOCKED:
+      return "vcpu parked on wait-for-interrupt";
     default:
       break;
   }

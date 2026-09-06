@@ -27,6 +27,7 @@
 #include "oemu/regs.h"
 #include "oemu/status.h"
 #include "oemu/sysenv.h"
+#include "oemu/sysreg.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -102,6 +103,43 @@ OEMU_NODISCARD oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu,
                                                            const oemu_memops *mem,
                                                            const oemu_env_ops *env,
                                                            const oemu_insn *insn);
+
+/*
+ * --- system mode (M2c) -------------------------------------------------------
+ *
+ * What to do with a decoded SYS/SYSL encoding, keyed by its 14-bit selector.
+ * oemu has no caches and (until M3) no TLB, so invalidation and clean are
+ * architectural no-ops, while anything that would write an observable result
+ * -- AT publishing into PAR_EL1, DC ZVA zeroing memory -- is either
+ * implemented or honestly refused.
+ */
+typedef enum oemu_exec_sys_action {
+  OEMU_EXEC_SYS_TRAP = 0,  /* Undefined, with the encoding as ISS */
+  OEMU_EXEC_SYS_NOP = 1,   /* execute as a no-op, advance the PC */
+  OEMU_EXEC_SYS_DC_ZVA = 2 /* zero one cache line at [Rt] */
+} oemu_exec_sys_action;
+
+/* The policy decision for one SYS selector; exhaustively testable. */
+oemu_exec_sys_action oemu_exec_internal_sys_action(uint32_t sel);
+
+/* Re-assemble an op0=0b01 trap-space word from SEL and Rt, for synthetic
+ * dispatch whose insn was hand-built rather than fetched. */
+uint32_t oemu_exec_internal_reencode_sys(uint32_t sel, unsigned rt);
+
+/*
+ * Executes one instruction with system-mode semantics: SVC/BRK/HLT/HVC/SMC/
+ * ERET/MRS/MSR/SYS follow the architecture (deliver via oemu/exc.h), and a
+ * memory fault becomes a Data Abort with FAR. WFI/WFE execute as no-ops at
+ * this level -- deciding wake-vs-park belongs to the vCPU, which alone sees
+ * the interrupt pins and the event register. Returns OEMU_OK whenever the
+ * step made progress (instruction executed or exception delivered) and
+ * OEMU_ERR_INVALID_ARG on caller bugs. `word` is the fetched encoding,
+ * carried so refusals can report it as the Undefined ISS.
+ */
+OEMU_NODISCARD oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
+                                                              const oemu_memops *mem,
+                                                              const oemu_insn *in,
+                                                              uint32_t word);
 
 OEMU_END_DECLS
 
