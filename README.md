@@ -404,8 +404,9 @@ make coverage-summary   # per-file text summary; needs only gcov
 make coverage           # HTML report in build/coverage/coverage-html; needs lcov
 ```
 
-Current, by new line coverage: **decode 100%, regs 100%, exec 96%, elf 96%,
-memory 98%, sysenv 93%, main 84%, allocator/version 100%; TOTAL 97% of lines.**
+Current, by new line coverage: **decode 99%, regs 100%, exec 96%, elf 96%,
+sysenv 94%, main 84%, buffer 95%, aspace 99%, machine 100%, sysreg 98%, exc
+82%; TOTAL 96% of lines (2747/2841).**
 The uncovered exec and elf lines are defensive arms a correct caller never
 produces: for exec, `operand2`'s extended/none operand kinds, the dispatch
 `default:` (`"a newer decoder cannot outdate this switch"`), and the
@@ -416,7 +417,11 @@ forking `test_cli` (which runs the real binary); its uncovered lines are the rar
 error arms -- allocation failure, a faulting or unsupported guest instruction, a
 stack map that collides -- not the happy path or the exit-code contract, which the
 subprocess tests cover. These read `#####` precisely because they are hard to
-reach on purpose, not because they are untested.
+reach on purpose, not because they are untested. `exc` sits at 82% because its
+uncovered lines are `oemu_exc_ec_name` arms for syndrome classes no test has
+forced yet (SError, SMC/HVC, trapped FP, breakpoints) plus one
+undefined-injection wrapper; they become reachable as the vCPU work (M2c)
+drives real exception sources into the module.
 
 One tooling caveat so the number is read correctly: `make coverage-summary`
 currently omits `src/memory/memory.c` -- `file(STRINGS)` mis-parses that one
@@ -471,6 +476,19 @@ detects the TSan build and routes the test binaries through `setarch -R` via the
 `CROSSCOMPILING_EMULATOR` target property — which matters because
 `gtest_discover_tests` runs each binary at discovery time too, not just during
 the test run. The alternative is `sudo sysctl vm.mmap_rnd_bits=28`.
+
+**A green coverage run that reports nothing means gcov does not match the
+compiler.** On this machine `/usr/bin/cc` resolved to GCC 10 while
+`/usr/bin/gcov` was 13.3; gcov cannot parse a profile format from a newer
+compiler, and every per-TU invocation failed -- slowly, about a minute each,
+with zero output -- so the summary printed "no project lines instrumented" and
+still exited 0. `cmake/Coverage.cmake` now prefers `gcov-<major>` matching the
+configured compiler, for both the summary and lcov's `--gcov-tool`, and
+`cmake/GcovSummary.cmake` hard-fails when no `.gcov` files were produced
+instead of reporting an empty run. The gcov sweep itself is fanned out through
+`xargs -P` rather than one file at a time. If you override the toolchain, keep
+the pair matched: `cmake -B build/coverage -U OEMU_GCOV` re-runs the lookup
+after a compiler change.
 
 Other details worth knowing:
 
