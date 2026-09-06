@@ -294,6 +294,21 @@ oemu_add_test(test_exc_check
   LABELS "unit;death"
 )
 
+# The vCPU: boot state, pins against DAIF, quantum accounting, WFI/WFE
+# wake-or-park, and the whole system-mode step path.
+oemu_add_test(test_vcpu
+  SOURCES unit/test_vcpu.cpp
+  LABELS unit
+)
+
+# Reaches into src/vcpu/vcpu_internal.h: the pending-interrupt priority and
+# DAIF-gating decision, enumerated.
+oemu_add_test(test_vcpu_internal
+  SOURCES unit/test_vcpu_internal.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.
@@ -330,6 +345,8 @@ add_dependencies(check
   test_exc
   test_exc_internal
   test_exc_check
+  test_vcpu
+  test_vcpu_internal
 )
 
 # Registers the `coverage` target now that the test targets exist.

@@ -195,6 +195,14 @@ void oemu_exc_hvc(oemu_regs *regs, oemu_sysregs *sysregs, uint16_t imm16) {
   oemu_exc_undefined(regs, sysregs, 0xD4000002U | ((uint32_t)imm16 << 5));
 }
 
+void oemu_exc_breakpoint(oemu_regs *regs, oemu_sysregs *sysregs) {
+  /* Debug-exception ISS (QEMU's arm_debug_exception agrees): ISV=1, IDS=0,
+   * DFSC=0b000100 software trigger. */
+  oemu_exc_take(regs, sysregs, OEMU_EXC_KIND_SYNC,
+                oemu_exc_route(oemu_pstate_el(sysregs->pstate)),
+                oemu_exc_internal_esr(OEMU_EXC_EC_BREAKPOINT, (1U << 24) | 0x04U), 0, false);
+}
+
 void oemu_exc_instruction_abort(oemu_regs *regs, oemu_sysregs *sysregs, uint64_t far) {
   const oemu_el from = oemu_pstate_el(sysregs->pstate);
   const oemu_el target = oemu_exc_route(from);

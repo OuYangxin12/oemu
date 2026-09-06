@@ -38,7 +38,15 @@ typedef enum oemu_status {
    */
   OEMU_ERR_FAULT = 7,
   /* A run reached its instruction budget without the guest having exited. */
-  OEMU_ERR_TIMEOUT = 8
+  OEMU_ERR_TIMEOUT = 8,
+  /*
+   * The vCPU parked itself on WFI/WFE with nothing to wake it: no unmasked
+   * interrupt, no SEV event. The instruction has not executed (PC unmoved,
+   * quantum unspent) and the scheduler is expected to run another vCPU or
+   * wake this one through an interrupt pin. System mode only -- the EL0
+   * facade keeps executing WFI/WFE as hints.
+   */
+  OEMU_ERR_BLOCKED = 9
 } oemu_status;
 
 /* Returns a stable, never-NULL description for any oemu_status value. */

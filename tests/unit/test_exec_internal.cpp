@@ -309,4 +309,48 @@ TEST_F(DispatchCrafted, BreakIsAFaultAndPrecise) {
   EXPECT_EQ(dispatch(&in), OEMU_ERR_FAULT);
 }
 
+/* --- SYS classifier (M2c) ---------------------------------------------------
+ *
+ * Every selector below is the (op1, CRn, CRm, op2) split of an encoding
+ * harvested from clang --target=aarch64 or named in Linux's sysreg.h, so a
+ * split that ever drifts fails here rather than executing the wrong policy.
+ */
+namespace {
+constexpr uint32_t Sel(unsigned op1, unsigned crn, unsigned crm, unsigned op2) {
+  return (op1 << 11U) | (crn << 7U) | (crm << 3U) | op2;
+}
+}  // namespace
+
+TEST(SysAction, DcZvaIsImplementedFirst) {
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(3, 7, 4, 1)), OEMU_EXEC_SYS_DC_ZVA); /* 0x1BA1 */
+}
+
+TEST(SysAction, TlbiSpaceIsNoop) {
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 8, 7, 0)), OEMU_EXEC_SYS_NOP); /* vmalle1 */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 8, 3, 0)), OEMU_EXEC_SYS_NOP);
+}
+
+TEST(SysAction, IcAndDcMaintainanceIsNoop) {
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 7, 5, 0)), OEMU_EXEC_SYS_NOP);  /* ic iallu */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(3, 7, 5, 1)), OEMU_EXEC_SYS_NOP);  /* ic ivau */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(3, 7, 14, 1)), OEMU_EXEC_SYS_NOP); /* dc civac */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 7, 10, 6)), OEMU_EXEC_SYS_NOP); /* dc cgdsw */
+}
+
+TEST(SysAction, AddressTranslateTraps) {
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 7, 8, 0)), OEMU_EXEC_SYS_TRAP); /* at s1e1r */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(4, 7, 8, 6)), OEMU_EXEC_SYS_TRAP); /* at s12e0r */
+}
+
+TEST(SysAction, UnrelatedSpaceTraps) {
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(2, 0, 0, 0)), OEMU_EXEC_SYS_TRAP); /* SYS G0 */
+}
+
+TEST(SysReencode, ReproducesHarvestedWords) {
+  // dc zva, x0; at s1e1r, x0; tlbi vmalle1 (Rt = xzr = 31)
+  EXPECT_EQ(oemu_exec_internal_reencode_sys(0x1BA1U, 0U), 0xD50B7420U);
+  EXPECT_EQ(oemu_exec_internal_reencode_sys(0x03C0U, 0U), 0xD5087800U);
+  EXPECT_EQ(oemu_exec_internal_reencode_sys(0x0438U, 31U), 0xD508871FU);
+}
+
 }  // namespace

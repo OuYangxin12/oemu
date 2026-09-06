@@ -129,9 +129,15 @@ with privilege checks. The precise-exception contract is restated:
 path stops returning an error to the host and injects an Instruction
 Abort instead (user-mode facade keeps the old host-visible semantics).
 ESR classes implemented: SVC AArch64 (`0x15`), Unknown (`0x00`),
-Trapped FP/SIMD (`0x18`), BRK (`0x30`), Instruction Abort (`0x20/0x21`),
-Data Abort (`0x24/0x25`), Alignment (`DFSC=0x01`); ISS carries ISV=1
-(SAS/WnR/VAT) for plain scalar accesses, ISV=0 for pairs.
+BRK64 (`0x3C`), Breakpoint/HLT (`0x30`, ISS DFSC `0b000100`), Instruction
+Abort (`0x20/0x21`), Data Abort (`0x24/0x25`), Alignment (`DFSC=0x01`);
+ISS carries ISV=1 (SAS/WnR/VAT) for plain scalar accesses, ISV=0 for
+pairs. Sysreg-table refusals (RO write, permission short, missing row)
+signal Unknown (`0x00`) carrying the full encoding as ISS, matching
+QEMU's UNDEF_REFLEX; `0x18` is reserved for control-bit traps, which
+oemu models none of until the MMU lands. The FP/SIMD trap (`0x07`) is
+not raised — no FP instruction is accepted, so `0x00` is the honest
+class until M3.
 
 **Decoder additions:** system-encoding group split — `OEMU_OP_SYS` with
 the sysreg selector fields, so DC/IC/TLBI/AT and the `ICC_*` registers

@@ -1002,6 +1002,7 @@ TEST(DecodeInvariants, NeverReportsAnUnexpectedStatus) {
       case OEMU_ERR_RANGE:
       case OEMU_ERR_FAULT:
       case OEMU_ERR_TIMEOUT:
+      case OEMU_ERR_BLOCKED:
         FAIL() << "unexpected status " << oemu_status_str(status) << " for 0x" << std::hex
                << word;
     }

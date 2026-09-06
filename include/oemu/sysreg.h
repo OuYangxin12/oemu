@@ -26,9 +26,13 @@
  *
  * Any access the architecture would trap at -- an unimplemented encoding, a
  * read-only register, or a register above the current exception level --
- * returns OEMU_ERR_UNSUPPORTED. That is the caller's signal to inject
- * Undefined (EC 0x18) in system mode; the EL0 facade keeps its own
- * error-return contract and never reaches this table.
+ * returns OEMU_ERR_UNSUPPORTED. That is the caller's signal to inject an
+ * Undefined exception in system mode: on real hardware an encoding the
+ * machine does not implement, or one not permitted at the current level, is
+ * simply UNDEFINED (EC 0x00, ISS carrying the encoding), which is what QEMU
+ * raises too. EC 0x18 stays reserved for accesses a control bit *traps* --
+ * oemu has no such trap yet. The EL0 facade keeps its own error-return
+ * contract and never reaches this table.
  *
  * Deferred on purpose, each to the milestone that can test it: the generic
  * timer (CNTFRQ/CNTVCT, M4 with the DT), the GIC ICC_* bank (M4), cache and

@@ -16,6 +16,7 @@ add_library(oemu
   sysreg/sysreg.c
   exc/exc.c
   exec/exec.c
+  vcpu/vcpu.c
   elf/elf.c
 )
 
@@ -30,6 +31,7 @@ target_sources(oemu PRIVATE
   elf/elf_internal.h
   sysreg/sysreg_internal.h
   exc/exc_internal.h
+  vcpu/vcpu_internal.h
 )
 
 target_include_directories(oemu
@@ -38,6 +40,11 @@ target_include_directories(oemu
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
   PRIVATE
+    # Cross-module internal use (vcpu.c including "exec/exec_internal.h"):
+    # the library builds as one target, so one shared internal root is safe,
+    # and it keeps internal includes spelled module-relative like the tests
+    # spell them.
+    ${CMAKE_CURRENT_SOURCE_DIR}
     # Lets buffer.c say #include "buffer_internal.h".
     ${CMAKE_CURRENT_SOURCE_DIR}/buffer
     # Likewise for regs.c and "regs_internal.h".
