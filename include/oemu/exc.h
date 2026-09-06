@@ -139,8 +139,10 @@ void oemu_exc_hvc(oemu_regs *regs, oemu_sysregs *sysregs, uint16_t imm16);
 
 /*
  * Instruction abort (fetch fault): FAR = the faulting fetch address, DFSC
- * = 0b000100 translation fault level 1 -- oemu's address spaces report
- * unmapped ranges, which reads exactly like a missing first-level mapping.
+ * = 0b101100 -- the translation fault with no walk level (Linux's
+ * FSC_FAULT_nL): this helper is the bus-level refusal, the case where no
+ * mapping at any level covers the address. A walk fault carries its own
+ * class and level and is delivered from the mmu's record instead.
  */
 void oemu_exc_instruction_abort(oemu_regs *regs, oemu_sysregs *sysregs, uint64_t far);
 

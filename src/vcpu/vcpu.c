@@ -55,6 +55,7 @@ oemu_status oemu_vcpu_init(oemu_vcpu *vcpu, const oemu_memops *mem, const oemu_e
   }
   oemu_sysregs_init(&vcpu->sysregs, &vcpu->cpu.regs, el);
   vcpu->mem = *mem;
+  oemu_mmu_init(&vcpu->mmu, &vcpu->sysregs, mem);
   vcpu->env = env;
   vcpu->quantum = quantum;
   vcpu->insns_left = quantum;
@@ -136,12 +137,24 @@ oemu_status oemu_vcpu_step(oemu_vcpu *vcpu, oemu_insn *insn_out) {
     return OEMU_OK;
   }
 
+  /* The step path always runs through the translation layer: with the MMU
+   * off or at EL3 it is exactly the bus beneath it, and it is the only place
+   * that knows whether a failed access is worth a syndrome record. */
+  const oemu_memops view = oemu_mmu_memops(&vcpu->mmu);
+
   uint32_t word = 0U;
   const uint64_t pc = oemu_regs_pc(&vcpu->cpu.regs);
-  if (vcpu->mem.fetch32(vcpu->mem.ctx, pc, &word) != OEMU_OK) {
-    /* Unmapped or non-executable: an Instruction Abort, FAR = the PC the
-     * core was trying to run. */
-    oemu_exc_instruction_abort(&vcpu->cpu.regs, &vcpu->sysregs, pc);
+  if (view.fetch32(view.ctx, pc, &word) != OEMU_OK) {
+    /* Instruction Abort, FAR = the PC the core was trying to run. The mmu
+     * record (when present) carries the walk's verdict: the real class and
+     * level, not the flat-bus approximation. */
+    oemu_mmu_fault fault;
+    if (oemu_mmu_take_fault(&vcpu->mmu, &fault)) {
+      oemu_exc_take(&vcpu->cpu.regs, &vcpu->sysregs, OEMU_EXC_KIND_SYNC,
+                    oemu_exc_route(oemu_vcpu_el(vcpu)), fault.esr, fault.far, true);
+    } else {
+      oemu_exc_instruction_abort(&vcpu->cpu.regs, &vcpu->sysregs, pc);
+    }
     vcpu->insns_left--;
     return OEMU_OK;
   }
@@ -175,8 +188,8 @@ oemu_status oemu_vcpu_step(oemu_vcpu *vcpu, oemu_insn *insn_out) {
     }
   }
 
-  const oemu_status st =
-      oemu_exec_internal_dispatch_system(&vcpu->cpu, &vcpu->sysregs, &vcpu->mem, &insn, word);
+  const oemu_status st = oemu_exec_internal_dispatch_system(&vcpu->cpu, &vcpu->sysregs, &view,
+                                                            &insn, word, &vcpu->mmu);
   if (st != OEMU_OK) {
     return st; /* BLOCKED (backstop: unreachable from here) or INVALID_ARG */
   }

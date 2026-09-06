@@ -31,6 +31,7 @@
 #include "oemu/exec.h"
 #include "oemu/macros.h"
 #include "oemu/memops.h"
+#include "oemu/mmu.h"
 #include "oemu/status.h"
 #include "oemu/sysreg.h"
 
@@ -42,7 +43,11 @@ OEMU_BEGIN_DECLS
 typedef struct oemu_vcpu {
   oemu_cpu cpu;            /* register file, exclusive monitor, EL0 thread ID */
   oemu_sysregs sysregs;    /* paired with &cpu.regs by init; do not re-point */
-  oemu_memops mem;         /* the bus; a copied view, ctx is caller-owned */
+  oemu_memops mem;         /* the physical bus; a copied view, ctx is caller-owned */
+  oemu_mmu mmu;            /* the translation layer over `mem`; initialized with
+                            * it, and the only bus the step path uses --
+                            * SCTLR_EL1.M decides whether it is identity or a
+                            * real walk */
   const oemu_env_ops *env; /* nullable; only `halted` is consulted in system
                             * mode -- SVC is an exception here, not a syscall */
 
