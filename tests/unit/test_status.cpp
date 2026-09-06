@@ -1,4 +1,12 @@
 // Tests for oemu_status_str.
+//
+// The status text is the diagnostic surface every failure message builds on,
+// so the contract here is threefold: every known code carries a description;
+// the two decoder failure classes do not read alike -- DECODE means the guest
+// image is wrong, UNSUPPORTED means oemu is incomplete, and triage starts
+// from that distinction; and an unmapped code still yields usable text
+// instead of garbage. A parameterised case re-checks the non-null, non-empty
+// invariant across all valid codes.
 #include "oemu/status.h"
 
 #include <string>

@@ -1,4 +1,9 @@
 // Tests that the version string stays in sync with the version macros.
+//
+// oemu_version_string() assembles its answer from the same macros a release
+// edits, so a bump that forgets the string fails here. The second case pins
+// that the function returns a static literal: the pointer itself must stay
+// valid across calls, which callers may rely on.
 #include "oemu/version.h"
 
 #include <string>
