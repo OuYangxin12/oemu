@@ -58,6 +58,11 @@ vgcore.*
 bench/guest/build/
 bench/guest/coremark-src/
 
+# Guest Linux / qemu workspace (downloads, cross toolchain, kernel build tree,
+# rootfs images). Everything under guest/ is regenerable; the roadmap requires
+# that kernel Images and rootfs images never enter the repository.
+guest/
+
 # Editor and OS noise
 .vscode/
 .idea/
