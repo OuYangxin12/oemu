@@ -59,9 +59,11 @@ bench/guest/build/
 bench/guest/coremark-src/
 
 # Guest Linux / qemu workspace (downloads, cross toolchain, kernel build tree,
-# rootfs images). Everything under guest/ is regenerable; the roadmap requires
-# that kernel Images and rootfs images never enter the repository.
-guest/
+# rootfs images). Everything under the top-level guest/ is regenerable; the
+# roadmap requires that kernel Images and rootfs images never enter the
+# repository. Anchored deliberately: an unanchored "guest/" would also swallow
+# tests/guest/, which holds the committed acceptance guests.
+/guest/
 
 # Editor and OS noise
 .vscode/

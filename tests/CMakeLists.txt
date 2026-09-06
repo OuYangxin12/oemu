@@ -332,6 +332,14 @@ oemu_add_test(test_mmu_check
   LABELS "unit;death"
 )
 
+# The page-table builder in tests/support: descriptor words are hand-computed
+# literals cross-checked against the Linux header, so tests across M3-M5 can
+# trust the tables they are handed without sharing code with src/mmu.
+oemu_add_test(test_page_table_builder
+  SOURCES unit/test_page_table_builder.cpp
+  LABELS unit
+)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.
@@ -370,6 +378,7 @@ add_dependencies(check
   test_exc_check
   test_vcpu
   test_vcpu_internal
+  test_page_table_builder
 )
 
 # Registers the `coverage` target now that the test targets exist.
