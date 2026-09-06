@@ -24,20 +24,58 @@ file(MAKE_DIRECTORY "${report_dir}")
 
 # Run gcov once per .gcda; -b adds branch data, -p keeps path-mangled names so
 # same-named files in different directories do not collide.
-foreach(gcda IN LISTS gcda_files)
+#
+# The .gcda set includes every test TU, so the sweep is fanned out through
+# xargs instead of running one file at a time. Paths are newline-joined and
+# split with -d, so build directories containing spaces stay one argument.
+# Falls back to a plain loop where xargs is unavailable.
+find_program(OEMU_XARGS xargs)
+
+if(OEMU_XARGS)
+  cmake_host_system_information(RESULT oemu_jobs QUERY NUMBER_OF_LOGICAL_CORES)
+  string(JOIN "\n" oemu_gcda_lines ${gcda_files})
+  file(WRITE "${report_dir}/gcda.list" "${oemu_gcda_lines}\n")
   execute_process(
-    COMMAND "${GCOV_EXECUTABLE}" -b -c -p "${gcda}"
+    COMMAND "${OEMU_XARGS}" -a "${report_dir}/gcda.list" -d "\n"
+            -P "${oemu_jobs}" -n 1 "${GCOV_EXECUTABLE}" -b -c -p
     WORKING_DIRECTORY "${report_dir}"
     OUTPUT_VARIABLE _out
     ERROR_VARIABLE _err
     RESULT_VARIABLE _rc
   )
   if(NOT _rc EQUAL 0)
-    message(WARNING "gcov failed for ${gcda}: ${_err}")
+    # xargs exits 123 when any invocation failed; the count below reports how
+    # bad it was, so the message here only needs to point at the cause.
+    message(WARNING "gcov sweep had failures (rc=${_rc}): ${_err}")
   endif()
-endforeach()
+else()
+  foreach(gcda IN LISTS gcda_files)
+    execute_process(
+      COMMAND "${GCOV_EXECUTABLE}" -b -c -p "${gcda}"
+      WORKING_DIRECTORY "${report_dir}"
+      OUTPUT_VARIABLE _out
+      ERROR_VARIABLE _err
+      RESULT_VARIABLE _rc
+    )
+    if(NOT _rc EQUAL 0)
+      message(WARNING "gcov failed for ${gcda}: ${_err}")
+    endif()
+  endforeach()
+endif()
 
 file(GLOB gcov_files "${report_dir}/*.gcov")
+
+# A silent empty run is worse than a failure: the summary would print "no
+# project lines instrumented" and exit 0 while CI and humans read it as real.
+# By far the most common cause is a gcov that cannot parse the profile format
+# of the compiler which wrote the .gcda files.
+if(NOT gcov_files)
+  message(FATAL_ERROR
+    "GcovSummary.cmake: gcov produced no .gcov files, so there is nothing to "
+    "report. The usual cause is a version mismatch: ${GCOV_EXECUTABLE} cannot "
+    "parse the profiles written by the configured compiler. Compare "
+    "\"${GCOV_EXECUTABLE} --version\" with the compiler's version.")
+endif()
 
 set(total_lines 0)
 set(total_covered 0)
