@@ -13,6 +13,10 @@ oemu 的全部测试都在本目录：以 GoogleTest 为骨架、经 CTest 驱�
 `OEMU_BEGIN_DECLS` / `OEMU_END_DECLS` 与 C 库链接。这个拆分正是那对宏存在的
 理由：少了 `extern "C"` 保护，最先炸掉的就是这里的链接。
 
+测试分层（L0–L4）、每里程碑的测试矩阵与验证纪律见
+`docs/verification-strategy.md`；里程碑任务动工前按
+`docs/templates/milestone-task-card.md` 先填任务卡。
+
 > 每个测试文件具体钉住了哪些行为，以该文件**头部的注释**为准。文件级细节有意
 > 维护在离代码最近的地方，本文只写不随用例增减变化的结构与约定。
 
