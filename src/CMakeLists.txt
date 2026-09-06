@@ -15,6 +15,7 @@ add_library(oemu
   machine/machine.c
   sysreg/sysreg.c
   exc/exc.c
+  mmu/mmu.c
   exec/exec.c
   vcpu/vcpu.c
   elf/elf.c
@@ -32,6 +33,7 @@ target_sources(oemu PRIVATE
   sysreg/sysreg_internal.h
   exc/exc_internal.h
   vcpu/vcpu_internal.h
+  mmu/mmu_internal.h
 )
 
 target_include_directories(oemu
@@ -62,6 +64,10 @@ target_include_directories(oemu
     ${CMAKE_CURRENT_SOURCE_DIR}/sysreg
     # Likewise for exc.c and "exc_internal.h".
     ${CMAKE_CURRENT_SOURCE_DIR}/exc
+    # Likewise for mmu.c and "mmu_internal.h".
+    ${CMAKE_CURRENT_SOURCE_DIR}/mmu
+    # Likewise for vcpu.c and "vcpu_internal.h".
+    ${CMAKE_CURRENT_SOURCE_DIR}/vcpu
 )
 
 target_link_libraries(oemu PUBLIC oemu_compiler_flags)

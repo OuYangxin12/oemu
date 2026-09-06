@@ -736,7 +736,7 @@ static oemu_status do_msr_system(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_ins
 /* SYS op: DC/IC/TLBI policy is the classifier's; a trap is an Undefined with
  * the fetched encoding as ISS. */
 static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *mem,
-                          const oemu_insn *in, uint32_t word) {
+                          oemu_mmu *mmu, const oemu_insn *in, uint32_t word) {
   const uint32_t sel = in->sysreg & SYSREG_MASK;
   switch (oemu_exec_internal_sys_action(sel)) {
     case OEMU_EXEC_SYS_NOP:
@@ -748,19 +748,27 @@ static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *me
       break;
   }
 
-  /* DC ZVA: the address must be 8-byte aligned (the alignment check is not
-   * gated on SCTLR.SA), then a whole cache line of zeroes. */
+  /* DC ZVA: the address must be 8-byte aligned. The check is not gated on
+   * SCTLR.A -- a DC ZVA is architecturally specified to fault when unaligned
+   * -- and it reports as an Alignment fault: the data-abort EC with DFSC
+   * 0x21, no ISS (the width of a cache line is not a transfer size). */
   const uint64_t addr = read_g(cpu, in->rd, false, OEMU_REG_W64);
   if ((addr & (UINT64_C(8) - UINT64_C(1))) != 0U) {
-    oemu_exc_data_abort(&cpu->regs, sr, addr, 3U, true, true, 0x01U);
+    oemu_exc_data_abort(&cpu->regs, sr, addr, 3U, true, false, 0x21U);
     return OEMU_ERR_FAULT;
   }
   const uint64_t line = addr & ~(uint64_t)(EXEC_CACHE_LINE - 1U);
   if (mem->validate(mem->ctx, line, EXEC_CACHE_LINE, OEMU_PERM_WRITE) != OEMU_OK) {
-    /* Bus-level refusal: unmapped or read-only. The walk of M3 will tell
-     * permission from translation; at the seam both read as "no mapping
-     * covers this", the level -1 translation fault. */
-    oemu_exc_data_abort(&cpu->regs, sr, line, 3U, true, true, 0x2CU);
+    /* The access could not be committed: the walk's record says which part
+     * (permission, translation, missing backing); the bus's own refusal says
+     * only that no mapping covers it. */
+    oemu_mmu_fault fault;
+    if ((mmu != NULL) && oemu_mmu_take_fault(mmu, &fault)) {
+      oemu_exc_take(&cpu->regs, sr, OEMU_EXC_KIND_SYNC,
+                    oemu_exc_route(oemu_pstate_el(sr->pstate)), fault.esr, fault.far, true);
+    } else {
+      oemu_exc_data_abort(&cpu->regs, sr, line, 3U, true, false, 0x2CU);
+    }
     return OEMU_ERR_FAULT;
   }
   for (unsigned off = 0U; off < EXEC_CACHE_LINE; off += 8U) {
@@ -783,7 +791,7 @@ static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *me
  */
 oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
                                                const oemu_memops *mem, const oemu_insn *in,
-                                               uint32_t word) {
+                                               uint32_t word, oemu_mmu *mmu) {
   if ((cpu == NULL) || (sr == NULL) || (in == NULL) || (in->op == OEMU_OP_UNKNOWN)) {
     return OEMU_ERR_INVALID_ARG;
   }
@@ -827,7 +835,7 @@ oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
   } else if (in->op == OEMU_OP_MSR) {
     sys = do_msr_system(cpu, sr, in, word);
   } else if (in->op == OEMU_OP_SYS) {
-    sys = do_sys(cpu, sr, mem, in, word);
+    sys = do_sys(cpu, sr, mem, mmu, in, word);
   } else {
     intercept = false;
   }
@@ -847,16 +855,24 @@ oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
    * interrupt pins and the event register. */
   oemu_status st = oemu_exec_internal_dispatch_bus(cpu, mem, NULL, in);
   if (st == OEMU_ERR_FAULT) {
-    /* Precise contract: the faulting instruction committed nothing, so the
-     * fault address can be recomputed from the same inputs. DFSC 0x2C
-     * (translation, level -1) is the bus-level truth -- no mapping covers
-     * the access -- and M3's walk will refine it per fault class. */
-    uint64_t far = 0U;
-    (void)fault_far_of(cpu, in, &far);
-    const bool is_write = op_is_store(in->op);
-    const bool is_pair =
-        (in->op == OEMU_OP_LDP) || (in->op == OEMU_OP_STP) || (in->op == OEMU_OP_LDPSW);
-    oemu_exc_data_abort(&cpu->regs, sr, far, (unsigned)in->mem_size, is_write, !is_pair, 0x2CU);
+    /* Precise contract: the faulting instruction committed nothing. The
+     * translation layer records the walk's verdict (class, level, the
+     * virtual FAR) on the way out; prefer it. With no mmu, or a fault that
+     * never reached the walk, the bus itself refused: DFSC 0x2C, the
+     * translation fault with no level, at the recomputed address. */
+    oemu_mmu_fault fault;
+    if ((mmu != NULL) && oemu_mmu_take_fault(mmu, &fault)) {
+      oemu_exc_take(&cpu->regs, sr, OEMU_EXC_KIND_SYNC,
+                    oemu_exc_route(oemu_pstate_el(sr->pstate)), fault.esr, fault.far, true);
+    } else {
+      uint64_t far = 0U;
+      (void)fault_far_of(cpu, in, &far);
+      const bool is_write = op_is_store(in->op);
+      const bool is_pair =
+          (in->op == OEMU_OP_LDP) || (in->op == OEMU_OP_STP) || (in->op == OEMU_OP_LDPSW);
+      oemu_exc_data_abort(&cpu->regs, sr, far, (unsigned)in->mem_size, is_write, !is_pair,
+                          0x2CU);
+    }
     return OEMU_OK;
   }
   if (st == OEMU_ERR_UNSUPPORTED) {

@@ -309,6 +309,29 @@ oemu_add_test(test_vcpu_internal
   LABELS "unit;whitebox"
 )
 
+# The translation layer over a real address space: hand-built tables, every
+# fault class, banding, tagging, and the bus wrappers' split rules.
+oemu_add_test(test_mmu
+  SOURCES unit/test_mmu.cpp
+  LABELS unit
+)
+
+# Reaches into src/mmu/mmu_internal.h: the DFSC table, the walk geometry,
+# the permission matrix, and the syndrome composition.
+oemu_add_test(test_mmu_internal
+  SOURCES unit/test_mmu_internal.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
+# Death tests for the mmu module's fatal contracts (NULL state, a bus view
+# missing callbacks, a fault level that cannot exist).
+oemu_add_test(test_mmu_check
+  SOURCES unit/test_mmu_check.cpp
+  INTERNAL
+  LABELS "unit;death"
+)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.

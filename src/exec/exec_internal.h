@@ -24,6 +24,7 @@
 #include "oemu/exec.h"
 #include "oemu/macros.h"
 #include "oemu/memory.h"
+#include "oemu/mmu.h"
 #include "oemu/regs.h"
 #include "oemu/status.h"
 #include "oemu/sysenv.h"
@@ -134,12 +135,16 @@ uint32_t oemu_exec_internal_reencode_sys(uint32_t sel, unsigned rt);
  * the interrupt pins and the event register. Returns OEMU_OK whenever the
  * step made progress (instruction executed or exception delivered) and
  * OEMU_ERR_INVALID_ARG on caller bugs. `word` is the fetched encoding,
- * carried so refusals can report it as the Undefined ISS.
+ * carried so refusals can report it as the Undefined ISS. `mem` is normally
+ * the view of `mmu` (see oemu/mmu.h): when a memory fault reaches this
+ * dispatch, `mmu`'s pending record -- the walk's class, level and virtual
+ * FAR -- is what the guest sees; without a mmu the bus's own refusal maps
+ * to the translation fault with no level (DFSC 0x2C).
  */
 OEMU_NODISCARD oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
                                                               const oemu_memops *mem,
                                                               const oemu_insn *in,
-                                                              uint32_t word);
+                                                              uint32_t word, oemu_mmu *mmu);
 
 OEMU_END_DECLS
 

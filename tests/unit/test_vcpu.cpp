@@ -42,12 +42,22 @@ constexpr uint32_t EcBase(oemu_exc_ec ec) {
   return static_cast<uint32_t>(ec) << 26U;
 }
 
+/* Page-table bits for the identity-mapping helper (see oemu/mmu.h and ARM
+ * ARM D8-3: a block descriptor is bit-0-set-not-bit-1, with the output
+ * address at [47:30] for a 1 GiB block). */
+constexpr uint64_t kBlock = UINT64_C(1);
+constexpr uint64_t kAf = UINT64_C(1) << 10;
+constexpr uint64_t kAp2 = UINT64_C(1) << 7;
+constexpr uint64_t kAttrNormal = UINT64_C(0); /* AttrIndx 0 */
+constexpr uint64_t kSctlrM = UINT64_C(1);
+
 class VcpuTest : public ::testing::Test {
  protected:
   static constexpr uint64_t kText = UINT64_C(0x400000);
   static constexpr uint64_t kData = UINT64_C(0x500000);
   static constexpr uint64_t kStack = UINT64_C(0x600000);
   static constexpr uint64_t kVectors = UINT64_C(0x8000);
+  static constexpr uint64_t kTables = UINT64_C(0x700000);
   static constexpr uint64_t kQuantum = UINT64_C(1000);
 
   void SetUp() override {
@@ -93,6 +103,22 @@ class VcpuTest : public ::testing::Test {
   }
   void store64(uint64_t addr, uint64_t value) {
     ASSERT_EQ(oemu_memory_write(&mem_, addr, OEMU_MEM_DWORD, value), OEMU_OK);
+  }
+
+  /*
+   * Turn on the MMU with one identity mapping: a 1 GiB block at L1 index 0
+   * (every fixture address is under 1 GiB, and T0SZ=25 starts the walk at
+   * level 1, so one descriptor maps the whole machine onto itself). The
+   * block's flags are the caller's, which is how a permission test gets
+   * read-only memory without touching the bus underneath.
+   */
+  void enable_identity(uint64_t l1_flags) {
+    ASSERT_EQ(oemu_memory_map(&mem_, kTables, 0x1000U, OEMU_PERM_ALL), OEMU_OK);
+    store64(kTables, kBlock | kAf | kAttrNormal | l1_flags); /* VA 0..1GiB -> PA 0 */
+    vcpu_.sysregs.ttbr0_el1 = kTables;
+    vcpu_.sysregs.tcr_el1 = UINT64_C(25) | (UINT64_C(25) << 16) | (UINT64_C(1) << 27);
+    vcpu_.sysregs.sctlr_el1 |= kSctlrM;
+    allocations_at_setup_ = tracker_.alloc_count(); /* the map is setup, not a step */
   }
 
   oemu_status step(oemu_insn *insn = nullptr) { return oemu_vcpu_step(&vcpu_, insn); }
@@ -253,18 +279,19 @@ TEST_F(VcpuTest, UnallocatableWordDeliversUndefined) {
   EXPECT_EQ(vcpu_.sysregs.esr_el[OEMU_EL1], EcBase(OEMU_EXC_EC_UNKNOWN) | (uint32_t)kIlBit);
 }
 
-TEST_F(VcpuTest, UnmappedStoreDeliversDataAbortWithFarAndIsv) {
+TEST_F(VcpuTest, UnmappedStoreDeliversDataAbortWithoutIsv) {
   set_x(1, UINT64_C(0x900000));
   set_x(0, 0xDEADBEEFU);
   program({kStrX0X1});
   ASSERT_EQ(step(), OEMU_OK);
   EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x200U);
   EXPECT_EQ(vcpu_.sysregs.far_el[OEMU_EL1], UINT64_C(0x900000));
-  /* EC 0b100101 (same-EL data abort), ISV=1, SAS=0b011 (8 bytes), WnR=1,
-   * SET=0b01, DFSC=0x2C. */
-  EXPECT_EQ(vcpu_.sysregs.esr_el[OEMU_EL1], EcBase(OEMU_EXC_EC_DABORT_SAME) | (uint32_t)kIlBit |
-                                                (1U << 24) | (3U << 21) | (1U << 11) |
-                                                (1U << 6) | 0x2CU);
+  /* EC 0b100101 (same-EL data abort), IL=1, WnR=1, DFSC=0x2C. ISV is clear:
+   * a fault on the way to the access (walk refusal or unmapped bus) has never
+   * seen the transfer, so oemu cannot attest its width -- the honest value,
+   * and one Linux ignores when it routes the fault. */
+  EXPECT_EQ(vcpu_.sysregs.esr_el[OEMU_EL1],
+            EcBase(OEMU_EXC_EC_DABORT_SAME) | (uint32_t)kIlBit | (1U << 6) | 0x2CU);
 }
 
 TEST_F(VcpuTest, LoadFaultClearsTheWriteFlag) {
@@ -294,6 +321,70 @@ TEST_F(VcpuTest, DcZvaZeroesALine) {
   EXPECT_EQ(load64(kData), 0U);
   EXPECT_EQ(load64(kData + 8U), 0U);
   EXPECT_EQ(load64(kData + 16U), 0U);
+}
+
+/* --- the translation layer (M3a) ------------------------------------------------- */
+
+TEST_F(VcpuTest, IdentityTranslationRunsLikeMmuOff) {
+  enable_identity(0U);
+  program({kYield});
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText + OEMU_INSN_SIZE);
+  set_x(1, kData);
+  set_x(0, 0xFEEDFACEULL);
+  program({kStrX0X1});
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(load64(kData), 0xFEEDFACEULL);
+}
+
+TEST_F(VcpuTest, FetchFaultThroughWalkCarriesTheLevel) {
+  enable_identity(0U);
+  store64(kTables, 0U); /* and then the block entry is gone */
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x200U);
+  EXPECT_EQ(vcpu_.sysregs.far_el[OEMU_EL1], kText);
+  /* With a mapping layer the refusal has a place: the walk died at level 1,
+   * not at the bus. (With the MMU off the same miss is DFSC 0x2C.) */
+  EXPECT_EQ(vcpu_.sysregs.esr_el[OEMU_EL1],
+            EcBase(OEMU_EXC_EC_IABORT_SAME) | (uint32_t)kIlBit | 0x05U);
+}
+
+TEST_F(VcpuTest, StoreThroughReadOnlyTranslationIsAPermissionAbort) {
+  enable_identity(kAp2); /* the whole block: EL1 read-only */
+  set_x(1, kData);
+  set_x(0, 1U);
+  program({kStrX0X1});
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x200U);
+  EXPECT_EQ(vcpu_.sysregs.far_el[OEMU_EL1], kData);
+  EXPECT_EQ(vcpu_.sysregs.esr_el[OEMU_EL1],
+            EcBase(OEMU_EXC_EC_DABORT_SAME) | (uint32_t)kIlBit | (1U << 6) | 0x0DU);
+}
+
+TEST_F(VcpuTest, DcZvaZeroesThroughTranslation) {
+  enable_identity(0U);
+  store64(kData, 0xFFFFFFFFFFFFFFFFULL);
+  store64(kData + 56U, 0xFFFFFFFFFFFFFFFFULL);
+  set_x(0, kData + 8U);
+  program({kDcZvaX0});
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(load64(kData), 0U);
+  EXPECT_EQ(load64(kData + 56U), 0U);
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText + OEMU_INSN_SIZE);
+}
+
+TEST_F(VcpuTest, DcZvaUnalignedIsAnAlignmentAbort) {
+  set_x(0, kData + 4U);
+  program({kDcZvaX0});
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x200U);
+  EXPECT_EQ(vcpu_.sysregs.far_el[OEMU_EL1], kData + 4U);
+  /* Data abort with DFSC 0b100001 and no ISV: a DC ZVA has no transfer width
+   * to report, and claiming one would be a lie the handler could act on.
+   * WnR survives without ISV: the direction is known even when the width is
+   * not, and a DC ZVA writes. */
+  EXPECT_EQ(vcpu_.sysregs.esr_el[OEMU_EL1],
+            EcBase(OEMU_EXC_EC_DABORT_SAME) | (uint32_t)kIlBit | (1U << 6) | 0x21U);
 }
 
 TEST_F(VcpuTest, AtTrapsUndefinedUntilM3) {
