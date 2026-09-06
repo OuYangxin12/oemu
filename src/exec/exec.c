@@ -956,6 +956,15 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
     case OEMU_OP_SVC:
       st = do_svc(cpu, env, mem);
       break;
+    case OEMU_OP_HVC:
+    case OEMU_OP_SMC:
+    case OEMU_OP_ERET:
+    case OEMU_OP_SYS:
+      /* EL1+ operations: real instructions the user-mode subset refuses, the
+       * same signal an unimplemented MRS/MSR row gives. System-mode handling
+       * of these lands with the vCPU (M2c) and the MMU (M3) for SYS. */
+      st = OEMU_ERR_UNSUPPORTED;
+      break;
     case OEMU_OP_BRK:
     case OEMU_OP_HLT:
       /* A guest-initiated trap stops the run exactly like a fault. */
@@ -963,6 +972,8 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       break;
     case OEMU_OP_NOP:
     case OEMU_OP_HINT:
+    case OEMU_OP_WFI:
+    case OEMU_OP_WFE:
     case OEMU_OP_BARRIER:
       break; /* architecturally observable: nothing happens */
     case OEMU_OP_MRS:

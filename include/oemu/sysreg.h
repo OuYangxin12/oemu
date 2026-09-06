@@ -216,17 +216,19 @@ typedef struct oemu_sysregs {
    * it. Set once by oemu_sysregs_init and never re-pointed. */
   oemu_regs *regs;
 
-  /* Banked per-exception-level registers, indexed by oemu_el. Slot 0 is
-   * architecturally unused (exceptions never target EL0; SP_EL0 lives in
-   * regs->sp) and slot 1 indexes EL1. EL2 slots stay zero: no EL2. */
-  uint64_t sp_el[OEMU_EL_COUNT]; /* [3] exists for exception entry. There is
-                                  * deliberately no SP_EL3 MRS/MSR row: each
-                                  * SP_ELx encoding lives in the op1 bank of
-                                  * the level above it, and no level sits
-                                  * above EL3, so the architecture defines
-                                  * no SP_EL3 encoding at all (consistent
-                                  * with clang, LLVM, QEMU and Linux, none
-                                  * of which list one). */
+  /* Banked per-exception-level registers, indexed by oemu_el. The bank the
+   * PSTATE selects is live in `regs->sp` (kept in step by
+   * oemu_sysregs_switch_sp and the SP callbacks); inactive slots hold their
+   * last written value. Slot 0 backs SP_EL0, slot 1 SP_EL1, slot 3 the EL3
+   * bank exception entry uses. EL2 slots stay zero: no EL2. */
+  uint64_t sp_el[OEMU_EL_COUNT]; /* There is deliberately no SP_EL3 MRS/MSR
+                                  * row: each SP_ELx encoding lives in the
+                                  * op1 bank of the level above it, and no
+                                  * level sits above EL3, so the
+                                  * architecture defines no SP_EL3 encoding
+                                  * at all (consistent with clang, LLVM,
+                                  * QEMU and Linux, none of which list
+                                  * one). */
   uint64_t elr_el[OEMU_EL_COUNT];
   uint64_t spsr_el[OEMU_EL_COUNT];
   uint64_t vbar_el[OEMU_EL_COUNT]; /* [1] and [3] used in M2. */
@@ -271,14 +273,26 @@ typedef struct oemu_sysregs {
 /*
  * Prepares a system-register bank for boot at `el`, pairing it with `regs`.
  *
- * Applies every table row's reset value, then composes the boot PSTATE: mode
- * `oemu_pstate_mode(el)`, all four interrupt masks set (the guest unmasks
- * what it wants once it has a vector table), SPSel=1 from EL1 up (the DT
- * booting convention for a kernel entered at EL1) and IL/SS clear. `regs` is
- * not touched: PC and SP_EL0 belong to oemu_cpu_init. Booting at EL2 is a
- * programming error -- oemu implements no EL2 -- and aborts.
+ * Applies every table row's reset value, composes the boot PSTATE: mode
+ * `oemu_pstate_mode(el)` (h-form above EL0, so SPSel=1 as the DT booting
+ * convention requires), all four interrupt masks set (the guest unmasks what
+ * it wants once it has a vector table), IL/SS clear (IL=1 would make the boot
+ * state itself illegal), and seeds the SP bank that holds `regs->sp` so the
+ * first bank switch has defined history. `regs` is not otherwise touched: PC
+ * and SP_EL0 belong to oemu_cpu_init. Booting at EL2 is a programming error
+ * -- oemu implements no EL2 -- and aborts.
  */
 void oemu_sysregs_init(oemu_sysregs *sr, oemu_regs *regs, oemu_el el);
+
+/*
+ * Switches the active stack pointer: saves `regs->sp` into the bank the
+ * current PSTATE selects, loads the bank the given PSTATE selects, and
+ * adopts it. The SPSel MSR callback and the exception entry/return paths in
+ * oemu/exc.h share this one implementation, which is what keeps sp_el[] and
+ * the live SP consistent: every bank has defined history after the first
+ * write, and the active bank's history lives in `regs->sp` alone.
+ */
+void oemu_sysregs_switch_sp(oemu_sysregs *sr, uint64_t new_pstate);
 
 /*
  * The table-driven MRS: reads the register named by the 14-bit `sel` encoding

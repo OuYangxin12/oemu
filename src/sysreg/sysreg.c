@@ -27,7 +27,10 @@ static uint64_t get_sp_sel(const oemu_sysregs *sr) {
 }
 
 static void set_sp_sel(oemu_sysregs *sr, uint64_t value) {
-  sr->pstate = (sr->pstate & ~OEMU_PSTATE_SPSEL) | (value & OEMU_PSTATE_SPSEL);
+  /* MSR SPSel really switches stacks: the newly selected bank becomes the
+   * interpreter's SP. Delegating to the shared switch keeps this identical
+   * to what exception entry/return do. */
+  oemu_sysregs_switch_sp(sr, (sr->pstate & ~OEMU_PSTATE_SPSEL) | (value & OEMU_PSTATE_SPSEL));
 }
 
 static uint64_t get_daif(const oemu_sysregs *sr) {
@@ -38,6 +41,27 @@ static void set_daif(oemu_sysregs *sr, uint64_t value) {
   const uint64_t field = OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT;
   sr->pstate =
       (sr->pstate & ~field) | ((value & OEMU_PSTATE_DAIF_MASK) << OEMU_PSTATE_DAIF_SHIFT);
+}
+
+void oemu_sysregs_switch_sp(oemu_sysregs *sr, uint64_t new_pstate) {
+  OEMU_REQUIRE(sr != NULL, "NULL oemu_sysregs");
+  OEMU_REQUIRE(sr->regs != NULL, "NULL oemu_regs in oemu_sysregs_switch_sp");
+
+  const oemu_el old_el = oemu_pstate_el(sr->pstate);
+  const oemu_el new_el = oemu_pstate_el(new_pstate);
+  /* Which bank `regs->sp` holds under the current PSTATE, and which it must
+   * hold under the new one: SPSel=0 or EL0 both mean SP_EL0. */
+  const bool old_user = oemu_pstate_sp_sel(sr->pstate) == 0U || old_el == OEMU_EL0;
+  const bool new_user = oemu_pstate_sp_sel(new_pstate) == 0U || new_el == OEMU_EL0;
+
+  if (old_user != new_user || (!old_user && old_el != new_el)) {
+    /* Crossing banks: deposit the live value into the bank it came from,
+     * withdraw the new one. Staying in one bank (e.g. ERET within EL1h) is
+     * a no-op for the SP itself. */
+    sr->sp_el[old_user ? OEMU_EL0 : old_el] = sr->regs->sp;
+    sr->regs->sp = sr->sp_el[new_user ? OEMU_EL0 : new_el];
+  }
+  sr->pstate = new_pstate;
 }
 
 /* NZCV and SP_EL0 live in the paired oemu_regs; see oemu/sysreg.h. NZCV keeps
@@ -51,12 +75,45 @@ static void set_nzcv(oemu_sysregs *sr, uint64_t value) {
   oemu_regs_set_nzcv(sr->regs, (uint32_t)value);
 }
 
+/*
+ * Banked stack pointers (SP_EL0, SP_EL1).
+ *
+ * The active bank's live value is `regs->sp` -- the interpreter's SP -- and
+ * inactive banks live in sp_el[]. A guest MRS/MSR must observe the
+ * single-bank model the hardware presents: reads answer with the bank the
+ * current PSTATE sees, and a write to the active bank moves the
+ * interpreter's SP with it (Linux's head.S seeds SP_EL1 before selecting it;
+ * KVM restores a vCPU's SP_EL1 through this table while SP_EL1 is that
+ * vCPU's active stack).
+ */
+
+/* SP_EL0 is active at EL0 and above EL0 whenever SPSel is 0. */
+static bool sp_el0_active(const oemu_sysregs *sr) {
+  return oemu_pstate_el(sr->pstate) == OEMU_EL0 || oemu_pstate_sp_sel(sr->pstate) == 0U;
+}
+
 static uint64_t get_sp_el0(const oemu_sysregs *sr) {
-  return oemu_regs_sp(sr->regs);
+  return sp_el0_active(sr) ? sr->regs->sp : sr->sp_el[OEMU_EL0];
 }
 
 static void set_sp_el0(oemu_sysregs *sr, uint64_t value) {
-  oemu_regs_set_sp(sr->regs, value);
+  sr->sp_el[OEMU_EL0] = value;
+  if (sp_el0_active(sr)) {
+    sr->regs->sp = value;
+  }
+}
+
+static uint64_t get_sp_el1(const oemu_sysregs *sr) {
+  const bool active =
+      oemu_pstate_el(sr->pstate) == OEMU_EL1 && oemu_pstate_sp_sel(sr->pstate) != 0U;
+  return active ? sr->regs->sp : sr->sp_el[OEMU_EL1];
+}
+
+static void set_sp_el1(oemu_sysregs *sr, uint64_t value) {
+  sr->sp_el[OEMU_EL1] = value;
+  if (oemu_pstate_el(sr->pstate) == OEMU_EL1 && oemu_pstate_sp_sel(sr->pstate) != 0U) {
+    sr->regs->sp = value;
+  }
 }
 
 /* --- the table ----------------------------------------------------------------- */
@@ -346,14 +403,18 @@ static const oemu_sysreg_row k_rows[] = {
     /* SP_ELx sits in the op1 bank of the level ABOVE it (op1=4 = EL2+), so
      * SP_EL1 is reachable from EL2 and EL3 only; an EL1 guest uses its own
      * banked SP through SP plus SPSel instead. min_el=OEMU_EL2 here means
-     * "requires EL2 or above", reachable in practice only from EL3. */
+     * "requires EL2 or above", reachable in practice only from EL3. The
+     * callbacks keep the single-bank model: the active bank's live copy is
+     * regs->sp, so table writes must move it too. */
     {.name = "SP_EL1",
      .sel = OEMU_SYSREG_SP_EL1,
      .min_el = OEMU_EL2,
      .flags = OEMU_SYSREG_F_NONE,
-     .offset = offsetof(oemu_sysregs, sp_el[OEMU_EL1]),
+     .offset = 0,
      .write_mask = ~(uint64_t)0,
-     .reset_value = 0},
+     .reset_value = 0,
+     .get = get_sp_el1,
+     .set = set_sp_el1},
 
     /* --- EL3 exception-link state (exception entry and ERET only) -------------- */
     {.name = "SPSR_EL3",
@@ -436,13 +497,16 @@ void oemu_sysregs_init(oemu_sysregs *sr, oemu_regs *regs, oemu_el el) {
     memcpy((char *)sr + row->offset, &row->reset_value, sizeof(row->reset_value));
   }
 
-  /* Boot PSTATE: target mode, interrupts masked, SPSel=1 from EL1 up (the DT
-   * booting convention for a kernel entered at EL1). IL stays clear because
-   * IL=1 would make the boot state itself architecturally illegal. */
+  /* Boot PSTATE: target mode (h-form above EL0, so SPSel=1 as the DT booting
+   * convention requires), interrupts masked. IL stays clear because IL=1
+   * would make the boot state itself architecturally illegal. */
   sr->pstate = oemu_pstate_mode(el) | (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT);
-  if (el != OEMU_EL0) {
-    sr->pstate |= OEMU_PSTATE_SPSEL;
-  }
+
+  /* Seed the bank that holds the initial stack pointer (oemu/exc.h's
+   * mirroring invariant): the boot bank gets regs->sp, the rest stay 0 so a
+   * bank switch away from an unseeded bank reads 0 rather than the caller's
+   * stack garbage. */
+  sr->sp_el[(el == OEMU_EL0) ? 0 : el] = regs->sp;
 }
 
 static bool row_access_allowed(const oemu_sysregs *sr, const oemu_sysreg_row *row) {

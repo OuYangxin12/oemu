@@ -516,9 +516,16 @@ static oemu_status decode_exception(uint32_t word, oemu_insn *insn) {
     insn->op = OEMU_OP_HLT;
     return OEMU_OK;
   }
-  /* HVC, SMC and the DCPS forms are all EL1+ operations. */
-  if (opc == 0x0U && (ll == 0x2U || ll == 0x3U)) {
-    return OEMU_ERR_UNSUPPORTED;
+  /* HVC and SMC decode so the executor can be honest about them; until PSCI
+   * exists (M4) both deliver Undefined -- see oemu/exc.h. The DCPS forms stay
+   * outside the subset. */
+  if (opc == 0x0U && ll == 0x2U) {
+    insn->op = OEMU_OP_HVC;
+    return OEMU_OK;
+  }
+  if (opc == 0x0U && ll == 0x3U) {
+    insn->op = OEMU_OP_SMC;
+    return OEMU_OK;
   }
   if (opc == 0x5U) {
     return OEMU_ERR_UNSUPPORTED;
@@ -532,10 +539,21 @@ static oemu_status decode_hints_and_barriers(uint32_t word, oemu_insn *insn) {
   const uint32_t op2 = BITS(word, 5, 3);
 
   if (crn == 0x2U) {
-    /* Hint space. NOP is hint #0; the rest (YIELD, WFE, WFI, SEV, SEVL) have no
-     * observable effect on a single-threaded user-mode model. */
+    /* Hint space: uimm is the architectural hint number (assembled forms:
+     * nop d503201f, yield d503203f, wfe d503205f, wfi d503207f, sev
+     * d503209f, sevl d50320bf). WFE and WFI split out because system mode
+     * (M4) makes them scheduler yield points; the executor must be able to
+     * tell them apart from the harmless hints. */
     insn->uimm = (crm << 3U) | op2;
     insn->imm = (int64_t)insn->uimm;
+    if (crm == 0U && op2 == 0x2U) {
+      insn->op = OEMU_OP_WFE;
+      return OEMU_OK;
+    }
+    if (crm == 0U && op2 == 0x3U) {
+      insn->op = OEMU_OP_WFI;
+      return OEMU_OK;
+    }
     insn->op = (insn->uimm == 0U) ? OEMU_OP_NOP : OEMU_OP_HINT;
     return OEMU_OK;
   }
@@ -569,8 +587,18 @@ static oemu_status decode_system(uint32_t word, oemu_insn *insn) {
   }
 
   if (op0 == 0x1U) {
-    /* SYS/SYSL: system instructions such as cache maintenance by address. */
-    return OEMU_ERR_UNSUPPORTED;
+    /* SYS/SYSL: register-argument system operations (DC/IC/TLBI/AT...). The
+     * 14-bit op1:CRn:CRm:op2 selector rides in insn.sysreg, the same layout
+     * the MRS/MSR rows use, so an executor handles one field uniformly.
+     * Decoding (rather than rejecting) the group lets the executor say "known
+     * class, refused operation" instead of Undefined for real encoding space;
+     * M3 wires the data-management ops up. */
+    insn->sysreg = BITS(word, 5, 14);
+    insn->rd = rt;
+    insn->rt2 = rt;
+    insn->operand_kind = OEMU_OPERAND_NONE;
+    insn->op = OEMU_OP_SYS;
+    return OEMU_OK;
   }
 
   /*
@@ -613,8 +641,13 @@ static oemu_status decode_uncond_branch_reg(uint32_t word, oemu_insn *insn) {
     case 0x2:
       insn->op = OEMU_OP_RET;
       return OEMU_OK;
-    case 0x4: /* ERET */
-    case 0x5: /* DRPS */
+    case 0x4:
+      /* ERET: no operands; the executor runs the SPSR checks of oemu/exc.h
+       * in system mode. */
+      insn->operand_kind = OEMU_OPERAND_NONE;
+      insn->op = OEMU_OP_ERET;
+      return OEMU_OK;
+    case 0x5: /* DRPS stays outside the subset. */
       return OEMU_ERR_UNSUPPORTED;
     default:
       return OEMU_ERR_DECODE;
@@ -1475,16 +1508,28 @@ const char *oemu_opcode_name(oemu_opcode op) {
       return "brk";
     case OEMU_OP_HLT:
       return "hlt";
+    case OEMU_OP_HVC:
+      return "hvc";
+    case OEMU_OP_SMC:
+      return "smc";
+    case OEMU_OP_ERET:
+      return "eret";
     case OEMU_OP_NOP:
       return "nop";
     case OEMU_OP_HINT:
       return "hint";
+    case OEMU_OP_WFI:
+      return "wfi";
+    case OEMU_OP_WFE:
+      return "wfe";
     case OEMU_OP_BARRIER:
       return "barrier";
     case OEMU_OP_MRS:
       return "mrs";
     case OEMU_OP_MSR:
       return "msr";
+    case OEMU_OP_SYS:
+      return "sys";
     default:
       break;
   }
