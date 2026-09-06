@@ -1,7 +1,16 @@
 # oemu
 
-An emulator for the **ARMv8-A AArch64 user-mode subset**, built on a pure C11
-core with a local GoogleTest harness.
+An AArch64 emulator built on a pure C11 core with a local GoogleTest harness,
+with two modes over the same decode/exec engine:
+
+- **`oemu run`** — the user-mode interpreter: a static AArch64 ELF executes at
+  EL0 against a host-provided syscall layer. Fully working today; kept as the
+  regression facade as the system stack grows underneath it.
+- **`oemu boot`** — full-system mode: a `virt`-like machine that raises the
+  shared engine through exception levels, an MMU and real devices, ending with
+  a booted Linux. Under development; the committed plan is
+  [`docs/roadmap-full-system.md`](docs/roadmap-full-system.md) (M1–M5, with M1
+  and the register/exception layers of M2 merged).
 
 Production code is C11 with hidden visibility and no C++ dependency. Only the
 test translation units are C++17, linking against the C library through
@@ -12,16 +21,28 @@ test translation units are C++17, linking against the C library through
 ARM is not one instruction set but a family: several architecture generations,
 three profiles (A/R/M), and three distinct encodings (A32, T32/Thumb, A64).
 Picking a subset up front is what keeps the decoder tractable, so oemu commits
-to exactly one:
+to exactly one encoding and a deliberately shaped privilege model:
 
 | Axis | Choice |
 | --- | --- |
 | Architecture | ARMv8-A (the 64-bit baseline, v8.0) |
 | Profile | A — Application |
 | Encoding | **A64 only** — fixed 32-bit instructions |
-| Privilege | EL0 (user mode) only |
+| Privilege, user mode | EL0 only |
+| Privilege, system mode | **EL3 + EL1 + EL0** — no EL2, no VHE, no secure world |
 | Register width | 64-bit `X0`–`X30`, `SP`, `PC`, `NZCV` |
-| Memory model | little-endian, flat address space |
+| Memory model, user mode | little-endian, flat address space |
+| Memory model, system mode | static physical map, stage-1 MMU added in M3, no unmap |
+
+System mode's privilege shape is a feature-boundary statement, not a shortcut:
+`ID_AA64PFR0_EL1` reports EL2 as not implemented and AArch64-only support at
+each level, so a Linux kernel skips every EL2/KVM code path on its own. EL3 is
+a modelled state machine, never executed code — PSCI is emulated by
+intercepting `SMC #0` at exception entry (the same approach as QEMU's in-model
+PSCI). The machine layout mirrors QEMU
+`-machine virt` address conventions — RAM at `0x40000000`, GIC distributor at
+`0x08000000`, GIC CPU interface at `0x08010000`, PL011 UART0 at `0x09000000` —
+so a guest needs a modified defconfig, never a patched kernel.
 
 ### In scope
 
@@ -29,8 +50,14 @@ to exactly one:
   shifted/extended), loads and stores including the addressing modes and
   pair/exclusive forms, branches, conditional selects, and the `NZCV` flag
   semantics.
-- `SVC`-based system-call entry, so a static user-mode binary can make
+- User mode: `SVC`-based system-call entry, so a static binary can make
   progress against a host-provided syscall layer.
+- System mode (per the [roadmap](docs/roadmap-full-system.md)): exception
+  levels, the AArch64 vector table and precise exception delivery; a
+  table-driven system-register bank; the stage-1 MMU with a strict
+  "TLB is only ever faster, never different" contract; `virt`-like devices
+  (PL011, GICv2, arch timer), PSCI, a device-tree builder and the AArch64
+  Image loader; cooperative single-threaded vCPUs for `--smp N`.
 
 ### Out of scope
 
@@ -40,16 +67,32 @@ without changing the core design:
 - **A32 and T32/Thumb.** A64 is a separate encoding; supporting the 32-bit
   ones means a second decoder, not an extension of the first. Interworking
   (`AArch32` execution state) is therefore absent too.
-- **EL1–EL3, MMU, TrustZone, virtualisation.** User mode needs no page tables,
-  exception levels, or secure world.
+- **EL2, VHE, and the secure world.** The non-secure EL3+EL1+EL0 triangle is
+  the whole model; virtualisation and TrustZone would double the exception and
+  routing state for features no target guest uses.
 - **Optional extensions:** AdvSIMD/NEON, floating point, SVE/SVE2, SME,
   Crypto, Pointer Authentication, MTE, and the v8.1+ / v9 feature increments.
+  The decoder honestly reports `UNSUPPORTED` for SIMD; the advertised feature
+  ID registers (FP=0, SIMD=0, LSE=0, PA=0, PMU=0) keep guests inside the
+  boundary. FP/SIMD is the tracked horizon (M6).
 - **Self-modifying code and cache maintenance semantics.** Instruction-cache
   coherency operations are accepted and ignored rather than modelled.
 
 Anything outside the subset must be reported as an `oemu_status` decode or
 unimplemented-instruction error, never silently executed as something else.
 Extensions can be added later; none of them may be assumed present today.
+
+### Invariants that survive every phase
+
+These hold in both modes and are what each roadmap phase must keep unbroken:
+
+1. Pure C11 production code, no C++ dependency, and **zero allocation on the
+   step path**.
+2. **Precise exception semantics:** when an exception is delivered, no
+   architectural state has advanced past the triggering instruction.
+3. All allocation goes through the `oemu_allocator` seam, so every OOM path is
+   reachable by a test.
+4. `make test`, `make asan`, `make tsan`, coverage and `-Werror` stay green.
 
 ## Decoding
 
@@ -64,10 +107,14 @@ Two decisions in that file are load-bearing and easy to undo by accident:
 **Reserved does not mean plausible.** An encoding whose reserved bits are
 non-zero, or whose combination of otherwise-valid fields the architecture leaves
 unallocated, returns `OEMU_ERR_DECODE` — undefined encoding, the guest is wrong.
-A valid instruction the subset excludes (anything SIMD/FP, `ERET`, the
+A valid instruction the subset excludes (anything SIMD/FP, the
 pointer-authentication branches) returns `OEMU_ERR_UNSUPPORTED` — the guest is
 fine, oemu is incomplete. Collapsing the two would let an absent feature look
-like a corrupt binary, which is the wrong diagnosis to act on.
+like a corrupt binary, which is the wrong diagnosis to act on. A few
+system-mode instructions — `ERET`, `WFI`/`WFE`, the `SYS`/`MRS`/`MSR` group —
+decode as their own opcodes even though the user-mode executor refuses them at
+dispatch: the decode tree is shared by both modes, and refusing at execution
+keeps the user-mode contract intact while the system stack grows in.
 
 **`0b1111` means *always*, not *never*.** A four-bit condition field's all-ones
 value is not a sixteenth condition but the `NV` mnemonic, and in AArch64 it
@@ -92,17 +139,25 @@ untouched, register fields never exceed 31, and only PC-relative forms depend on
 
 ## Execution
 
-`src/exec/exec.c` is the fetch–decode–dispatch loop. One `oemu_cpu` is one
-single-threaded AArch64 core at EL0: the `oemu_regs` state plus the two pieces
-an instruction can observe that the register module deliberately does not model
--- the exclusive-access monitor and `TPIDRUR_EL0`. The struct is not opaque so it
-lives on the stack, and **no step ever allocates**, which is what lets the
-executor be driven from a leak-checked test fixture. `oemu_exec_step` runs
-exactly one instruction (optionally handing back the decoded `oemu_insn` even
-when it then faults, so a caller can show the offending instruction);
-`oemu_exec_run` loops it until the guest exits, a budget is spent, or an error
-surfaces. Decoding is not reimplemented here -- the executor calls
-`oemu_decode`, so the two agree by construction.
+`src/exec/exec.c` is the fetch–decode–dispatch loop, and both modes run it. In
+user mode one `oemu_cpu` is one single-threaded AArch64 core at EL0: the
+`oemu_regs` state plus the two pieces an instruction can observe that the
+register module deliberately does not model -- the exclusive-access monitor and
+`TPIDRUR_EL0`. The struct is not opaque so it lives on the stack, and **no step
+ever allocates**, which is what lets the executor be driven from a leak-checked
+test fixture. `oemu_exec_step` runs exactly one instruction (optionally handing
+back the decoded `oemu_insn` even when it then faults, so a caller can show the
+offending instruction); `oemu_exec_run` loops it until the guest exits, a
+budget is spent, or an error surfaces. Decoding is not reimplemented here -- the
+executor calls `oemu_decode`, so the two agree by construction.
+
+Since M1b the executor has no direct dependency on any memory implementation:
+every fetch, read, write and validation goes through the `oemu_memops` bus seam
+(`include/oemu/memops.h`). The user-mode facade wraps `oemu_memory` into those
+ops; a system-mode machine hands the executor its `oemu_aspace` ops instead,
+which is how the same loop will one day hit MMIO devices. Exception delivery
+(`src/exc`) and the banked system-register state (`src/sysreg`) sit beside this
+loop for the system-mode vCPU; in user mode they stay dormant.
 
 **Faults are precise, including the awkward instructions.** When a step returns
 `OEMU_ERR_FAULT` (bad address, bad permission, misaligned fetch, `BRK`/`HLT`) or
@@ -114,11 +169,15 @@ forms stage through locals rather than writing one half and failing on the
 other. A partially-applied store is the kind of bug that never shows up until a
 guest misbehaves hours later, so the design refuses to allow it.
 
-**Only the EL0-visible system registers are honoured.** `MRS`/`MSR` accept a
-small whitelist -- `NZCV`, `SP_EL0`, `TPIDRRO_EL0`, `TPIDRUR_EL0`, and a read of
-`CurrentEL` that answers EL0. Any other register, in particular anything at
-EL1+, is `OEMU_ERR_UNSUPPORTED` and the destination register is left exactly as
-it was: a refusal must not clobber state.
+**Only the EL0-visible system registers are honoured** in user mode.
+`MRS`/`MSR` accept a small whitelist -- `NZCV`, `SP_EL0`, `TPIDRRO_EL0`,
+`TPIDRUR_EL0`, and a read of `CurrentEL` that answers EL0. Any other register,
+in particular anything at EL1+, is `OEMU_ERR_UNSUPPORTED` and the destination
+register is left exactly as it was: a refusal must not clobber state. System
+mode inverts this deliberately: the full banked state lives in `src/sysreg`'s
+table-driven register bank, and an access to a register the model does not
+implement injects an Undefined exception -- the architectural behaviour a guest
+kernel can handle -- instead of returning an error to the host.
 
 **The syscall surface is the four calls a static benchmark actually needs**
 (`src/core/sysenv.c`), at their honest Linux AArch64 numbers so a guest built
@@ -136,9 +195,13 @@ as long as the assumptions below hold:
 - **No memory-ordering model.** `LDXR`/`STXR` reservations and `STLR` store-release
   are tracked, but the acquire-release *ordering* is not: on one in-order core no
   barrier semantics are observable, so the pair behaves correctly by accident of
-  single-threading. A future multithreaded host would need real fences.
+  single-threading. That accident is protected by design: system mode keeps its
+  vCPUs cooperative on one host thread (no locks, no data races between cores),
+  so the argument keeps holding. A future multithreaded host would need real fences.
 - **SP alignment is not checked.** A misaligned SP-based memory access proceeds
-  rather than raising the `SPAlignmentFault` a real core would take.
+  rather than raising the `SPAlignmentFault` a real core would take. System mode
+  closes this in M3, where data alignment is enforced and misalignment is
+  delivered as an Alignment fault.
 - **ELF loading covers static `ET_EXEC` only.** See the next section: the loader
   maps a non-PIE AArch64 executable's `PT_LOAD` segments. A position-independent
   `ET_DYN` image (which needs relocations applied) and dynamic linking are
@@ -190,14 +253,14 @@ tail needs no separate handling.
 
 ```bash
 make test          # configure, build and run the whole suite
-make run GUEST=path/to/prog.elf   # boot a static AArch64 ELF under the CLI
+make run GUEST=path/to/prog.elf   # run a static AArch64 ELF under the CLI
 make bench-exec    # end-to-end interpreter throughput (see bench/README.md)
 make help          # list every target
 ```
 
 ### Running a binary
 
-The `oemu` executable boots a static AArch64 `ET_EXEC` image:
+The `oemu run` subcommand runs a static AArch64 `ET_EXEC` image:
 
 ```bash
 ./build/debug/bin/oemu run prog.elf            # run to completion, exit status
@@ -221,6 +284,11 @@ cmake --build build/debug
 ctest --preset debug
 ```
 
+The system-mode entry point, `oemu boot -kernel Image ...`, is not shipped yet;
+it arrives with the register/vCPU work (M2) and the device stack (M4). Until
+then the roadmap document is the source of truth for its planned flags and
+behaviour.
+
 ## Layout
 
 ```
@@ -236,6 +304,12 @@ include/oemu/         Public headers. Consumers see only these.
   sysenv.h            the four-call SVC surface the guest runs against
   exec.h              the CPU: register bag plus the step/run interpreter loop
   elf.h               load a static AArch64 ET_EXEC image into guest memory
+  memops.h            the bus seam: fetch/read/write/validate over an opaque ctx
+  aspace.h            guest physical address space: RAM regions + MMIO regions
+  device.h            MMIO device callback contract (callbacks never allocate)
+  machine.h           machine container: RAM block, device table, power/reset events
+  sysreg.h            banked system-register state for the system-mode CPU
+  exc.h               exception delivery: entry sequence, syndrome builders, ERET
 src/
   core/               status, version, allocator, check, sysenv
   buffer/
@@ -251,8 +325,19 @@ src/
     memory.c          region table, permission checks, endian-aware accessors
     memory_internal.h internal region layout and validation helpers
   exec/
-    exec.c            fetch-decode-dispatch loop, precise faults, sysreg whitelist
+    exec.c            fetch-decode-dispatch loop over memops, precise faults
     exec_internal.h   pure helpers: shifts, extends, NZCV, bit reversal, bitfield
+  aspace/
+    aspace.c          physical region table: RAM dispatch, MMIO fan-out
+    aspace_internal.h pure containment/overlap helpers, mirroring memory's
+  machine/
+    machine.c         machine init, RAM mapping, poweroff/reset event record
+  sysreg/
+    sysreg.c          table-driven system registers: encoding, reset, RES0 masks
+    sysreg_internal.h pure helpers: encoding lookup, mask composition
+  exc/
+    exc.c             exception take/return: SPSR/ELR/ESR/FAR, vector selection
+    exc_internal.h    pure syndrome and vector-table helpers
   elf/
     elf.c             static AArch64 ET_EXEC loader: validate, then map PT_LOAD
     elf_internal.h    pure helpers: little-endian readers, segment validation
