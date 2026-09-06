@@ -123,8 +123,10 @@ TEST_F(SysregInternalTest, InitAppliesEveryResetValue) {
 }
 
 TEST_F(SysregInternalTest, CallbackRowsSeeTheBootState) {
-  // SPSel=1 and DAIF=1111 at an EL1 boot; CurrentEL reads level 1; NZCV and
-  // SP_EL0 come straight from the paired register file.
+  // SPSel=1 and DAIF=1111 at an EL1 boot; CurrentEL reads level 1; NZCV comes
+  // straight from the paired register file. The banked SPs follow the single
+  // bank model: SP_EL1 is the active bank (live in regs), SP_EL0 was never
+  // written so it reads its stored 0.
   uint64_t value = 0;
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_SPSEL, &value));
   EXPECT_EQ(1u, value);
@@ -135,7 +137,16 @@ TEST_F(SysregInternalTest, CallbackRowsSeeTheBootState) {
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_NZCV, &value));
   EXPECT_EQ(0u, value);
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_SP_EL0, &value));
-  EXPECT_EQ(oemu_regs_sp(&regs_), value);
+  EXPECT_EQ(0u, value) << "SP_EL0 was never written at an EL1h boot";
+  // The active bank reads back through the paired register file: at an EL0
+  // boot SP_EL0 is the live stack. (From EL1, SP_EL1's encoding is out of
+  // reach -- min_el=EL2 -- which the black-box suite pins separately.)
+  oemu_regs user_regs{};
+  oemu_sysregs user{};
+  ASSERT_EQ(OEMU_OK, oemu_regs_init(&user_regs, 0x1000, 0x2000));
+  oemu_sysregs_init(&user, &user_regs, OEMU_EL0);
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&user, OEMU_SYSREG_SP_EL0, &value));
+  EXPECT_EQ(oemu_regs_sp(&user_regs), value);
 }
 
 TEST_F(SysregInternalTest, InitDoesNotTouchTheRegisterFile) {

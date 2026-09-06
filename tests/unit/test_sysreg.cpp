@@ -141,12 +141,22 @@ TEST_F(SysregTest, ExceptionBanksStartZeroed) {
 }
 
 TEST_F(SysregTest, SpEl0RoundTripsThroughTheRegisterFile) {
-  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_SP_EL0, 0x7FFF0000));
-  EXPECT_EQ(0x7FFF0000u, oemu_regs_sp(&regs_)) << "SP_EL0 must land in oemu_regs.sp";
-  oemu_regs_set_sp(&regs_, 0x1234);
+  // Booting at EL1h leaves SP_EL0 inactive: a write lands in its bank and
+  // only becomes the live SP once SPSel selects it (the bank model of
+  // oemu/sysreg.h).
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_SP_EL0, 0x7FFF0000U));
+  EXPECT_EQ(0x41000000U, oemu_regs_sp(&regs_)) << "the active SP_EL1 must not move";
+  oemu_regs_set_sp(&regs_, 0x1234);  // the kernel stack moves underneath
   uint64_t value = 0;
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_SP_EL0, &value));
-  EXPECT_EQ(0x1234u, value);
+  EXPECT_EQ(0x7FFF0000U, value) << "SP_EL0 keeps its banked value";
+
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_SPSEL, 0));
+  EXPECT_EQ(0x7FFF0000U, oemu_regs_sp(&regs_)) << "selecting SP_EL0 adopts its bank";
+
+  oemu_regs_set_sp(&regs_, 0x1234);
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_SP_EL0, &value));
+  EXPECT_EQ(0x1234U, value) << "an active SP_EL0 reads back through regs";
 }
 
 TEST_F(SysregTest, NzcvRoundTripsThroughTheRegisterFileAndMasks) {
@@ -197,6 +207,57 @@ TEST_F(SysregTest, CurrentElReportsTheBootLevel) {
   BootAt(&monitor, &regs_, OEMU_EL3, 0x2000);
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&monitor, OEMU_SYSREG_CURRENT_EL, &value));
   EXPECT_EQ(12u, value);
+}
+
+// --- the banked stack pointers -------------------------------------------------
+
+TEST_F(SysregTest, MsrSpselSwitchesTheActiveBank) {
+  // MSR SPSel really switches stacks (that is its whole purpose on the kernel
+  // entry path): the newly selected bank becomes the interpreter's SP.
+  EXPECT_EQ(0x41000000U, regs_.sp);
+  EXPECT_EQ(0x41000000U, sr_.sp_el[OEMU_EL1]) << "boot seeds the active bank";
+
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_SPSEL, 0));
+  EXPECT_EQ(0U, regs_.sp) << "SP_EL0 was never written: bank switch reads its stored 0";
+  EXPECT_EQ(0x41000000U, sr_.sp_el[OEMU_EL1]) << "the kernel stack is preserved in its bank";
+
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_SPSEL, 1));
+  EXPECT_EQ(0x41000000U, regs_.sp);
+}
+
+TEST_F(SysregTest, WritingSpEl0WhileInactiveStaysInItsBank) {
+  // KVM-style sequence: prepare a user stack from EL1, then let an ERET to
+  // EL0t pick it up.
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_SP_EL0, 0xABCDU));
+  uint64_t value = 0;
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_SP_EL0, &value));
+  EXPECT_EQ(0xABCDU, value);
+  EXPECT_EQ(0x41000000U, regs_.sp) << "the active SP_EL1 must not move";
+
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_SPSEL, 0));
+  EXPECT_EQ(0xABCDU, regs_.sp) << "switching to SP_EL0 adopts the prepared value";
+}
+
+TEST_F(SysregTest, SpEl1IsReachableFromEl3IntoItsBank) {
+  oemu_sysregs monitor{};
+  BootAt(&monitor, &regs_, OEMU_EL3, 0x2000);
+
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&monitor, OEMU_SYSREG_SP_EL1, 0x9999U));
+  EXPECT_EQ(0x9999U, monitor.sp_el[OEMU_EL1]);
+  EXPECT_EQ(0x2000U, regs_.sp) << "an inactive bank write must not move the live SP";
+
+  uint64_t value = 0;
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&monitor, OEMU_SYSREG_SP_EL1, &value));
+  EXPECT_EQ(0x9999U, value);
+}
+
+TEST_F(SysregTest, SpEl1IsInaccessibleFromEl1) {
+  // The SP_EL1 encoding lives in the op1 bank of the level above, so an EL1
+  // guest cannot touch it -- the executor's Undefined signal, same as any
+  // too-low-EL access.
+  uint64_t value = 0;
+  EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_sysreg_read(&sr_, OEMU_SYSREG_SP_EL1, &value));
+  EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_sysreg_write(&sr_, OEMU_SYSREG_SP_EL1, 0));
 }
 
 // --- the two Undefined signals -----------------------------------------------------

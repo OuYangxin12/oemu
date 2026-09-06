@@ -272,6 +272,28 @@ oemu_add_test(test_sysreg_check
   LABELS "unit;death"
 )
 
+# Exception delivery and return: routing, vector groups, SP bank switching,
+# ERET's permission checks and the abort helpers' syndromes.
+oemu_add_test(test_exc
+  SOURCES unit/test_exc.cpp
+  LABELS unit
+)
+
+# Reaches into src/exc/exc_internal.h: ESR word bit layouts and the mode
+# validator's verdict table.
+oemu_add_test(test_exc_internal
+  SOURCES unit/test_exc_internal.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
+# Death tests for the exc module's fatal contracts (NULL state, delivery to
+# EL0/EL2).
+oemu_add_test(test_exc_check
+  SOURCES unit/test_exc_check.cpp
+  LABELS "unit;death"
+)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.
@@ -305,6 +327,9 @@ add_dependencies(check
   test_sysreg
   test_sysreg_internal
   test_sysreg_check
+  test_exc
+  test_exc_internal
+  test_exc_check
 )
 
 # Registers the `coverage` target now that the test targets exist.

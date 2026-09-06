@@ -182,11 +182,20 @@ typedef enum oemu_opcode {
   OEMU_OP_SVC,
   OEMU_OP_BRK,
   OEMU_OP_HLT,
+  OEMU_OP_HVC, /* monitor call: Undefined until PSCI exists (M4) */
+  OEMU_OP_SMC, /* likewise */
+  OEMU_OP_ERET,
   OEMU_OP_NOP,
-  OEMU_OP_HINT,    /* YIELD/WFE/WFI/SEV: architecturally a hint, a NOP here */
+  OEMU_OP_HINT, /* YIELD/SEV/SEVL: architecturally a hint, a NOP here */
+  OEMU_OP_WFI,  /* scheduler yield points in system mode (M4); free NOP in a
+                 * user-mode process */
+  OEMU_OP_WFE,
   OEMU_OP_BARRIER, /* DMB/DSB/ISB: ordering is trivially satisfied */
   OEMU_OP_MRS,
-  OEMU_OP_MSR
+  OEMU_OP_MSR,
+  OEMU_OP_SYS /* SYS/SYSL (DC/IC/TLBI/AT...): insn.sysreg names the operation,
+               * decoded so the executor can distinguish it from Undefined
+               * encoding space; M3 wires the data-management ones */
 } oemu_opcode;
 
 /*

@@ -530,9 +530,13 @@ TEST(DecodeException, DecodesBrkAndHlt) {
 
 TEST(DecodeSystem, NopIsDistinctFromOtherHints) {
   EXPECT_EQ(OEMU_OP_NOP, DecodeOk(0xd503201fU).op);
-  // YIELD, WFE, WFI and SEV are hints with no user-visible effect here.
+  // YIELD and SEV/SEVL stay hints; WFE and WFI get their own opcodes so a
+  // system-mode executor can make them scheduler yield points (M4).
   EXPECT_EQ(OEMU_OP_HINT, DecodeOk(0xd503203fU).op);  // yield
-  EXPECT_EQ(OEMU_OP_HINT, DecodeOk(0xd503205fU).op);  // wfe
+  EXPECT_EQ(OEMU_OP_WFE, DecodeOk(0xd503205fU).op);   // wfe
+  EXPECT_EQ(OEMU_OP_WFI, DecodeOk(0xd503207fU).op);   // wfi
+  EXPECT_EQ(OEMU_OP_HINT, DecodeOk(0xd503209fU).op);  // sev
+  EXPECT_EQ(OEMU_OP_HINT, DecodeOk(0xd50320bfU).op);  // sevl
 }
 
 TEST(DecodeSystem, BarriersDecodeToTheBarrierMarker) {
@@ -872,17 +876,41 @@ TEST(DecodeScope, RejectsSimdLoadStoreAsUnsupported) {
   EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_decode(0x3d800020U, kPc, &insn));  // str q0, [x1]
 }
 
-TEST(DecodeScope, RejectsEretAsUnsupported) {
-  // ERET is a real instruction, but an EL1+ one.
-  oemu_insn insn{};
-  EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_decode(0xd69f03e0U, kPc, &insn));
+TEST(DecodeException, DecodesEretHvcAndSmc) {
+  // Real EL1+ instructions: they decode (the executor raises the exceptions
+  // of oemu/exc.h), which is not the same as the user-mode subset running
+  // them.
+  const oemu_insn eret = DecodeOk(0xd69f03e0U);  // eret
+  EXPECT_EQ(OEMU_OP_ERET, eret.op);
+  EXPECT_EQ(OEMU_OPERAND_NONE, eret.operand_kind);
+
+  const oemu_insn hvc = DecodeOk(0xd4000842U);  // hvc #0x42
+  EXPECT_EQ(OEMU_OP_HVC, hvc.op);
+  EXPECT_EQ(0x42U, hvc.uimm);
+
+  const oemu_insn smc = DecodeOk(0xd4000843U);  // smc #0x42
+  EXPECT_EQ(OEMU_OP_SMC, smc.op);
+  EXPECT_EQ(0x42U, smc.uimm);
 }
 
-TEST(DecodeScope, RejectsHvcAndSmcAsUnsupported) {
-  oemu_insn hvc{};
-  EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_decode(0xd4000002U, kPc, &hvc));
-  oemu_insn smc{};
-  EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_decode(0xd4000003U, kPc, &smc));
+TEST(DecodeSystem, SysKeepsTheOperationSelector) {
+  // The selector is the same op1:CRn:CRm:op2 field the MRS/MSR rows use, so
+  // an executor compares one 14-bit value per operation. Encodings
+  // harvested from clang --target=aarch64 (llvm 18). oemu decodes the whole
+  // op0=0b01 group coarsely -- including combinations the allocation table
+  // leaves unallocated (llvm-mc rejects those) -- because the executor
+  // refuses every operation until M3 wires the data-management ones up, and
+  // a coarse class keeps the executor's switch small until then.
+  const oemu_insn dc = DecodeOk(0xd50b7423U);  // dc zva, x3
+  EXPECT_EQ(OEMU_OP_SYS, dc.op);
+  EXPECT_EQ(3U, dc.rd);
+  // op1=0b011 (DC), CRn=7, CRm=4, op2=1.
+  EXPECT_EQ(0x1BA1U, dc.sysreg);
+
+  const oemu_insn tlbi = DecodeOk(0xd508871fU);  // tlbi vmalle1
+  EXPECT_EQ(OEMU_OP_SYS, tlbi.op);
+  // op1=0, CRn=8, CRm=7, op2=0.
+  EXPECT_EQ(0x0438U, tlbi.sysreg);
 }
 
 // --- rejection: invalid encodings --------------------------------------------
