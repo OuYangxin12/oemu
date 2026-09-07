@@ -340,6 +340,16 @@ oemu_add_test(test_page_table_builder
   LABELS unit
 )
 
+# L2 boot smoke: drives the real CLI over the freestanding guest assembled
+# from tests/guest/el1_smoke.S. Needs scripts/build-guest.sh's cross pair, so
+# every case GTEST_SKIPs without the image -- a missing optional toolchain is
+# a skip, never a failure.
+oemu_add_test(test_boot_smoke
+  SOURCES unit/test_boot_smoke.cpp
+  LABELS guest
+)
+add_dependencies(test_boot_smoke oemu_cli)
+
 # --- convenience targets ------------------------------------------------------
 
 # `cmake --build build --target check` builds everything then runs ctest.
@@ -379,6 +389,7 @@ add_dependencies(check
   test_vcpu
   test_vcpu_internal
   test_page_table_builder
+  test_boot_smoke
 )
 
 # Registers the `coverage` target now that the test targets exist.
