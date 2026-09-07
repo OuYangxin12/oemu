@@ -240,7 +240,8 @@ constexpr uint32_t movz(const uint32_t rd, const uint32_t imm16) {
 // size=11 opc=01 fixed 0xF9400000, imm14 = off/8 at bit 10). Kept alongside
 // movz for tests that hand-build a load; [[maybe_unused]] so the compiler
 // does not flag it on the day no case happens to need it.
-[[maybe_unused]] constexpr uint32_t ldr(const uint32_t rt, const uint32_t rn, const uint32_t off) {
+[[maybe_unused]] constexpr uint32_t ldr(const uint32_t rt, const uint32_t rn,
+                                        const uint32_t off) {
   return 0xF9400000U | ((off >> 3U) << 10U) | (rn << 5U) | rt;
 }
 }  // namespace boot_words
