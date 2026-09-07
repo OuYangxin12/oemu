@@ -229,9 +229,9 @@ constexpr uint32_t kStrX0X1 = 0xF9000020U;     // str  x0, [x1]  (device gets lo
 constexpr uint32_t kStrX0X1Off8 = 0xF9001020U;
 // ldr x0, [x1]: same family, opc=01 (ARM ARM C6.2.219) -- Rt=0, Rn=1.
 constexpr uint32_t kLdrX0X1 = 0xF9400020U;
-constexpr uint32_t kBrk0 = 0xD4200000U;        // brk  #0
-constexpr uint32_t kWfi = 0xD503207FU;         // wfi
-constexpr uint32_t kBSpin = 0x14000000U;       // b    .
+constexpr uint32_t kBrk0 = 0xD4200000U;   // brk  #0
+constexpr uint32_t kWfi = 0xD503207FU;    // wfi
+constexpr uint32_t kBSpin = 0x14000000U;  // b    .
 // movz x64,#imm16 : the pattern cited above.
 constexpr uint32_t movz(const uint32_t rd, const uint32_t imm16) {
   return 0xD2800000U | ((imm16 & 0xFFFFU) << 5U) | rd;
@@ -408,8 +408,7 @@ TEST_F(CliBootTest, BootEntryOverrideSkipsThePark) {
                  kUartAddress[1], boot_words::kStrX0X1});
   const TempImage file(parked);
   ASSERT_TRUE(file.ok());
-  const Captured r =
-      capture_cli({"boot", "-kernel", file.path(), "--entry", "0x40080004"});
+  const Captured r = capture_cli({"boot", "-kernel", file.path(), "--entry", "0x40080004"});
   EXPECT_TRUE(r.exited);
   EXPECT_EQ(r.code, 0);
 }

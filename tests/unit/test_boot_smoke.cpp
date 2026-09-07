@@ -53,8 +53,12 @@ std::string exe_dir() {
 
 // build-guest.sh writes build/guest/*.bin; from build/<preset>/bin that is
 // ../../guest. One relative contract, no configured path.
-std::string oemu_path() { return exe_dir() + "oemu"; }
-std::string guest_path() { return exe_dir() + "../../guest/el1_smoke.bin"; }
+std::string oemu_path() {
+  return exe_dir() + "oemu";
+}
+std::string guest_path() {
+  return exe_dir() + "../../guest/el1_smoke.bin";
+}
 
 struct CaptureResult {
   bool exited = false;
@@ -122,16 +126,20 @@ TEST(BootSmoke, El1ArmVectorsSvcRoundTripAndMarker) {
     GTEST_SKIP() << "oemu binary not found at " << oemu_path() << " (build it first)";
   }
   if (access(guest_path().c_str(), R_OK) != 0) {
-    GTEST_SKIP() << "guest image missing: " << guest_path()
-                 << " -- run scripts/build-guest.sh tests/guest/el1_smoke.S (needs clang + ld.lld)";
+    GTEST_SKIP()
+        << "guest image missing: " << guest_path()
+        << " -- run scripts/build-guest.sh tests/guest/el1_smoke.S (needs clang + ld.lld)";
   }
 
-  const CaptureResult r = run_capture({"boot", "-kernel", guest_path(), "--max-insns", kBudget});
+  const CaptureResult r =
+      run_capture({"boot", "-kernel", guest_path(), "--max-insns", kBudget});
   ASSERT_TRUE(r.exited) << "oemu did not exit normally (killed by a signal?)";
-  EXPECT_NE(r.out.find("EL1"), std::string::npos) << "no EL1 self-report on the UART: " << r.out;
+  EXPECT_NE(r.out.find("EL1"), std::string::npos)
+      << "no EL1 self-report on the UART: " << r.out;
   EXPECT_NE(r.out.find("BOOT-OK"), std::string::npos)
       << "no BOOT-OK: the SVC/ERET round trip did not complete: " << r.out;
-  EXPECT_EQ(r.out.find("BOOT-FAIL"), std::string::npos) << "the guest explicitly failed: " << r.out;
+  EXPECT_EQ(r.out.find("BOOT-FAIL"), std::string::npos)
+      << "the guest explicitly failed: " << r.out;
   EXPECT_EQ(r.code, 0) << "expected the EOT sentinel to power the machine off cleanly";
 }
 

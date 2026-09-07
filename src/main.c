@@ -89,14 +89,14 @@
  * and size from docs/linux-minimal-qemu.md, image address from the booting.rst
  * protocol, UART address from virt's memory map.
  */
-#define BOOT_RAM_BASE   ((uint64_t)0x40000000ULL)
-#define BOOT_RAM_SIZE   ((uint64_t)0x10000000ULL) /* 256 MiB, as the oracle baseline */
-#define BOOT_IMAGE_BASE ((uint64_t)0x40080000ULL) /* booting.rst kernel load address */
-#define BOOT_UART_BASE  ((uint64_t)0x09000000ULL) /* virt UART0 -- oracle-portable */
-#define BOOT_UART_SIZE  ((uint64_t)0x00001000ULL)
-#define BOOT_UART_DR    ((uint64_t)0x00ULL) /* PL011 DR offset: the only register we honour */
-#define BOOT_UART_EOT   (0x04U)             /* sentinel byte: the guest asks to stop */
-#define BOOT_REGION_CAPACITY 8U             /* RAM + UART today; room for M4 devices */
+#define BOOT_RAM_BASE        ((uint64_t)0x40000000ULL)
+#define BOOT_RAM_SIZE        ((uint64_t)0x10000000ULL) /* 256 MiB, as the oracle baseline */
+#define BOOT_IMAGE_BASE      ((uint64_t)0x40080000ULL) /* booting.rst kernel load address */
+#define BOOT_UART_BASE       ((uint64_t)0x09000000ULL) /* virt UART0 -- oracle-portable */
+#define BOOT_UART_SIZE       ((uint64_t)0x00001000ULL)
+#define BOOT_UART_DR         ((uint64_t)0x00ULL) /* PL011 DR offset: the only register we honour */
+#define BOOT_UART_EOT        (0x04U)             /* sentinel byte: the guest asks to stop */
+#define BOOT_REGION_CAPACITY 8U                  /* RAM + UART today; room for M4 devices */
 /* Instructions per scheduler slice. One vCPU, so a quantum is purely the
  * latency bound between machine-event polls; 1M keeps a stuck guest inside
  * the 60 s test budget while keeping syscall-free slices cheap. */
@@ -287,8 +287,7 @@ static uint64_t load64le(const unsigned char *p) {
 static oemu_status boot_load_image(oemu_aspace *as, const unsigned char *src, size_t len) {
   uint64_t pa = BOOT_IMAGE_BASE;
   while (len >= 8U) {
-    const oemu_status st =
-        oemu_aspace_write(as, pa, OEMU_MEM_DWORD, load64le(src));
+    const oemu_status st = oemu_aspace_write(as, pa, OEMU_MEM_DWORD, load64le(src));
     if (st != OEMU_OK) {
       return st;
     }
@@ -371,8 +370,7 @@ static int boot(const char *kernel_path, uint64_t entry, uint64_t max_insns) {
   /* The architecture requires a 4-byte-aligned PC, and the entry must be
    * inside the machine -- an entry outside RAM is a caller error, not a
    * guest-visible Instruction Abort at an address no region owns. */
-  if ((entry & 3U) != 0U || entry < BOOT_RAM_BASE ||
-      entry >= BOOT_RAM_BASE + BOOT_RAM_SIZE) {
+  if ((entry & 3U) != 0U || entry < BOOT_RAM_BASE || entry >= BOOT_RAM_BASE + BOOT_RAM_SIZE) {
     (void)fprintf(stderr, "oemu: entry 0x%" PRIx64 " is not 4-aligned inside RAM\n", entry);
     goto done;
   }
@@ -406,8 +404,8 @@ static int boot(const char *kernel_path, uint64_t entry, uint64_t max_insns) {
   env.syscall = NULL;
   env.halted = boot_halted;
   bus = oemu_aspace_memops(&machine.aspace);
-  st = oemu_vcpu_init(&vcpu, &bus, &env, OEMU_EL1, entry,
-                      BOOT_RAM_BASE + BOOT_RAM_SIZE - 16U, BOOT_QUANTUM);
+  st = oemu_vcpu_init(&vcpu, &bus, &env, OEMU_EL1, entry, BOOT_RAM_BASE + BOOT_RAM_SIZE - 16U,
+                      BOOT_QUANTUM);
   if (st != OEMU_OK) {
     (void)fprintf(stderr, "oemu: vcpu init failed: %s\n", oemu_status_str(st));
     goto done;
