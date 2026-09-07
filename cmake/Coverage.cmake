@@ -32,7 +32,15 @@ function(oemu_add_coverage_target)
 
   find_program(OEMU_LCOV lcov)
   find_program(OEMU_GENHTML genhtml)
-  find_program(OEMU_GCOV gcov)
+
+  # gcov must come from the same GCC major as the compiler that wrote the
+  # .gcda/.gcno files: a mismatched gcov mis-parses the profile format and
+  # here failed slowly on every file (a minute each, zero output), which the
+  # summary then reported as an empty run with a green exit code. Prefer the
+  # versioned binary; fall back to PATH's gcov for toolchains (e.g. Clang)
+  # that have no matching-named one.
+  string(REGEX MATCH "^[0-9]+" oemu_gcc_major "${CMAKE_C_COMPILER_VERSION}")
+  find_program(OEMU_GCOV NAMES "gcov-${oemu_gcc_major}" gcov)
 
   # Text summary straight from gcov: always available when the compiler is, so
   # coverage numbers are reachable even without lcov installed.
@@ -73,9 +81,13 @@ function(oemu_add_coverage_target)
   set(html "${CMAKE_BINARY_DIR}/coverage-html")
 
   # --ignore-errors keeps lcov tolerant across gcc/lcov version mismatches.
+  # --gcov-tool pins the same version-matched gcov as the summary target: the
+  # counters were written by the configured compiler, so lcov's internal gcov
+  # calls must speak the same profile format.
   set(lcov_common
     --directory "${CMAKE_BINARY_DIR}"
     --rc branch_coverage=1
+    --gcov-tool "${OEMU_GCOV}"
     --ignore-errors mismatch,unused,empty,gcov,source,negative
   )
 
