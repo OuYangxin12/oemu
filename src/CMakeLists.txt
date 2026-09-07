@@ -102,7 +102,20 @@ set(OEMU_INTERNAL_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}" PARENT_SCOPE)
 
 # --- optional demo executable -------------------------------------------------
 
+# The boot command needs a device tree even where dtc does not exist, so the
+# fixture blob rides inside the binary. A configure-time byte dump turns it
+# into a C array -- no host tools required at build or run time, CI-clean.
+find_program(Python3_EXECUTABLE NAMES python3 python)
+if(NOT Python3_EXECUTABLE)
+  message(FATAL_ERROR "python3 is needed to embed the boot device-tree fixture")
+endif()
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/generated)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_LIST_DIR}/../scripts/embed-dtb.py" "${CMAKE_CURRENT_LIST_DIR}/../tests/fixtures/boot.dtb" "${CMAKE_BINARY_DIR}/generated/boot_dtb.h"
+  COMMAND_ERROR_IS_ERROR)
+
 add_executable(oemu_cli main.c)
+target_include_directories(oemu_cli PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(oemu_cli PRIVATE oemu oemu_compiler_flags)
 set_target_properties(oemu_cli PROPERTIES OUTPUT_NAME oemu)
 

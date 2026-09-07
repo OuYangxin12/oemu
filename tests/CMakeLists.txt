@@ -324,6 +324,38 @@ oemu_add_test(test_fdt
   LABELS unit
 )
 
+# M4a Image loader: byte-built booting.rst headers against the parser's
+# accept/refuse matrix, and a real load into a machine's physical bus. White-
+# box only for the named header-offset constants; behaviour stays black-box.
+oemu_add_test(test_image
+  SOURCES unit/test_image.cpp
+  INTERNAL
+  LABELS unit
+)
+
+# The Image loader's fatal bus-contract abort.
+oemu_add_test(test_image_check
+  SOURCES unit/test_image_check.cpp
+  INTERNAL
+  LABELS "unit;death"
+)
+
+# M4a PL011: driven over the bus as a guest driver sees it -- TX pass-through
+# and ring order, RX injection gating, RIS/MIS interrupt state, the peripheral
+# ID table measured off QEMU. Uses the internal offset/bit names.
+oemu_add_test(test_pl011
+  SOURCES unit/test_pl011.cpp
+  INTERNAL
+  LABELS unit
+)
+
+# The PL011 device-handle fatal contract.
+oemu_add_test(test_pl011_check
+  SOURCES unit/test_pl011_check.cpp
+  INTERNAL
+  LABELS "unit;death"
+)
+
 # M3b parity: every served answer against the bypassed walk -- the cache
 # may only be faster. It needs the internal bypass and the peek, so it is
 # a whitebox target; the suite names carry "Tlb" for -R Tlb.

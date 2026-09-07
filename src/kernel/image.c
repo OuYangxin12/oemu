@@ -53,17 +53,19 @@ oemu_status oemu_image_parse_header(const unsigned char *head, oemu_image *out) 
   if ((flags & 0xB8U) != 0U) {
     return OEMU_ERR_UNSUPPORTED;
   }
-  const uint32_t text_offset = img_le32(head + 0x08U);
+  /* booting.rst: text_offset is a 64-bit little-endian doubleword, 4 KiB
+   * aligned and under 2 MiB. (A 32-bit read here reads the always-zero high
+   * half on a 4K-aligned image and would pass -- wrong for other layouts.) */
+  const uint64_t text_offset = img_le64(head + 0x08U);
   const uint64_t image_size = img_le64(head + 0x10U);
-  /* booting.rst: text_offset must be 2 MiB-aligned and below 2 MiB. */
-  if (((text_offset & 0x1FFFFFU) != 0U) || (text_offset >= 0x200000U)) {
+  if (((text_offset & 0xFFFU) != 0U) || (text_offset >= 0x200000U)) {
     return OEMU_ERR_FORMAT;
   }
   /* An image_size of zero is the legacy "unknown" encoding; the loader
    * caller supplies the file length in that case, so keep it as-is but
    * an absurd size is caught against the machine, not the header. */
   oemu_image parsed;
-  parsed.text_offset = text_offset;
+  parsed.text_offset = (uint32_t)text_offset; /* validated below 2 MiB, so it fits */
   parsed.image_size = image_size;
   parsed.flags = flags;
   parsed.load_pa = 0U;
@@ -82,7 +84,7 @@ oemu_status oemu_image_load(oemu_image *out, const unsigned char *bytes, size_t 
     return OEMU_ERR_FORMAT; /* not even a header */
   }
   oemu_image info;
-  const oemu_status st = oemu_image_parse_header(bytes, &info);
+  oemu_status st = oemu_image_parse_header(bytes, &info);
   if (st != OEMU_OK) {
     return st;
   }

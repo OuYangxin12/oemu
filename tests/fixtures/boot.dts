@@ -26,6 +26,11 @@
 
 	chosen {
 		stdout-path = "/pl011@9000000";
+		/* A fixed 256-byte pad: `oemu boot -append` writes the command line
+		 * into this property in place, so the blob's size and dtc-identity
+		 * never change. Trailing spaces are invisible to Linux, which
+		 * reads bootargs with strlen semantics. */
+		bootline = "                                                                                                                                                                                                ";
 	};
 
 	aliases {

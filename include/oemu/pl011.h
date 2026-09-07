@@ -29,8 +29,13 @@
 
 OEMU_BEGIN_DECLS
 
-/* Ring depths: fixed, embedded, spec-plausible (PL011 FIFOs top out at 32). */
-#define OEMU_PL011_TX_RING 16U
+/* Ring depths: fixed, embedded. The RX ring matches the real FIFO. The TX
+ * ring is deliberately deeper than the 32-entry hardware: the model drains
+ * TX at run-loop slice boundaries, not at a baud rate, so a burst longer
+ * than the slice would silently lose the oldest byte. A guest banner
+ * ("PSCI-OK\nPSCI-SMC\n") is one such burst; 64 keeps every polled byte and
+ * the drop path stays only as the last-resort overflow signal it is. */
+#define OEMU_PL011_TX_RING 64U
 #define OEMU_PL011_RX_RING 16U
 
 /* One output byte, handed to the installer's sink by oemu_pl011_pump. */

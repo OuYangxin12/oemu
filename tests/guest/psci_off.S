@@ -28,14 +28,15 @@
 _start_of_image:
 	b	_start
 	.word	0
-	.quad	0x80000
-	.quad	_image_end - _start_of_image
+	.quad	0x1000                       /* text_offset: 4 KiB up, booting.rst-legal */
+	.quad	_image_end - _start
 	.quad	0x2                          /* LE, 4K pages */
 	.quad	0
 	.quad	0
 	.quad	0
 	.word	0x644d5241                   /* "ARM\x64" */
 	.word	0
+	.balign	0x1000                       /* the loader skips this hole */
 
 _start:
 	/* Reserve a stack below the image: the print helpers are non-leaf and
@@ -139,32 +140,29 @@ probe_conduit:
 	cmp	w0, #3
 	b.eq	.Lpc_prop
 	b	.Lpc_default                 /* END or nonsense */
+
+/* BEGIN_NODE: the name follows the token inline. Walk to its NUL, but stop
+ * at the blob end -- a corrupt or truncated name must bail, not run off the
+ * mapped window into an unmapped byte and take a data abort. */
 .Lpc_begin:
-	/* inline name at x21: find its NUL, then compare "psci" */
 	mov	x2, x21
-1:	ldrb	w3, [x2], #1
+1:	cmp	x2, x25
+	b.hs	.Lpc_default
+	ldrb	w3, [x2], #1
 	cbnz	w3, 1b
-	sub	x4, x2, x21                  /* strlen + 1 */
+	sub	x4, x2, x21                  /* strlen + 1, including the NUL */
 	add	x5, x4, #3
-	and	x5, x5, #~3                  /* padded advance */
-	cmp	x4, #5                       /* "psci\0" is exactly 5 */
+	and	x5, x5, #~3                  /* padded advance to the next word */
+	cmp	x4, #5                       /* "psci\0" is exactly five bytes */
 	b.ne	.Lpc_begin_no
-	ldrb	w1, [x21]
-	ldrb	w2, [x21, #1]
-	ldrb	w3, [x21, #2]
-	ldrb	w4, [x21, #3]
-	adr	x6, str_psci
-	ldrb	w7, [x6]
-	ldrb	w8, [x6, #1]
-	ldrb	w9, [x6, #2]
-	ldrb	w10, [x6, #3]
-	cmp	w1, w7
-	b.ne	.Lpc_begin_no
-	cmp	w2, w8
-	b.ne	.Lpc_begin_no
-	cmp	w3, w9
-	b.ne	.Lpc_begin_no
-	cmp	w4, w10
+	/* the four name bytes against one immediate: an `adr` to str_psci
+	 * inside this loop is what bit us -- its relocation came out wrong and
+	 * graded the wrong address, so the name is now compared to a constant.
+	 * Little-endian: byte 0 'p' is the low halfword, byte 3 'i' the high. */
+	movz	w4, #0x7370                   /* 'p' 's' */
+	movk	w4, #0x6963, lsl #16         /* 'c' 'i' */
+	ldr	w6, [x21]                    /* the four name bytes in one word */
+	cmp	w6, w4
 	b.ne	.Lpc_begin_no
 	mov	x23, #1                      /* inside /psci */
 	b	.Lpc_begin_next
@@ -173,73 +171,56 @@ probe_conduit:
 .Lpc_begin_next:
 	add	x21, x21, x5
 	b	.Lpc_loop
+
 .Lpc_end:
 	mov	x23, #0
 	b	.Lpc_loop
+
+/* PROP: name is the string-block offset (token + 8). Resolve it, bound it
+ * inside the blob, and only then read. dlen (token + 4) sizes the value;
+ * the cursor always advances, whatever the name turns out to be. */
 .Lpc_prop:
 	add	x0, x21, #8
 	cmp	x0, x25
 	b.hi	.Lpc_default
 	ldr	w1, [x21]
-	rev	w1, w1                       /* dlen: token + 4 */
+	rev	w1, w1                       /* dlen */
 	ldr	w0, [x21, #4]
-	rev	w0, w0                       /* name offset: token + 8 */
-	/* resolve the name both ways: by string-block offset and inline at
-	 * token+12. Whichever reads "method" is the layout this tree uses;
-	 * real-world blobs are split on this (QEMU writes inline, libfdt
-	 * tools write offsets), so the probe accepts either. */
-	add	x6, x24, x0                  /* name by string-block offset */
-	add	x7, x21, #8                  /* name inline, token + 12 */
+	rev	w0, w0                       /* name offset */
+	add	x6, x24, x0                  /* name address in the string block */
 	mov	x5, x1
 	add	x5, x5, #3
-	and	x5, x5, #~3
+	and	x5, x5, #~3                  /* padded value length */
 	add	x4, x21, #8
 	add	x4, x4, x5                   /* cursor after the padded body */
 	mov	x21, x4                      /* walk on regardless */
 	cbz	x23, .Lpc_loop               /* outside /psci: not our property */
-	/* compare "method" at either candidate address; x3 keeps the winner */
-	ldrb	w1, [x6]
-	cmp	w1, #'m'
-	b.eq	.Lpc_name_ok
-	ldrb	w1, [x7]
-	cmp	w1, #'m'
+	/* six name bytes fit? x6 must sit at least six in from the blob end. */
+	sub	x2, x25, #6
+	cmp	x6, x2
+	b.hi	.Lpc_loop
+	cmp	x6, x20
+	b.lo	.Lpc_loop
+	ldr	w6, [x6]                     /* 'm''e''t''h', the first four bytes */
+	ldrh	w2, [x6, #4]                 /* 'o''d', the last two */
+	movz	w3, #0x656d                   /* 'm' 'e' */
+	movk	w3, #0x6874, lsl #16         /* 't' 'h' */
+	cmp	w6, w3
 	b.ne	.Lpc_loop
-	mov	x3, x7
-	b	.Lpc_name_more
-.Lpc_name_ok:
-	mov	x3, x6
-.Lpc_name_more:
-	/* the literals are immediates, not adr loads: the cursor must never
-	 * touch x30, the link register -- a `bl` on the way here rewrote it,
-	 * and the "compare" silently graded the return address instead of
-	 * bytes. */
-	ldrb	w1, [x3]
-	ldrb	w2, [x3, #1]
-	ldrb	w3, [x3, #2]
-	ldrb	w4, [x3, #3]
-	ldrb	w7, [x3, #4]
-	ldrb	w8, [x3, #5]
-	cmp	w1, #'m'
+	movz	w3, #0x646f                   /* 'o' 'd' */
+	cmp	w2, w3
 	b.ne	.Lpc_loop
-	cmp	w2, #'e'
-	b.ne	.Lpc_loop
-	cmp	w3, #'t'
-	b.ne	.Lpc_loop
-	cmp	w4, #'h'
-	b.ne	.Lpc_loop
-	cmp	w7, #'o'
-	b.ne	.Lpc_loop
-	cmp	w8, #'d'
-	b.ne	.Lpc_loop
-	/* the method property: its value begins at token + 12, i.e. right
-	 * after the dlen and name-offset words -- x4 strided past the
-	 * padded body, so step back over the padding only. */
+	/* it is /psci/method: read the 4-byte value at token + 12. x4 already
+	 * strided past the value plus padding; step back over just the padding. */
 	sub	x4, x4, x5
-	ldr	w1, [x4]                     /* value bytes, LE view of "hvc\0" */
+	sub	x2, x25, #4
+	cmp	x4, x2
+	b.hi	.Lpc_default
+	ldr	w1, [x4]                     /* value, LE view of "hvc\0" */
 	movz	w2, #0x7668                  /* 'h' 'v' */
 	movk	w2, #0x0063, lsl #16         /* 'c' '\0' */
 	cmp	w1, w2
-	b.ne	.Lpc_default
+	b.ne	.Lpc_default                 /* present but not hvc: SMC */
 	mov	w0, #1                       /* the DTB says HVC */
 	b	.Lpc_ret
 .Lpc_default:
