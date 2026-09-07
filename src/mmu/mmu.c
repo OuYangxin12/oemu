@@ -25,6 +25,7 @@
 #include "oemu/memory.h"
 
 #include <stddef.h>
+#include <string.h>
 
 #include "mmu_internal.h"
 
@@ -51,6 +52,7 @@
 #define DESC_AP2       ((uint64_t)1U << 7U)
 #define DESC_AP1       ((uint64_t)1U << 6U)
 #define DESC_AF        ((uint64_t)1U << 10U)
+#define DESC_NG        ((uint64_t)1U << 11U) /* not-global: TLB tag material */
 #define DESC_PXN       ((uint64_t)1U << 53U)
 #define DESC_XN        ((uint64_t)1U << 54U)
 #define DESC_ADDR_MASK (UINT64_C(0x0000FFFFFFFFF000)) /* bits [47:12] */
@@ -151,6 +153,7 @@ oemu_mmu_desc oemu_mmu_internal_decode(uint64_t descriptor) {
   d.table = ((descriptor & 3U) == 3U);
   d.block_page = ((descriptor & 3U) == 1U);
   d.address = descriptor & DESC_ADDR_MASK;
+  d.ng = (descriptor & DESC_NG) != 0U;
   d.af = (descriptor & DESC_AF) != 0U;
   d.ap = (unsigned)((descriptor & DESC_AP2) != 0U) * 2U +
          (unsigned)((descriptor & DESC_AP1) != 0U);
@@ -220,9 +223,24 @@ typedef struct walk_fault {
   uint64_t far;
 } walk_fault;
 
+/* What a successful walk must hand back so the TLB can be filled: the leaf
+ * level (which is the size, and the DFSC level of any later permission
+ * fault), the leaf attributes after the table constraints have been
+ * merged, and whether this was a table walk at all -- the identity paths
+ * (EL3, SCTLR.M=0) have nothing worth caching and nothing to invalidate. */
+typedef struct oemu_walk_info {
+  bool walked;
+  unsigned level;
+  unsigned ap;
+  bool xn;
+  bool pxn;
+  bool ng;
+} walk_info;
+
 static oemu_status walk(const oemu_sysregs *sr, const oemu_memops *phys, uint64_t va,
                         oemu_el cur, bool is_write, bool is_fetch, uint64_t *pa_out,
-                        walk_fault *wf) {
+                        walk_fault *wf, walk_info *wi) {
+  wi->walked = false;
   const uint64_t sctlr = sr->sctlr_el1;
 
   /* EL3 runs untranslated: SCTLR_EL3 is not modelled because the modelled
@@ -344,12 +362,19 @@ static oemu_status walk(const oemu_sysregs *sr, const oemu_memops *phys, uint64_
     }
 
     *pa_out = addr;
+    /* The fill material, for whoever fronts this walk with a cache: the
+     * merged attributes exactly as the verdict was reached, so a served
+     * hit replays the same inputs through the same permission table. */
+    wi->walked = true;
+    wi->level = (unsigned)level;
+    wi->ap = ap;
+    wi->xn = xn;
+    wi->pxn = pxn;
+    wi->ng = d.ng;
     return OEMU_OK;
   }
 #undef MMU_FAULT
 }
-
-/* --- fault plumbing ---------------------------------------------------------- */
 
 static bool to_lower_from(oemu_el cur) {
   return cur < oemu_exc_route(cur);
@@ -361,17 +386,174 @@ static uint32_t compose_esr(oemu_el cur, bool is_fetch, bool is_write, oemu_mmu_
                                oemu_mmu_internal_dfsc(cls, level));
 }
 
-/* One translation through the bus wrapper, with the access kind resolved
- * into the fault record on the way out. */
-static oemu_status translate(const oemu_mmu *mmu, uint64_t va, oemu_el cur, bool is_write,
+/* --- the TLB: M3a's walk, fronted by a cache that may only be faster ----------
+ *
+ * One direct-mapped cache; the set is VA[23:12] and the tag is the whole
+ * (tag-stripped, page-aligned) address, so a hit is an exact match and the
+ * entry needs no mask beyond its own existence. The lookup sits between
+ * the control-epoch check and the walk; the fill happens only on the
+ * success path of a table-driven translation. Faults are never cached --
+ * a faulting address re-walks, which is both the cheap choice and the one
+ * that cannot go stale.
+ *
+ * Epoch invalidation is value comparison, not trap interception: a guest
+ * that writes a control register by any route (MSR, a debug port, a test
+ * fixture poking the struct) invalidates exactly the same way, and a
+ * same-value write invalidates not at all -- the architecture permits
+ * that, because software owning break-before-make must TLBI after any
+ * change that matters anyway, and TLBI here means flush-all.
+ */
+
+/* The epoch, in order: a change to any of the five flushes everything. */
+#define TLB_EPOCH_SCTLR 0U
+#define TLB_EPOCH_TCR   1U
+#define TLB_EPOCH_TTBR0 2U
+#define TLB_EPOCH_TTBR1 3U
+#define TLB_EPOCH_MAIR  4U
+
+static void tlb_epoch_read(const oemu_sysregs *sr, uint64_t out[5]) {
+  out[TLB_EPOCH_SCTLR] = sr->sctlr_el1;
+  out[TLB_EPOCH_TCR] = sr->tcr_el1;
+  out[TLB_EPOCH_TTBR0] = sr->ttbr0_el1;
+  out[TLB_EPOCH_TTBR1] = sr->ttbr1_el1;
+  out[TLB_EPOCH_MAIR] = sr->mair_el1;
+}
+
+/* The set index: the twelve bits between the page offset and the reach of
+ * a page-granular index field. */
+static unsigned tlb_index(uint64_t va) {
+  return (unsigned)((va >> MMU_PAGE_SHIFT) & (OEMU_MMU_TLB_ENTRIES - 1U));
+}
+
+/* Pack the fill's verdict inputs into one byte. Storing inputs and never
+ * a verdict is what makes parity structural: a hit re-runs
+ * oemu_mmu_internal_permits with these, so cache and walk decide alike. */
+static uint8_t tlb_flags(const walk_info *wi) {
+  uint8_t f = 0U;
+  if (wi->ng) {
+    f |= OEMU_TLB_NG;
+  }
+  f |= (uint8_t)((wi->ap << 1U) & OEMU_TLB_AP);
+  if (wi->xn) {
+    f |= OEMU_TLB_XN;
+  }
+  if (wi->pxn) {
+    f |= OEMU_TLB_PXN;
+  }
+  return f;
+}
+
+void oemu_mmu_flush_all(oemu_mmu *mmu) {
+  OEMU_REQUIRE(mmu != NULL, "NULL oemu_mmu");
+  (void)memset(mmu->tlb, 0, sizeof(mmu->tlb));
+  mmu->tlb_flushes++;
+}
+
+/* Cache service for one access. A denied hit is still a served hit, so
+ * counting happens here; only the third answer lets the walk run. */
+typedef enum oemu_tlb_served {
+  TLB_SERVED, /* *pa set from the entry */
+  TLB_DENIED, /* permission fault composed from the entry's inputs */
+  TLB_MISS    /* no entry: the walk must answer */
+} tlb_served;
+
+static tlb_served tlb_lookup(oemu_mmu *mmu, uint64_t va, oemu_el cur, bool is_write,
                              bool is_fetch, uint64_t *pa, oemu_mmu_fault *f) {
+  const oemu_tlb_entry *e = &mmu->tlb[tlb_index(va)];
+  if ((e->level == 0U) || (e->va != (va & ~(MMU_PAGE_SIZE - 1U)))) {
+    mmu->tlb_misses++;
+    return TLB_MISS;
+  }
+  const unsigned ap = (unsigned)((e->flags & OEMU_TLB_AP) >> 1U);
+  if (!oemu_mmu_internal_permits(ap, (e->flags & OEMU_TLB_XN) != 0U,
+                                 (e->flags & OEMU_TLB_PXN) != 0U, cur == OEMU_EL0, is_write,
+                                 is_fetch)) {
+    /* The entry records the leaf level, and a permission fault takes its
+     * DFSC from it -- the hit composes exactly the syndrome the walk
+     * would have. */
+    f->esr = compose_esr(cur, is_fetch, is_write, OEMU_MMU_FAULT_PERMISSION, (int)e->level);
+    f->far = va; /* the tagged address was stripped before the lookup, and
+                  * the walk's FAR strips it too: same value by way of the
+                  * same expression */
+    mmu->tlb_hits++;
+    return TLB_DENIED;
+  }
+  *pa = e->pa | (va & (MMU_PAGE_SIZE - 1U));
+  mmu->tlb_hits++;
+  return TLB_SERVED;
+}
+
+/* Store one served translation, evicting whatever owned the set. `va` is
+ * the tag-stripped address the lookup used; both key and value are stored
+ * at page-base granularity -- the offset is the accessor's, not the
+ * entry's, and a hit re-adds the current one. A block's leaf may cover
+ * many pages; caching it at one page key is legal (the walk may be re-run
+ * for sibling pages), just not maximally dense. */
+static void tlb_fill(oemu_mmu *mmu, uint64_t va, uint64_t pa, const walk_info *wi) {
+  oemu_tlb_entry *e = &mmu->tlb[tlb_index(va)];
+  const bool ttbr1 = oemu_mmu_internal_use_ttbr1(va);
+  e->va = va & ~(MMU_PAGE_SIZE - 1U);
+  e->pa = pa & ~(MMU_PAGE_SIZE - 1U);
+  e->asid = (uint32_t)((ttbr1 ? mmu->sysregs->ttbr1_el1 : mmu->sysregs->ttbr0_el1) >>
+                       48U); /* tag slot: stored, pinned, inert until TLBI grows precise */
+  e->level = (uint8_t)wi->level;
+  e->flags = tlb_flags(wi);
+  e->vmid = 0U; /* no stage 2 (decision D3) */
+}
+
+/* One translation through the bus wrapper: epoch first, cache second, walk
+ * last. The cache may only remember what the walk answered -- and only on
+ * the table-driven success path: the identity paths (EL3, stage-1 off)
+ * have nothing to cache, and caching faults would invent staleness the
+ * architecture never promised. */
+static oemu_status translate(oemu_mmu *mmu, uint64_t va, oemu_el cur, bool is_write,
+                             bool is_fetch, uint64_t *pa, oemu_mmu_fault *f) {
+  const oemu_sysregs *sr = mmu->sysregs;
+  uint64_t now[5];
+  tlb_epoch_read(sr, now);
+  if (mmu->epoch_valid) {
+    for (unsigned i = 0U; i < 5U; ++i) {
+      if (mmu->epoch[i] != now[i]) {
+        oemu_mmu_flush_all(mmu);
+        break;
+      }
+    }
+  } else {
+    mmu->epoch_valid = true;
+  }
+  for (unsigned i = 0U; i < 5U; ++i) {
+    mmu->epoch[i] = now[i];
+  }
+
+  /* The tag bit is not part of the address, nor of the FAR, nor of a key:
+     the cache keys on exactly what the walk keys on. */
+  const bool ttbr1 = oemu_mmu_internal_use_ttbr1(va);
+  const bool tbi = (now[TLB_EPOCH_TCR] & (ttbr1 ? TCR_TBI1 : TCR_TBI0)) != 0U;
+  const uint64_t tva = tbi ? (va & ~(UINT64_C(0xFF) << 56)) : va;
+
+  const bool cacheable = ((now[TLB_EPOCH_SCTLR] & SCTLR_M) != 0U) && (cur < OEMU_EL3);
+  if (cacheable) {
+    const tlb_served served = tlb_lookup(mmu, tva, cur, is_write, is_fetch, pa, f);
+    if (served == TLB_SERVED) {
+      return OEMU_OK;
+    }
+    if (served == TLB_DENIED) {
+      return OEMU_ERR_FAULT;
+    }
+  }
+
   walk_fault wf;
-  const oemu_status st = walk(mmu->sysregs, &mmu->phys, va, cur, is_write, is_fetch, pa, &wf);
+  walk_info wi;
+  const oemu_status st = walk(sr, &mmu->phys, va, cur, is_write, is_fetch, pa, &wf, &wi);
   if (st == OEMU_ERR_FAULT) {
     f->esr = compose_esr(cur, is_fetch, is_write, wf.cls, wf.level);
     f->far = wf.far;
+    return st;
   }
-  return st;
+  if (cacheable && wi.walked) {
+    tlb_fill(mmu, tva, *pa, &wi);
+  }
+  return OEMU_OK;
 }
 
 static oemu_status refuse(oemu_mmu *mmu, oemu_el cur, bool is_fetch, bool is_write,
@@ -406,7 +588,7 @@ void oemu_mmu_init(oemu_mmu *mmu, oemu_sysregs *sysregs, const oemu_memops *phys
   mmu->phys = *phys;
 }
 
-OEMU_NODISCARD oemu_status oemu_mmu_translate(const oemu_mmu *mmu, uint64_t va, bool is_write,
+OEMU_NODISCARD oemu_status oemu_mmu_translate(oemu_mmu *mmu, uint64_t va, bool is_write,
                                               bool is_fetch, uint64_t *pa_out,
                                               oemu_mmu_fault *fault_out) {
   if ((mmu == NULL) || (pa_out == NULL)) {
@@ -418,6 +600,42 @@ OEMU_NODISCARD oemu_status oemu_mmu_translate(const oemu_mmu *mmu, uint64_t va, 
     fault_out = &discard;
   }
   return translate(mmu, va, cur, is_write, is_fetch, pa_out, fault_out);
+}
+
+/* --- the white-box surface (see mmu_internal.h) -------------------------------- */
+
+OEMU_NODISCARD oemu_status oemu_mmu_internal_walk(const oemu_mmu *mmu, uint64_t va, oemu_el cur,
+                                                  bool is_write, bool is_fetch,
+                                                  uint64_t *pa_out, oemu_mmu_fault *fault_out) {
+  if ((mmu == NULL) || (pa_out == NULL)) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  /* Neither the epoch nor the counters nor the cache: the oracle must not
+   * disturb the thing it is the oracle for. The walk takes the sysregs
+   * pointer and the copied bus view by const path -- it writes to none of
+   * them -- so a const layer can be walked through. */
+  walk_fault wf;
+  walk_info wi;
+  const oemu_status st =
+      walk(mmu->sysregs, &mmu->phys, va, cur, is_write, is_fetch, pa_out, &wf, &wi);
+  if ((st == OEMU_ERR_FAULT) && (fault_out != NULL)) {
+    fault_out->esr = compose_esr(cur, is_fetch, is_write, wf.cls, wf.level);
+    fault_out->far = wf.far;
+  }
+  return st;
+}
+
+bool oemu_mmu_internal_tlb_peek(const oemu_mmu *mmu, unsigned index, oemu_tlb_entry *out) {
+  OEMU_REQUIRE((mmu != NULL) && (out != NULL), "NULL tlb_peek argument");
+  if (index >= OEMU_MMU_TLB_ENTRIES) {
+    return false;
+  }
+  const oemu_tlb_entry *e = &mmu->tlb[index];
+  if (e->level == 0U) {
+    return false;
+  }
+  *out = *e;
+  return true;
 }
 
 /* --- the bus layer -----------------------------------------------------------

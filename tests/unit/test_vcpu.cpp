@@ -312,6 +312,22 @@ TEST_F(VcpuTest, TlbiAndIcExecuteAsNoOps) {
   EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText + (2U * OEMU_INSN_SIZE));
 }
 
+TEST_F(VcpuTest, TlbiThroughStepFlushesTheTlb) {
+  // M3b: the TLBI window stopped being a no-op. A real `tlbi vmalle1`
+  // executed through the step path must reach the layer's invalidation,
+  // not just retire -- the counter is the proof it did.
+  enable_identity(0U);
+  set_x(1, kData);
+  set_x(0, 0x1234ULL);
+  program({kStrX0X1, 0xD508871FU /* tlbi vmalle1 */});
+  ASSERT_EQ(step(), OEMU_OK);  // store: walks and fills the entry
+  ASSERT_EQ(step(), OEMU_OK);  // tlbi: invalidates the whole cache
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText + (2U * OEMU_INSN_SIZE));
+  EXPECT_EQ(vcpu_.mmu.tlb_flushes, UINT64_C(1));
+  store64(kData, 0U);
+  EXPECT_EQ(load64(kData), 0U);  // the mapping still serves after the flush
+}
+
 TEST_F(VcpuTest, DcZvaZeroesALine) {
   store64(kData, 0xFFFFFFFFFFFFFFFFULL);
   store64(kData + 8U, 0xFFFFFFFFFFFFFFFFULL);

@@ -149,6 +149,12 @@ class MmuTest : public ::testing::Test {
     return oemu_mmu_translate(&mmu_, va, is_write, is_fetch, pa, f);
   }
 
+  /* Since M3b the layer caches, so a test that rewrites a live mapping in
+   * place must invalidate it before re-testing -- exactly the architec-
+   * ture's break-before-make a kernel obeys. Each poke of a descriptor
+   * here is followed by tlbi(), standing in for `TLBI VMALLE1IS`. */
+  void tlbi() { oemu_mmu_flush_all(&mmu_); }
+
   oemu_aspace as_{};
   oemu_cpu cpu_{};
   oemu_sysregs sr_{};
@@ -342,8 +348,10 @@ TEST_F(MmuTest, UserPageGatesEl0ByAp) {
   ASSERT_EQ(xlat(kRam, false, false, &pa, &f), OEMU_ERR_FAULT);
   EXPECT_EQ(f.esr, EcBase(OEMU_EXC_EC_DABORT_LOWER) | kIlBit | Perm(1));
   l1_block(kL1, kRam, kRam, kAp1); /* AP=0b01 */
+  tlbi();                          /* break-before-make on the rewritten leaf */
   ASSERT_EQ(xlat(kRam, true, false, &pa, nullptr), OEMU_OK);
   l1_block(kL1, kRam, kRam, kAp1 | kAp2); /* AP=0b11: user read-only */
+  tlbi();
   ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
   ASSERT_EQ(xlat(kRam, true, false, &pa, &f), OEMU_ERR_FAULT);
   EXPECT_EQ(f.esr, EcBase(OEMU_EXC_EC_DABORT_LOWER) | kIlBit | kWnr | Perm(1));
@@ -359,6 +367,7 @@ TEST_F(MmuTest, XnAndPxnGateOnlyFetchesOfTheirOwnEl) {
   ASSERT_EQ(xlat(kRam, false, true, &pa, &f), OEMU_ERR_FAULT);
   EXPECT_EQ(f.esr, EcBase(OEMU_EXC_EC_IABORT_LOWER) | kIlBit | Perm(1));
   l1_block(kL1, kRam, kRam, kPxn);
+  tlbi(); /* the rewritten leaf must not serve from the cache */
   el1();
   ASSERT_EQ(xlat(kRam, false, true, &pa, &f), OEMU_ERR_FAULT);
   EXPECT_EQ(f.esr, EcBase(OEMU_EXC_EC_IABORT_SAME) | kIlBit | Perm(1));
@@ -378,6 +387,7 @@ TEST_F(MmuTest, TableConstraintsBindEverythingBelowThem) {
   EXPECT_EQ(f.esr, EcBase(OEMU_EXC_EC_DABORT_LOWER) | kIlBit | Perm(3)); /* APT0 */
   el1();
   l1_table(kL1, va, kL2, kTPxn | kTApt1); /* EL1 read-only, no EL1 exec for the subtree */
+  tlbi(); /* changed table constraints must not serve from the cached leaf */
   ASSERT_EQ(xlat(va, true, false, &pa, &f), OEMU_ERR_FAULT);
   EXPECT_EQ(f.esr, EcBase(OEMU_EXC_EC_DABORT_SAME) | kIlBit | kWnr | Perm(3)); /* APT1 */
   ASSERT_EQ(xlat(va, false, true, &pa, &f), OEMU_ERR_FAULT);
@@ -511,6 +521,117 @@ TEST_F(MmuTest, ValidateChecksEveryPageOfTheRange) {
    * third (L3 idx 2) is not mapped. */
   ASSERT_EQ(view_.validate(view_.ctx, kRam + 0xF80U, 0x80U, OEMU_PERM_WRITE), OEMU_OK);
   ASSERT_EQ(view_.validate(view_.ctx, kRam + 0x1FF8U, 16U, OEMU_PERM_WRITE), OEMU_ERR_FAULT);
+}
+
+/* --- the cache epoch (M3b) ------------------------------------------------------ */
+
+TEST_F(MmuTest, ControlWritesFlushWithoutAnyTlbi) {
+  /* The epoch is the five registers whose values invalidate every entry.
+   * Each member gets its one-value-change here, and the translation that
+   * follows must see the NEW leaf without the test ever calling tlbi(). */
+  l1_block(kL1, kRam, kRam, 0U);
+  uint64_t pa = 0U;
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK); /* arms the epoch */
+  const uint64_t flushes0 = mmu_.tlb_flushes;
+
+  /* A same-value rewrite of all five is a context-switch idiom and must
+   * not flush: the epoch compares values, not write events. */
+  const uint64_t v_sctlr = sr_.sctlr_el1;
+  const uint64_t v_tcr = sr_.tcr_el1;
+  const uint64_t v_ttbr0 = sr_.ttbr0_el1;
+  const uint64_t v_ttbr1 = sr_.ttbr1_el1;
+  const uint64_t v_mair = sr_.mair_el1;
+  sr_.sctlr_el1 = v_sctlr;
+  sr_.tcr_el1 = v_tcr;
+  sr_.ttbr0_el1 = v_ttbr0;
+  sr_.ttbr1_el1 = v_ttbr1;
+  sr_.mair_el1 = v_mair;
+  l1_block(kL1, kRam, UINT64_C(0x80000000), 0U); /* 1 GiB-aligned: the level-1
+                                                  * block field's granularity */
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, kRam) << "the same-value rewrites must not have invalidated anything";
+  EXPECT_EQ(mmu_.tlb_flushes, flushes0);
+
+  /* SCTLR_EL1: a control bit flip (EE) drops the old mapping. */
+  sr_.sctlr_el1 |= UINT64_C(1) << 25;
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, UINT64_C(0x80000000));
+  EXPECT_EQ(mmu_.tlb_flushes, flushes0 + 1U);
+
+  /* TCR_EL1: enabling TBI0 -- translation of this untagged VA is
+   * unaffected, the epoch is not. */
+  l1_block(kL1, kRam, UINT64_C(0xC0000000), 0U);
+  sr_.tcr_el1 |= UINT64_C(1) << 24;
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, UINT64_C(0xC0000000));
+  EXPECT_EQ(mmu_.tlb_flushes, flushes0 + 2U);
+
+  /* TTBR0_EL1: the ASID field moves; the base table (and the walk) do
+   * not. A real kernel would now be switching address spaces. */
+  l1_block(kL1, kRam, UINT64_C(0x100000000), 0U);
+  sr_.ttbr0_el1 |= UINT64_C(1) << 48;
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, UINT64_C(0x100000000));
+  EXPECT_EQ(mmu_.tlb_flushes, flushes0 + 3U);
+
+  /* TTBR1_EL1: same trick, upper region's epoch member. */
+  l1_block(kL1, kRam, UINT64_C(0x140000000), 0U);
+  sr_.ttbr1_el1 |= UINT64_C(1) << 48;
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, UINT64_C(0x140000000));
+  EXPECT_EQ(mmu_.tlb_flushes, flushes0 + 4U);
+
+  /* MAIR_EL1: inert for this walk today, an epoch member anyway --
+   * whenever attribute decoding lands, the cache must already be
+   * invalidating for it. */
+  l1_block(kL1, kRam, UINT64_C(0x180000000), 0U);
+  sr_.mair_el1 = UINT64_C(0xFFFFFFFFFF);
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, UINT64_C(0x180000000));
+  EXPECT_EQ(mmu_.tlb_flushes, flushes0 + 5U);
+}
+
+TEST_F(MmuTest, TlbiRevealsTheNewLeafInBothRegions) {
+  /* The black-box three-step: map, re-point, invalidate -- per region.
+   * The stale service between steps 1 and 2 is asserted, not excused:
+   * skipping the invalidation is the guest's bug, and the cache
+   * reproducing that bug faithfully is the point. */
+  l1_table(kL1, kRam, kL2, 0U);
+  l2_table(kRam, kL3);
+  l3_page(kRam, kRam, 0U);
+  uint64_t pa = 0U;
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+  l3_page(kRam, kRam + 0x200000ULL, 0U);
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, kRam); /* stale, until the invalidation */
+  tlbi();
+  ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, kRam + 0x200000ULL);
+
+  const uint64_t base = ~((UINT64_C(1) << 39U) - 1U); /* the upper region's first VA */
+  l1_block(kL1b, base + 0x1234ULL, UINT64_C(0x80000000), 0U);
+  ASSERT_EQ(xlat(base + 0x1234ULL, false, false, &pa, nullptr), OEMU_OK);
+  l1_block(kL1b, base + 0x1234ULL, UINT64_C(0xC0000000), 0U);
+  ASSERT_EQ(xlat(base + 0x1234ULL, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, UINT64_C(0x80001234)); /* stale in the upper region too */
+  tlbi();
+  ASSERT_EQ(xlat(base + 0x1234ULL, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, UINT64_C(0xC0001234));
+}
+
+TEST_F(MmuTest, MmuOffNeverTouchesTheCache) {
+  /* Identity is not a translation and must not consume or disturb the
+   * cache: bypass first, before any lookup, before any counters. */
+  sr_.sctlr_el1 = 0U;
+  l1_block(kL1, kRam, kRam, 0U);
+  uint64_t pa = 0U;
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_EQ(xlat(kRam, false, false, &pa, nullptr), OEMU_OK);
+    EXPECT_EQ(pa, kRam);
+  }
+  EXPECT_EQ(mmu_.tlb_hits, 0U);
+  EXPECT_EQ(mmu_.tlb_misses, 0U);
+  EXPECT_EQ(mmu_.tlb_flushes, 0U);
 }
 
 }  // namespace

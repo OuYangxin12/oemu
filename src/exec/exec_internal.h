@@ -109,15 +109,17 @@ OEMU_NODISCARD oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu,
  * --- system mode (M2c) -------------------------------------------------------
  *
  * What to do with a decoded SYS/SYSL encoding, keyed by its 14-bit selector.
- * oemu has no caches and (until M3) no TLB, so invalidation and clean are
- * architectural no-ops, while anything that would write an observable result
- * -- AT publishing into PAR_EL1, DC ZVA zeroing memory -- is either
- * implemented or honestly refused.
+ * oemu has no caches, so invalidation and clean are architectural no-ops;
+ * the TLB exists since M3b, so the TLBI space requests a real invalidation
+ * (oemu's one answer to any of them is the whole cache). Anything that
+ * would write an observable result -- AT publishing into PAR_EL1, DC ZVA
+ * zeroing memory -- is either implemented or honestly refused.
  */
 typedef enum oemu_exec_sys_action {
-  OEMU_EXEC_SYS_TRAP = 0,  /* Undefined, with the encoding as ISS */
-  OEMU_EXEC_SYS_NOP = 1,   /* execute as a no-op, advance the PC */
-  OEMU_EXEC_SYS_DC_ZVA = 2 /* zero one cache line at [Rt] */
+  OEMU_EXEC_SYS_TRAP = 0,   /* Undefined, with the encoding as ISS */
+  OEMU_EXEC_SYS_NOP = 1,    /* execute as a no-op, advance the PC */
+  OEMU_EXEC_SYS_DC_ZVA = 2, /* zero one cache line at [Rt] */
+  OEMU_EXEC_SYS_TLBI = 3    /* invalidation request: flush the whole TLB */
 } oemu_exec_sys_action;
 
 /* The policy decision for one SYS selector; exhaustively testable. */

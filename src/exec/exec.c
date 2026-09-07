@@ -647,13 +647,17 @@ oemu_exec_sys_action oemu_exec_internal_sys_action(uint32_t sel) {
   if (sel == SYS_DC_ZVA) {
     return OEMU_EXEC_SYS_DC_ZVA;
   }
-  /* TLBI, all privilege banks (op1 in {0,1,2,4,6}, CRn 8/9): pure
-   * invalidation, and oemu has no TLB yet (M3b), so a no-op is the
-   * architecturally correct answer. Unallocated holes in the space execute
-   * as no-ops too -- harmless while the space decodes as one class. */
+  /* TLBI, all privilege banks (op1 in {0,1,2,4}, CRn 8/9): since M3b
+   * there is a TLB, and an invalidation request must invalidate. oemu
+   * answers every TLBI -- by-VA, by-ASID, and the CRn 9 stage-2 space,
+   * whose evictions a stage-1 flush-all satisfies -- with the whole
+   * cache: precise invalidation is a deliberate later step, and
+   * flush-all is the honest superset until then. Unallocated holes in
+   * the space execute as no-ops too -- harmless while the space decodes
+   * as one class. */
   if (((crn == 8U) || (crn == 9U)) &&
       ((op1 == 0U) || (op1 == 1U) || (op1 == 2U) || (op1 == 4U))) {
-    return OEMU_EXEC_SYS_NOP;
+    return OEMU_EXEC_SYS_TLBI;
   }
   /* AT (op1 in {0,4}, CRn 7, CRm 8/9: the full S1E* table of Linux
    * asm/sysreg.h): a translation request needs the MMU (M3), and executing it
@@ -744,6 +748,15 @@ static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *me
     case OEMU_EXEC_SYS_TRAP:
       oemu_exc_undefined(&cpu->regs, sr, word);
       return OEMU_ERR_FAULT;
+    case OEMU_EXEC_SYS_TLBI:
+      /* The request is real and the answer is the whole cache. The mmu is
+       * NULL exactly when the bus is the physical one -- a machine with
+       * no translation layer has no translations to invalidate, so the
+       * request is satisfied by having nothing to do. */
+      if (mmu != NULL) {
+        oemu_mmu_flush_all(mmu);
+      }
+      return OEMU_OK;
     case OEMU_EXEC_SYS_DC_ZVA:
       break;
   }
