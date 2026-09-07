@@ -1,8 +1,8 @@
 # 任务卡：M2c 收尾 — `oemu boot` CLI + guest 冒烟
 
-> 状态：已实现并本地全量验证（735/735 双绿 + tidy 通过 + PR 文件 format
-> 干净，数字见完工记录）；guest 真身验证待工具链/CI（见遗留）。依据：
-> `docs/verification-strategy.md`
+> 状态：**已实现并端到端验证完毕**——735/735 双绿零跳过、tidy 通过、PR
+> 文件 format 干净、guest 真身在 oemu 与 QEMU oracle 双机实测（见完工
+> 记录）。依据：`docs/verification-strategy.md`
 > §M2c 收尾、`docs/roadmap-full-system.md` M2c "Accepts" 节、
 > `docs/roadmap-linux-boot.md` §5（M2c 进行中 → 本卡收尾）。本卡同时是
 > `docs/task-cards/` 里 M2c 缺失的那张卡。
@@ -121,19 +121,30 @@ make coverage-summary                            # main.c 较 84% 基线只升�
 
 ## 完工记录（P6：只写实际跑过的）
 
-- 实际运行的配置与结果（真实数字，2026-07-02 本机）：
+- 实际运行的配置与结果（真实数字，2026-09-07 本机）：
   - `make test`：**735/735，100% 通过**（M2c 前为 721；新增 `CliBootTest`
     boot 契约 13 例 + `BootSmoke` 1 例）。
   - `make asan`：**735/735，100% 通过**（同一套件过 ASan+UBSan）。
   - `ctest -R Cli`：22/22（本卡新增 13 例全在其中，含 stdout 管道捕获的
     UART 字节级断言）。
-  - `ctest -L guest`：1 例干净 SKIP（无 clang+ld.lld，SKIP 消息给出重建
-      命令——设计内结局，非失败）。
+  - `ctest -L guest`：初跑 1 例干净 SKIP（当时无工具链，SKIP 消息给出重建
+      命令）；装齐后真跑 Passed——见下"guest 真身实测"。
   - `make coverage-summary`：`main.c` **85%**（210/246，基线 84% 之上）；
     全库 TOTAL 95%。**豁免**：未覆盖 36 行为跨进程 CLI 无法注入
     allocator 的 init/OOM 失败分支（与既有 `run` 同类结构性豁免）及
     RESET 分支（PSCI 前无触发路径，M4b 随 `test_psci` 覆盖）。
   - `make tidy`：**通过（exit 0，零 error）**。
+  - **guest 真身实测**（本机装齐 clang 21.1.8 + lld + qemu 10.2.1 后）：
+    - `scripts/build-guest.sh tests/guest/el1_smoke.S` 组装成功（4335 B）；
+    - `oemu boot -kernel build/guest/el1_smoke.bin` → stdout `EL1`、
+      `BOOT-OK`，exit 0；
+    - `scripts/qemu-oracle.sh build/guest/el1_smoke.bin EL1 BOOT-OK` →
+      `PASS (markers: EL1 BOOT-OK; exit: timeout)`——park 后超时回收属
+      设计内结局（与 mmu_smoke 先例一致）；
+    - `ctest -L guest`：**1/1 真跑 Passed**（0.15 s，不再 SKIP）；
+    - 附带复验：`psci_off` 在 QEMU 10.2.1 上 `PASS (markers: PSCI-OK;
+      exit: 0)`（M4b 资产在本机新 QEMU 上依旧立）。
+    - 上述全部重跑于 `make test` / `make asan`：**735/735 100%，零跳过**。
   - `make format-check`：本 PR 全部文件经 `make format` 规范化后**干净**
     （commit `style: clang-format the M2c additions`）。唯一残留违规在
     `bench/corpus/k_addsub.c`——本卡未触碰该文件，且 master 同树在 CI
@@ -144,8 +155,7 @@ make coverage-summary                            # main.c 较 84% 基线只升�
      21，对 `bench/corpus` 与个别对齐规则给出不同判定；跟进方向是 CI
      显式钉版本（如 `clang-format-18`）或统一 runner 基线，属 CI 工作面
      （`oemu-ci-workflow`），不在本卡范围。
-  2. el1_smoke 真身 + QEMU oracle 预验证：本机只装了 clang-format/
-     clang-tidy，无全量 clang + lld + qemu；CI `guest` job 按 M4b 既定
-     计划落地时一并跑。
+  2. ~~el1_smoke 真身 + QEMU oracle 预验证~~ **已完成**（2026-09-07 本机
+     装齐 clang 21.1.8/lld/qemu 10.2.1 后双机实测，见完工记录）。
   3. `docs/linux-minimal-qemu.md` 基线的喂入时序到 M5 才需要；
   4. CI `guest` job（装 `gcc-aarch64-linux-gnu` 或 clang+lld）另行落地。
