@@ -1,7 +1,8 @@
 # 任务卡：M2c 收尾 — `oemu boot` CLI + guest 冒烟
 
-> 状态：已实现并本地全量验证（735/735 双绿，数字见完工记录）；guest 真身
-> 验证与 lint 两关待工具链（见遗留）。依据：`docs/verification-strategy.md`
+> 状态：已实现并本地全量验证（735/735 双绿 + tidy 通过 + PR 文件 format
+> 干净，数字见完工记录）；guest 真身验证待工具链/CI（见遗留）。依据：
+> `docs/verification-strategy.md`
 > §M2c 收尾、`docs/roadmap-full-system.md` M2c "Accepts" 节、
 > `docs/roadmap-linux-boot.md` §5（M2c 进行中 → 本卡收尾）。本卡同时是
 > `docs/task-cards/` 里 M2c 缺失的那张卡。
@@ -99,8 +100,8 @@ make coverage-summary                            # main.c 较 84% 基线只升�
 - [x] 精确异常：el1_smoke 的 SVC→ERET 往返即 guest 级回归（`test_cli` 的
       boot 用例本地以真指令验证了陷入/返回/退出链）
 - [x] 一切分配经 `oemu_allocator` seam（RAM 大块亦经 machine→aspace→seam）
-- [x] `make test` / `make asan` 全绿；`make format-check` / `make tidy`
-      **待工具链**（本机无 clang-format/clang-tidy，见遗留——不虚报）
+- [x] `make test` / `make asan` / `make tidy` 全绿；`make format-check`
+      对本卡文件干净（残留违规仅 `bench/corpus`，版本漂移产物，见完工记录）
 - [x] 新代码行覆盖：`main.c` 85%（210/246）≥ 84% 基线，只升不降；豁免见完工记录
 - [x] 失败不留痕迹：boot 参数错误在任何状态提交前返回；DECODE/UNSUPPORTED
       文案二分不受影响（P5）
@@ -124,20 +125,27 @@ make coverage-summary                            # main.c 较 84% 基线只升�
   - `make test`：**735/735，100% 通过**（M2c 前为 721；新增 `CliBootTest`
     boot 契约 13 例 + `BootSmoke` 1 例）。
   - `make asan`：**735/735，100% 通过**（同一套件过 ASan+UBSan）。
-  - `ctest -R Cli`：20/20（本卡新增全在其中，含 stdout 管道捕获的 UART
-    字节级断言）。
+  - `ctest -R Cli`：22/22（本卡新增 13 例全在其中，含 stdout 管道捕获的
+    UART 字节级断言）。
   - `ctest -L guest`：1 例干净 SKIP（无 clang+ld.lld，SKIP 消息给出重建
       命令——设计内结局，非失败）。
   - `make coverage-summary`：`main.c` **85%**（210/246，基线 84% 之上）；
     全库 TOTAL 95%。**豁免**：未覆盖 36 行为跨进程 CLI 无法注入
     allocator 的 init/OOM 失败分支（与既有 `run` 同类结构性豁免）及
     RESET 分支（PSCI 前无触发路径，M4b 随 `test_psci` 覆盖）。
-  - `make format-check` / `make tidy`：**未运行**——本机无 clang-format/
-    clang-tidy，装后补跑并在 PR 记录真实输出（不虚报）。
+  - `make tidy`：**通过（exit 0，零 error）**。
+  - `make format-check`：本 PR 全部文件经 `make format` 规范化后**干净**
+    （commit `style: clang-format the M2c additions`）。唯一残留违规在
+    `bench/corpus/k_addsub.c`——本卡未触碰该文件，且 master 同树在 CI
+    （ubuntu-24.04，clang-format 18）历史上 lint 全绿，本机为 Ubuntu
+    25.10 / clang-format 21：**版本漂移产物，非本卡引入**。
 - 遗留问题 / 跟进项：
-  1. lint 两关（`apt install clang-format clang-tidy` 后 `make
-     format-check && make tidy`）。
-  2. el1_smoke 真身 + QEMU oracle 预验证（需 `clang lld qemu-system-arm`，
-     CI 的 `guest` job 按 M4b 既定计划落地时一并跑）。
+  1. **lint 版本漂移**：CI 钉 ubuntu-24.04（LLVM 18），本地滚动到 LLVM
+     21，对 `bench/corpus` 与个别对齐规则给出不同判定；跟进方向是 CI
+     显式钉版本（如 `clang-format-18`）或统一 runner 基线，属 CI 工作面
+     （`oemu-ci-workflow`），不在本卡范围。
+  2. el1_smoke 真身 + QEMU oracle 预验证：本机只装了 clang-format/
+     clang-tidy，无全量 clang + lld + qemu；CI `guest` job 按 M4b 既定
+     计划落地时一并跑。
   3. `docs/linux-minimal-qemu.md` 基线的喂入时序到 M5 才需要；
   4. CI `guest` job（装 `gcc-aarch64-linux-gnu` 或 clang+lld）另行落地。
