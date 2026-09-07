@@ -29,6 +29,7 @@
 
 #include "support/elf_builder.h"
 
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -223,6 +224,11 @@ TEST_F(CliTest, InvalidMaxInsnsIsUsage) {
 namespace boot_words {
 constexpr uint32_t kMovkX1Uart = 0xF2A12001U;  // movk x1, #0x900, lsl #16
 constexpr uint32_t kStrX0X1 = 0xF9000020U;     // str  x0, [x1]  (device gets low byte)
+// str x0, [x1, #8]: STR immediate (ARM ARM C6.2.391: size=11 opc=01 fixed
+// 0xF9000000, scaled imm14 = 8/8 = 1 at bit 10, Rn=1, Rt=0).
+constexpr uint32_t kStrX0X1Off8 = 0xF9001020U;
+// ldr x0, [x1]: same family, opc=01 (ARM ARM C6.2.219) -- Rt=0, Rn=1.
+constexpr uint32_t kLdrX0X1 = 0xF9400020U;
 constexpr uint32_t kBrk0 = 0xD4200000U;        // brk  #0
 constexpr uint32_t kWfi = 0xD503207FU;         // wfi
 constexpr uint32_t kBSpin = 0x14000000U;       // b    .
@@ -247,6 +253,43 @@ std::vector<uint8_t> raw_image(const std::vector<uint32_t> &words) {
 
 // x1 = 0x09000000: the stopgap UART base, built with mov x1,#0 + movk.
 const std::vector<uint32_t> kUartAddress = {0xD2800001U, boot_words::kMovkX1Uart};
+
+// A sparse file of exactly `size` bytes: ftruncate leaves holes that read
+// back as zeros, so testing the 256 MiB load ceiling costs no disk and no
+// memory until oemu itself streams the file.
+class TempSparse {
+ public:
+  explicit TempSparse(const uint64_t size) {
+    char tmpl[] = "/tmp/oemu-cli-XXXXXX";
+    const int fd = mkstemp(tmpl);
+    if (fd == -1) {
+      return;
+    }
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+      close(fd);
+      return;
+    }
+    close(fd);
+    path_ = tmpl;
+  }
+  ~TempSparse() {
+    if (!path_.empty()) {
+      std::remove(path_.c_str());
+    }
+  }
+  TempSparse(const TempSparse &) = delete;
+  TempSparse &operator=(const TempSparse &) = delete;
+  bool ok() const { return !path_.empty(); }
+  const std::string &path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
+// The load ceiling from src/main.c's documented layout: RAM 0x40000000 +
+// 256 MiB, image base 0x40080000. Contract, cited to the usage the CLI
+// prints and the task card pins.
+constexpr uint64_t kBootLoadCeiling = 0x10000000ULL - 0x80000ULL;
 
 class CliBootTest : public CliTest {
  protected:
@@ -317,15 +360,32 @@ TEST_F(CliBootTest, BootSentinelImagePowersOffCleanly) {
 
 TEST_F(CliBootTest, BootUartForwardsBytesExactly) {
   // 'o' 'k' then EOT: the UART stream must arrive byte-for-byte, in order.
+  // The write at offset 8 sits between them and must leave no trace -- the
+  // documented stopgap behaviour is "other writes are ignored".
   const std::vector<uint8_t> image =
       raw_image({boot_words::movz(0U, 0x6FU), kUartAddress[0], kUartAddress[1],
                  boot_words::kStrX0X1, boot_words::movz(0U, 0x6BU), boot_words::kStrX0X1,
+                 boot_words::kStrX0X1Off8,  // str x0, [x1, #8]: outside DR
                  boot_words::movz(0U, 0x4U), boot_words::kStrX0X1});
   const TempImage file(image);
   ASSERT_TRUE(file.ok());
   const Captured r = capture_cli({"boot", "-kernel", file.path()});
   EXPECT_TRUE(r.exited);
   EXPECT_EQ(r.out, "ok");
+  EXPECT_EQ(r.code, 0);
+}
+
+TEST_F(CliBootTest, BootUartRegistersReadAsZero) {
+  // Reading DR must not trap and must not stop the guest: load through the
+  // UART address, then exit normally. The stopgap contract is "every register
+  // reads 0"; M4a's PL011 will refine FR, guests must not care.
+  const std::vector<uint8_t> image =
+      raw_image({kUartAddress[0], kUartAddress[1], boot_words::kLdrX0X1,
+                 boot_words::movz(0U, 0x4U), boot_words::kStrX0X1});
+  const TempImage file(image);
+  ASSERT_TRUE(file.ok());
+  const Captured r = capture_cli({"boot", "-kernel", file.path()});
+  EXPECT_TRUE(r.exited);
   EXPECT_EQ(r.code, 0);
 }
 
@@ -400,6 +460,19 @@ TEST_F(CliBootTest, BootEntryOutsideRamIsErrorNotUsage) {
   const TempImage file(raw_image({boot_words::kBSpin}));
   ASSERT_TRUE(file.ok());
   EXPECT_EQ(capture_cli({"boot", "-kernel", file.path(), "--entry", "0x10"}).code, 1);
+}
+
+TEST_F(CliBootTest, BootImagePastTheLoadCeilingIsRefused) {
+  // One byte past the documented ceiling: rejection must come from the size
+  // contract, not from an access fault -- so the machine must be untouched
+  // (exit 1, no timeout, no output) and the check must happen before any
+  // instruction runs, which the sparse file makes cheap.
+  const TempSparse file(kBootLoadCeiling + 1ULL);
+  ASSERT_TRUE(file.ok());
+  const Captured r = capture_cli({"boot", "-kernel", file.path(), "--max-insns", "16"});
+  EXPECT_TRUE(r.exited);
+  EXPECT_EQ(r.code, 1);
+  EXPECT_TRUE(r.out.empty());
 }
 
 }  // namespace
