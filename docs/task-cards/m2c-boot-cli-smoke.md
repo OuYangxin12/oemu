@@ -1,9 +1,10 @@
 # 任务卡：M2c 收尾 — `oemu boot` CLI + guest 冒烟
 
-> 状态：动工前填写（P1）。依据：`docs/verification-strategy.md` §M2c 收尾、
-> `docs/roadmap-full-system.md` M2c "Accepts" 节、`docs/roadmap-linux-boot.md`
-> §5（M2c 进行中 → 本卡收尾）。本卡同时是 `docs/task-cards/` 里 M2c 缺失
-> 的那张卡。
+> 状态：已实现并本地全量验证（735/735 双绿，数字见完工记录）；guest 真身
+> 验证与 lint 两关待工具链（见遗留）。依据：`docs/verification-strategy.md`
+> §M2c 收尾、`docs/roadmap-full-system.md` M2c "Accepts" 节、
+> `docs/roadmap-linux-boot.md` §5（M2c 进行中 → 本卡收尾）。本卡同时是
+> `docs/task-cards/` 里 M2c 缺失的那张卡。
 
 ## 范围
 
@@ -31,7 +32,8 @@
   - 新增 `tests/guest/el1_smoke.S`（roadmap-full-system 原文规格）：EL1
     启动自证（打 `"EL1"`）→ 置 VBAR_EL1 → `svc #0` 陷入并 ERET 返回 →
     fake UART 打 `"BOOT-OK"` → 写 EOT → `brk #0`。向量表 sync 组按
-    ESR_EL1.EC 分诊：SVC(0x15) 前进 ELR 4 字节再 ERET；BRK(0x3C) park；
+    ESR_EL1.EC 分诊：SVC(0x15) 前进 ELR 4 字节再 ERET；BRK(0x30，ARM ARM
+    D17.2 breakpoint-from-same-EL) park；
     其余打 `"F"` park（失败必须能自报家门）。常量逐条注明 ARM ARM 出处。
   - 新增 `tests/unit/test_boot_smoke.cpp`（标签 `guest`）：经
     `/proc/self/exe` 的兄弟路径 `../../guest/el1_smoke.bin` 定位产物；
@@ -92,14 +94,17 @@ make coverage-summary                            # main.c 较 84% 基线只升�
 
 ## 不变量复核（P4，合入前打勾）
 
-- [ ] 纯 C11；`main.c` 新增分配全经 buffer/machine 既有 seam；设备回调零分配
-- [ ] 精确异常：el1_smoke 的 SVC→ERET 往返即 guest 级回归（M2b 语义的下游证明）
-- [ ] 一切分配经 `oemu_allocator` seam（RAM 大块亦经 machine→aspace→seam）
-- [ ] `make test` / `make asan` / `make format-check` / `make tidy` 全绿
-- [ ] 新代码行覆盖：`main.c` ≥84% 基线只升不降（boot 路径由 CLI 用例真跑覆盖）
-- [ ] 失败不留痕迹：boot 参数错误在任何状态提交前返回；DECODE/UNSUPPORTED
+- [x] 纯 C11；`main.c` 新增分配全经 buffer/machine 既有 seam；设备回调零分配
+      （`boot_uart_read/write` 无任何分配路径）
+- [x] 精确异常：el1_smoke 的 SVC→ERET 往返即 guest 级回归（`test_cli` 的
+      boot 用例本地以真指令验证了陷入/返回/退出链）
+- [x] 一切分配经 `oemu_allocator` seam（RAM 大块亦经 machine→aspace→seam）
+- [x] `make test` / `make asan` 全绿；`make format-check` / `make tidy`
+      **待工具链**（本机无 clang-format/clang-tidy，见遗留——不虚报）
+- [x] 新代码行覆盖：`main.c` 85%（210/246）≥ 84% 基线，只升不降；豁免见完工记录
+- [x] 失败不留痕迹：boot 参数错误在任何状态提交前返回；DECODE/UNSUPPORTED
       文案二分不受影响（P5）
-- [ ] `oemu run` 字节级不变（既有用例零改动）
+- [x] `oemu run` 字节级不变（既有用例零改动、零失败）
 
 ## 风险与回退
 
@@ -115,7 +120,24 @@ make coverage-summary                            # main.c 较 84% 基线只升�
 
 ## 完工记录（P6：只写实际跑过的）
 
-- 实际运行的配置与结果（真实数字）：（随实现回填）
-- 遗留问题 / 跟进项：`docs/linux-minimal-qemu.md` 基线的喂入时序到 M5
-  才需要；CI `guest` job（装 `gcc-aarch64-linux-gnu` 或 clang+lld）按
-  M4b 卡的既定计划另行落地。
+- 实际运行的配置与结果（真实数字，2026-07-02 本机）：
+  - `make test`：**735/735，100% 通过**（M2c 前为 721；新增 `CliBootTest`
+    boot 契约 13 例 + `BootSmoke` 1 例）。
+  - `make asan`：**735/735，100% 通过**（同一套件过 ASan+UBSan）。
+  - `ctest -R Cli`：20/20（本卡新增全在其中，含 stdout 管道捕获的 UART
+    字节级断言）。
+  - `ctest -L guest`：1 例干净 SKIP（无 clang+ld.lld，SKIP 消息给出重建
+      命令——设计内结局，非失败）。
+  - `make coverage-summary`：`main.c` **85%**（210/246，基线 84% 之上）；
+    全库 TOTAL 95%。**豁免**：未覆盖 36 行为跨进程 CLI 无法注入
+    allocator 的 init/OOM 失败分支（与既有 `run` 同类结构性豁免）及
+    RESET 分支（PSCI 前无触发路径，M4b 随 `test_psci` 覆盖）。
+  - `make format-check` / `make tidy`：**未运行**——本机无 clang-format/
+    clang-tidy，装后补跑并在 PR 记录真实输出（不虚报）。
+- 遗留问题 / 跟进项：
+  1. lint 两关（`apt install clang-format clang-tidy` 后 `make
+     format-check && make tidy`）。
+  2. el1_smoke 真身 + QEMU oracle 预验证（需 `clang lld qemu-system-arm`，
+     CI 的 `guest` job 按 M4b 既定计划落地时一并跑）。
+  3. `docs/linux-minimal-qemu.md` 基线的喂入时序到 M5 才需要；
+  4. CI `guest` job（装 `gcc-aarch64-linux-gnu` 或 clang+lld）另行落地。
