@@ -17,12 +17,19 @@ add_library(oemu
   exc/exc.c
   mmu/mmu.c
   exec/exec.c
+  fdt/fdt.c
+  kernel/image.c
+  dev/pl011.c
+  fw/psci.c
   vcpu/vcpu.c
   elf/elf.c
 )
 
 # Internal headers, listed so IDEs pick them up.
 target_sources(oemu PRIVATE
+  fdt/fdt_internal.h
+  kernel/image_internal.h
+  dev/pl011_internal.h
   buffer/buffer_internal.h
   regs/regs_internal.h
   decode/decode_internal.h
@@ -66,6 +73,10 @@ target_include_directories(oemu
     ${CMAKE_CURRENT_SOURCE_DIR}/exc
     # Likewise for mmu.c and "mmu_internal.h".
     ${CMAKE_CURRENT_SOURCE_DIR}/mmu
+    ${CMAKE_CURRENT_SOURCE_DIR}/fdt
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernel
+    ${CMAKE_CURRENT_SOURCE_DIR}/dev
+    ${CMAKE_CURRENT_SOURCE_DIR}/fw
     # Likewise for vcpu.c and "vcpu_internal.h".
     ${CMAKE_CURRENT_SOURCE_DIR}/vcpu
 )

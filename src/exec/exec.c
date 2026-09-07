@@ -804,7 +804,8 @@ static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *me
  */
 oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
                                                const oemu_memops *mem, const oemu_insn *in,
-                                               uint32_t word, oemu_mmu *mmu) {
+                                               uint32_t word, oemu_mmu *mmu,
+                                               const oemu_env_ops *env) {
   if ((cpu == NULL) || (sr == NULL) || (in == NULL) || (in->op == OEMU_OP_UNKNOWN)) {
     return OEMU_ERR_INVALID_ARG;
   }
@@ -828,12 +829,25 @@ oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
     oemu_exc_breakpoint(&cpu->regs, sr);
     return OEMU_OK;
   }
-  if (in->op == OEMU_OP_HVC) {
-    oemu_exc_hvc(&cpu->regs, sr, (uint16_t)in->imm);
-    return OEMU_OK;
-  }
-  if (in->op == OEMU_OP_SMC) {
-    oemu_exc_smc(&cpu->regs, sr, (uint16_t)in->imm);
+  if (in->op == OEMU_OP_HVC || in->op == OEMU_OP_SMC) {
+    /* A firmware conduit first: an environment that answers PSCI (the
+     * boot path) consumes the call and answers in x0; without one these
+     * instructions stay the exceptions the architecture describes. */
+    uint64_t ret0 = 0U;
+    const uint64_t args[3] = {oemu_regs_read(&cpu->regs, 0, OEMU_REG_W64),
+                              oemu_regs_read(&cpu->regs, 1, OEMU_REG_W64),
+                              oemu_regs_read(&cpu->regs, 2, OEMU_REG_W64)};
+    if ((env != NULL) && (env->fw_call != NULL) &&
+        env->fw_call(env->ctx, in->op == OEMU_OP_HVC, (uint16_t)in->imm, args, &ret0)) {
+      oemu_regs_write(&cpu->regs, 0, OEMU_REG_W64, ret0);
+      oemu_regs_set_pc(&cpu->regs, oemu_regs_pc(&cpu->regs) + OEMU_INSN_SIZE);
+      return OEMU_OK;
+    }
+    if (in->op == OEMU_OP_HVC) {
+      oemu_exc_hvc(&cpu->regs, sr, (uint16_t)in->imm);
+    } else {
+      oemu_exc_smc(&cpu->regs, sr, (uint16_t)in->imm);
+    }
     return OEMU_OK;
   }
   if (in->op == OEMU_OP_ERET) {

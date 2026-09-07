@@ -316,6 +316,14 @@ oemu_add_test(test_mmu
   LABELS unit
 )
 
+# M4a FDT builder: round-trip through the internal reader, lifecycle
+# refusals, and a dtc cross-check that skips when dtc is absent.
+oemu_add_test(test_fdt
+  SOURCES unit/test_fdt.cpp
+  INTERNAL
+  LABELS unit
+)
+
 # M3b parity: every served answer against the bypassed walk -- the cache
 # may only be faster. It needs the internal bypass and the peek, so it is
 # a whitebox target; the suite names carry "Tlb" for -R Tlb.

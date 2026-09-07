@@ -1,0 +1,86 @@
+/*
+ * boot.dts -- the device tree `oemu boot` installs for a booted kernel.
+ *
+ * This is the M4a DTB source of truth (task card D-M4a-5, route B): the
+ * blob shipped in tests/fixtures/boot.dtb is dtc's compiled answer to this
+ * file, and CI regenerates-and-compares when dtc is installed. The layout
+ * mirrors qemu-system-aarch64 -machine virt -- the guests we must boot
+ * have already chosen that side -- with three oemu-specific rewrites:
+ *
+ *   memory   : 1 GiB at 0x40000000 (oemu's default RAM window, -m to vary)
+ *   psci     : method = "smc"     (oemu has no EL3 firmware; the conduit
+ *                                  the executor actually intercepts)
+ *   chosen   : stdout-path to the single PL011 we model
+ *
+ * Nodes oemu does not emulate are absent rather than faked: no virtio, no
+ * platform-bus, one CPU, GICv2 with the distributor the machine owns.
+ */
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "linux,dummy-virt";
+	model = "oemu";
+	interrupt-parent = <&intc>;
+
+	chosen {
+		stdout-path = "/pl011@9000000";
+	};
+
+	aliases {
+		serial0 = "/pl011@9000000";
+	};
+
+	psci {
+		compatible = "arm,psci-1.0", "arm,psci-0.2", "arm,psci";
+		method = "smc";
+		cpu_on = <0xc4000003>;
+		cpu_off = <0x84000002>;
+		cpu_suspend = <0xc4000001>;
+		migrate = <0xc4000005>;
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x0 0x40000000>; /* 1 GiB */
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x0>;
+		};
+	};
+
+	intc: interrupt-controller@8000000 {
+		compatible = "arm,cortex-a15-gic";
+		reg = <0x0 0x8000000 0x0 0x10000>, <0x0 0x8010000 0x0 0x10000>;
+		#interrupt-cells = <3>;
+		interrupt-controller;
+	};
+
+	timer {
+		compatible = "arm,armv8-timer", "arm,armv7-timer";
+		interrupts = <1 13 0xf04>, <1 14 0xf04>, <1 11 0xf04>, <1 10 0xf04>;
+		always-on;
+	};
+
+	osc: oscillator {
+		compatible = "fixed-clock";
+		#clock-cells = <1>;
+		clock-frequency = <0x2dc6c00>; /* 48 MHz, the oracle's UART clock */
+	};
+
+	pl011: pl011@9000000 {
+		compatible = "arm,pl011", "arm,primecell";
+		reg = <0x0 0x9000000 0x0 0x1000>;
+		interrupts = <0 1 4>;
+		clocks = <&osc 0>, <&osc 0>;
+		clock-names = "uartclk", "apb_pclk";
+	};
+};

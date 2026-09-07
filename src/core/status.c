@@ -22,6 +22,14 @@ const char *oemu_status_str(oemu_status status) {
       return "instruction budget exhausted";
     case OEMU_ERR_BLOCKED:
       return "vcpu parked on wait-for-interrupt";
+    case OEMU_ERR_STATE:
+      return "call outside the object's lifecycle";
+    case OEMU_ERR_FORMAT:
+      return "data carries the format's shape but breaks its rules";
+    case OEMU_ERR_NOT_FOUND:
+      return "looked up, not present";
+    case OEMU_ERR_FULL:
+      return "bounded resource full";
     default:
       break;
   }

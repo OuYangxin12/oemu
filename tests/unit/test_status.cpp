@@ -25,6 +25,11 @@ TEST(StatusStr, ReturnsDescriptionForEveryKnownCode) {
   EXPECT_STREQ("instruction outside the emulated subset",
                oemu_status_str(OEMU_ERR_UNSUPPORTED));
   EXPECT_STREQ("vcpu parked on wait-for-interrupt", oemu_status_str(OEMU_ERR_BLOCKED));
+  EXPECT_STREQ("call outside the object's lifecycle", oemu_status_str(OEMU_ERR_STATE));
+  EXPECT_STREQ("data carries the format's shape but breaks its rules",
+               oemu_status_str(OEMU_ERR_FORMAT));
+  EXPECT_STREQ("looked up, not present", oemu_status_str(OEMU_ERR_NOT_FOUND));
+  EXPECT_STREQ("bounded resource full", oemu_status_str(OEMU_ERR_FULL));
 }
 
 TEST(StatusStr, DecodeAndUnsupportedAreDistinct) {
@@ -37,7 +42,9 @@ TEST(StatusStr, ReturnsFallbackForUnknownCode) {
   // Uses the value right after the last enumerator: it is unmapped, yet still
   // inside the enum's representable range, so the conversion is well defined.
   // A far-out value such as 9999 would be an unspecified conversion (-Wconversion).
-  const auto unmapped = static_cast<oemu_status>(static_cast<int>(OEMU_ERR_BLOCKED) + 1);
+  // OEMU_ERR_FULL is the last enumerator; when the enum grows this line
+  // follows it -- the invariant is "one past the last", not the number.
+  const auto unmapped = static_cast<oemu_status>(static_cast<int>(OEMU_ERR_FULL) + 1);
   EXPECT_STREQ("unknown status", oemu_status_str(unmapped));
 }
 
@@ -55,6 +62,7 @@ INSTANTIATE_TEST_SUITE_P(AllCodes, StatusStrContract,
                          ::testing::Values(OEMU_OK, OEMU_ERR_INVALID_ARG, OEMU_ERR_NO_MEMORY,
                                            OEMU_ERR_OVERFLOW, OEMU_ERR_RANGE, OEMU_ERR_DECODE,
                                            OEMU_ERR_UNSUPPORTED, OEMU_ERR_FAULT,
-                                           OEMU_ERR_TIMEOUT, OEMU_ERR_BLOCKED));
+                                           OEMU_ERR_TIMEOUT, OEMU_ERR_BLOCKED, OEMU_ERR_STATE,
+                                           OEMU_ERR_FORMAT, OEMU_ERR_NOT_FOUND, OEMU_ERR_FULL));
 
 }  // namespace

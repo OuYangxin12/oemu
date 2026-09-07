@@ -46,7 +46,30 @@ typedef enum oemu_status {
    * wake this one through an interrupt pin. System mode only -- the EL0
    * facade keeps executing WFI/WFE as hints.
    */
-  OEMU_ERR_BLOCKED = 9
+  OEMU_ERR_BLOCKED = 9,
+  /*
+   * A call arrived outside the object's legal lifecycle: emitting into a
+   * finished FDT, ending a node that never began. Distinct from
+   * INVALID_ARG -- the arguments are fine, the moment is not.
+   */
+  OEMU_ERR_STATE = 10,
+  /*
+   * Bytes claiming to be a format (an FDT blob, a kernel Image header)
+   * carry its magic but fail its invariants: bad totalsize, truncated
+   * structure block, a refused header flag.
+   */
+  OEMU_ERR_FORMAT = 11,
+  /*
+   * A lookup completed and the answer is "not there": an absent DTB
+   * property. Reported as a status, not a NULL, so tests can tell
+   * "missing" from "malformed".
+   */
+  OEMU_ERR_NOT_FOUND = 12,
+  /*
+   * A bounded resource is full: the UART RX ring. The caller owns the
+   * drop policy; the object itself stays intact.
+   */
+  OEMU_ERR_FULL = 13
 } oemu_status;
 
 /* Returns a stable, never-NULL description for any oemu_status value. */

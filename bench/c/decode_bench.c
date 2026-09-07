@@ -121,6 +121,10 @@ static uint64_t run_pass(const uint32_t *words, size_t word_count, bool tally) {
         case OEMU_ERR_FAULT:
         case OEMU_ERR_TIMEOUT:
         case OEMU_ERR_BLOCKED:
+        case OEMU_ERR_STATE:
+        case OEMU_ERR_FORMAT:
+        case OEMU_ERR_NOT_FOUND:
+        case OEMU_ERR_FULL:
         default:
           g_status_tally.other++;
           break;

@@ -65,6 +65,15 @@ typedef struct oemu_env_ops {
   int64_t (*syscall)(void *ctx, const oemu_memops *mem, uint64_t nr, const uint64_t args[6]);
   /* True once the guest has stopped (exit, powerdown, ...). */
   bool (*halted)(const void *ctx);
+  /*
+   * Firmware conduit: an environment that plays firmware (PSCI) sets
+   * this; HVC and SMC then reach it BEFORE exception delivery -- the
+   * answer QEMU's EL3 firmware gives that oemu, which has no EL3,
+   * returns directly. `is_hvc` names the conduit, `imm` the immediate,
+   * args x0..x2 as the call presented them; *ret0 receives the x0 the
+   * guest sees when the call was consumed (return true to consume).
+   */
+  bool (*fw_call)(void *ctx, bool is_hvc, uint16_t imm, const uint64_t args[3], uint64_t *ret0);
 } oemu_env_ops;
 
 OEMU_END_DECLS
