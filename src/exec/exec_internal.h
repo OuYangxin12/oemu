@@ -141,12 +141,14 @@ uint32_t oemu_exec_internal_reencode_sys(uint32_t sel, unsigned rt);
  * the view of `mmu` (see oemu/mmu.h): when a memory fault reaches this
  * dispatch, `mmu`'s pending record -- the walk's class, level and virtual
  * FAR -- is what the guest sees; without a mmu the bus's own refusal maps
- * to the translation fault with no level (DFSC 0x2C).
+ * to the translation fault with no level (DFSC 0x2C). `env` may be NULL or
+ * carry no fw_call; either way HVC/SMC keep their exception behaviour.
  */
 OEMU_NODISCARD oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
                                                               const oemu_memops *mem,
                                                               const oemu_insn *in,
-                                                              uint32_t word, oemu_mmu *mmu);
+                                                              uint32_t word, oemu_mmu *mmu,
+                                                              const oemu_env_ops *env);
 
 OEMU_END_DECLS
 

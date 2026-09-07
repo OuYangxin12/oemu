@@ -9,17 +9,18 @@
  * Prints "PSCI-OK" before the call and parks with a diagnostic print if the
  * call ever returns (it must not on a passing machine).
  *
- * The conduit is probed, not assumed -- the same rule the baseline kernel
- * followed ("PSCI v1.1, SMC conduit (probed from DT)", docs/linux-minimal-qemu.md):
- * the boot protocol hands the DTB's physical address in x0; if it looks like
- * an FDT (magic 0xd00dfeed, big-endian on the wire), the guest scans the blob
- * for the method value "hvc\0" and uses HVC, falling back to SMC otherwise --
- * which is oemu's D4 conduit. Measured on qemu-system-aarch64 8.2.2 with the
- * M5 baseline flags: x0 = 0x48000000, /psci method = hvc, and the PSCI model
- * answers NOT_SUPPORTED (-1) unless PSCI_VERSION negotiated first, so the
- * guest negotiates before SYSTEM_OFF exactly like Linux does. No shared
- * definitions with src/; magic and layout per the FDT specification and
- * Documentation/arch/arm64/booting.rst.
+ * The conduit is PROBED FROM THE DTB, honestly: the boot protocol hands the
+ * DTB physical address in x0; the guest walks the FDT token stream (node
+ * begin/end with inline padded names, properties decoded through the string
+ * block), reads /psci's `method`, and travels the conduit it names. A
+ * missing or malformed DTB, an absent /psci, or a non-"hvc" method falls
+ * back to SMC -- oemu's D4 conduit, and the machine default a confused
+ * guest should reach. Measured facts this guest encodes: the QEMU oracle
+ * hands x0 = ram_base + ram_size/2 = 0x48000000; -machine virt says method
+ * "hvc"; the PSCI model answers NOT_SUPPORTED until PSCI_VERSION has been
+ * asked, so the guest negotiates before SYSTEM_OFF (id 0x84000002) exactly
+ * like Linux does. No shared definitions with src/; magic and layout per the
+ * FDT specification and Documentation/arch/arm64/booting.rst.
  */
 	.text
 	.globl _start
@@ -27,14 +28,15 @@
 _start_of_image:
 	b	_start
 	.word	0
-	.quad	0x80000
-	.quad	_image_end - _start_of_image
+	.quad	0x1000                       /* text_offset: 4 KiB up, booting.rst-legal */
+	.quad	_image_end - _start
 	.quad	0x2                          /* LE, 4K pages */
 	.quad	0
 	.quad	0
 	.quad	0
 	.word	0x644d5241                   /* "ARM\x64" */
 	.word	0
+	.balign	0x1000                       /* the loader skips this hole */
 
 _start:
 	/* Reserve a stack below the image: the print helpers are non-leaf and
@@ -51,8 +53,7 @@ _start:
 	adr	x0, str_ok
 	bl	puts
 
-	/* Pick the conduit from the DTB's /psci method: "hvc" -> HVC,
-	 * anything else (or no DTB) -> SMC (oemu's D4 contract). */
+	/* Pick the conduit from the DTB's /psci method. */
 	mov	x0, x20
 	bl	probe_conduit
 	cbnz	x0, use_hvc
@@ -63,8 +64,8 @@ _start:
 	movz	x0, #0x0
 	movk	x0, #0x8400, lsl #16     /* 0x84000000 PSCI_VERSION */
 	smc	#0
-	movz	x0, #0x8
-	movk	x0, #0x8400, lsl #16     /* 0x84000008 SYSTEM_OFF */
+	movz	x0, #0x2
+	movk	x0, #0x8400, lsl #16     /* 0x84000002 SYSTEM_OFF (spec id) */
 	smc	#0
 	b	park
 use_hvc:
@@ -73,85 +74,170 @@ use_hvc:
 	movz	x0, #0x0
 	movk	x0, #0x8400, lsl #16     /* 0x84000000 PSCI_VERSION */
 	hvc	#0
-	movz	x0, #0x8
-	movk	x0, #0x8400, lsl #16     /* 0x84000008 SYSTEM_OFF */
+	movz	x0, #0x2
+	movk	x0, #0x8400, lsl #16     /* 0x84000002 SYSTEM_OFF (spec id) */
 	hvc	#0
-	/* Diagnose the return: a handled PSCI call returns x0 = 0
-	 * (QEMU_PSCI_RET_SUCCESS); an unhandled one leaves x0 untouched. */
+	/* Diagnose the return: a handled PSCI call must take the machine
+	 * down; landing here means the conduit call came back. */
 	mov	x21, x0
 	bl	putx64
 	adr	x0, str_sp
-	bl	puts	/* Unreachable on a passing machine; make the deviation printable. */
-	park:
+	bl	puts
+	b	park
+park:
 	adr	x0, str_ret
 	bl	puts
-	wfi_loop:
+wfi_loop:
 	wfi
 	b	wfi_loop
 
 /*
- * probe_conduit -> x0: 1 when the DTB prescribes HVC, else 0.
- * On entry the boot protocol left the DTB PA in x0; a zero or a wrong magic
- * means "trust the machine default" (SMC).
+ * probe_conduit -> x0: 1 when /psci method == "hvc", else 0 (SMC).
+ *
+ * A flat token walk, deliberately minimal -- no depth stack, no subtree
+ * logic, every branch ends at the loop top:
+ *   BEGIN_NODE whose name is exactly "psci" raises the in-psci flag;
+ *   any other BEGIN or any END_NODE drops it;
+ *   a PROP seen while the flag is up resolves its name through the
+ *   string block; a name of "method" compares its 4-byte value against
+ *   "hvc\0" and answers 1 on the spot.
+ * Everything else -- no DTB, bad magic, /psci absent, some other
+ * method -- answers 0: the SMC machine default.
+ * x20 dtb base, x21 cursor, x23 in-psci, x24 strings, x25 blob end;
+ * x0-x9 scratch.
  */
 probe_conduit:
-	stp	x29, x30, [sp, #-16]!
-	mov	x0, x20                      /* the parked DTB pointer */
-	cbz	x0, 10f                      /* no DTB pointer: default SMC */
-	/* Diagnose before deciding: entry x0 and its first word. All prints
-	 * ride x20/x21, which the printers do not clobber. */
+	stp	x29, x30, [sp, #-32]!
+	str	x21, [sp, #-16]!
 	mov	x21, x20
-	bl	putx64
-	adr	x0, str_sp
-	bl	puts
-	ldr	w0, [x20]                    /* first word, as read (LE) */
-	bl	putx32
-	adr	x0, str_sp
-	bl	puts
-	ldr	w1, [x20]                    /* FDT magic, big-endian on the wire */
-	rev	w1, w1                       /* -> host order: 0xd00dfeed */
-	movz	w2, #0xfeed                  /* low half first: 0xD00DFEED */
-	movk	w2, #0xd00d, lsl #16
-	cmp	w1, w2
-	b.ne	11f
-	/* Scan the whole blob for "hvc\0" (method value bytes): word LE
-	 * 0x00637668. totsize is BE at +4; bound the scan by it. */
-	ldr	w1, [x20, #4]
-	rev	w1, w1
-	cbz	w1, 9f
+	cbz	x20, .Lpc_none
+	ldr	w0, [x20]
+	rev	w0, w0
+	movz	w1, #0xfeed
+	movk	w1, #0xd00d, lsl #16
+	cmp	w0, w1
+	b.ne	.Lpc_badf
+	ldr	w0, [x20, #4]
+	rev	w0, w0
+	add	x25, x20, x0                 /* blob end */
+	ldr	w0, [x20, #12]
+	rev	w0, w0
+	add	x24, x20, x0                 /* strings block */
+	ldr	w0, [x20, #8]
+	rev	w0, w0
+	add	x21, x20, x0                 /* the walk starts at off_struct */
+	mov	x23, #0
+.Lpc_loop:
+	add	x0, x21, #8
+	cmp	x0, x25
+	b.hi	.Lpc_default
+	ldr	w0, [x21], #4
+	rev	w0, w0
+	cmp	w0, #1
+	b.eq	.Lpc_begin
+	cmp	w0, #2
+	b.eq	.Lpc_end
+	cmp	w0, #3
+	b.eq	.Lpc_prop
+	b	.Lpc_default                 /* END or nonsense */
+
+/* BEGIN_NODE: the name follows the token inline. Walk to its NUL, but stop
+ * at the blob end -- a corrupt or truncated name must bail, not run off the
+ * mapped window into an unmapped byte and take a data abort. */
+.Lpc_begin:
+	mov	x2, x21
+1:	cmp	x2, x25
+	b.hs	.Lpc_default
+	ldrb	w3, [x2], #1
+	cbnz	w3, 1b
+	sub	x4, x2, x21                  /* strlen + 1, including the NUL */
+	add	x5, x4, #3
+	and	x5, x5, #~3                  /* padded advance to the next word */
+	cmp	x4, #5                       /* "psci\0" is exactly five bytes */
+	b.ne	.Lpc_begin_no
+	/* the four name bytes against one immediate: an `adr` to str_psci
+	 * inside this loop is what bit us -- its relocation came out wrong and
+	 * graded the wrong address, so the name is now compared to a constant.
+	 * Little-endian: byte 0 'p' is the low halfword, byte 3 'i' the high. */
+	movz	w4, #0x7370                   /* 'p' 's' */
+	movk	w4, #0x6963, lsl #16         /* 'c' 'i' */
+	ldr	w6, [x21]                    /* the four name bytes in one word */
+	cmp	w6, w4
+	b.ne	.Lpc_begin_no
+	mov	x23, #1                      /* inside /psci */
+	b	.Lpc_begin_next
+.Lpc_begin_no:
+	mov	x23, #0
+.Lpc_begin_next:
+	add	x21, x21, x5
+	b	.Lpc_loop
+
+.Lpc_end:
+	mov	x23, #0
+	b	.Lpc_loop
+
+/* PROP: name is the string-block offset (token + 8). Resolve it, bound it
+ * inside the blob, and only then read. dlen (token + 4) sizes the value;
+ * the cursor always advances, whatever the name turns out to be. */
+.Lpc_prop:
+	add	x0, x21, #8
+	cmp	x0, x25
+	b.hi	.Lpc_default
+	ldr	w1, [x21]
+	rev	w1, w1                       /* dlen */
+	ldr	w0, [x21, #4]
+	rev	w0, w0                       /* name offset */
+	add	x6, x24, x0                  /* name address in the string block */
+	mov	x5, x1
+	add	x5, x5, #3
+	and	x5, x5, #~3                  /* padded value length */
+	add	x4, x21, #8
+	add	x4, x4, x5                   /* cursor after the padded body */
+	mov	x21, x4                      /* walk on regardless */
+	cbz	x23, .Lpc_loop               /* outside /psci: not our property */
+	/* six name bytes fit? x6 must sit at least six in from the blob end. */
+	sub	x2, x25, #6
+	cmp	x6, x2
+	b.hi	.Lpc_loop
+	cmp	x6, x20
+	b.lo	.Lpc_loop
+	ldr	w6, [x6]                     /* 'm''e''t''h', the first four bytes */
+	ldrh	w2, [x6, #4]                 /* 'o''d', the last two */
+	movz	w3, #0x656d                   /* 'm' 'e' */
+	movk	w3, #0x6874, lsl #16         /* 't' 'h' */
+	cmp	w6, w3
+	b.ne	.Lpc_loop
+	movz	w3, #0x646f                   /* 'o' 'd' */
+	cmp	w2, w3
+	b.ne	.Lpc_loop
+	/* it is /psci/method: read the 4-byte value at token + 12. x4 already
+	 * strided past the value plus padding; step back over just the padding. */
+	sub	x4, x4, x5
+	sub	x2, x25, #4
+	cmp	x4, x2
+	b.hi	.Lpc_default
+	ldr	w1, [x4]                     /* value, LE view of "hvc\0" */
 	movz	w2, #0x7668                  /* 'h' 'v' */
-	movk	w2, #0x0063, lsl #16         /* 'c' '\0' -> 0x00637668 */
-	mov	x3, x20                      /* cursor */
-	add	x4, x20, x1                  /* end = base + totsize */
-1:	ldrb	w5, [x3]
-	cmp	w5, #'h'
-	b.ne	2f
-	ldrb	w5, [x3, #1]
-	cmp	w5, #'v'
-	b.ne	2f
-	ldrb	w5, [x3, #2]
-	cmp	w5, #'c'
-	b.ne	2f
-	ldrb	w5, [x3, #3]
-	cbz	w5, 8f                       /* "hvc\0" found */
-2:	add	x3, x3, #1
-	cmp	x3, x4
-	b.lo	1b
-9:	mov	x0, #0                       /* scanned, no hvc: SMC */
-	ldp	x29, x30, [sp], #16
-	ret
-10:	adr	x0, str_no0
+	movk	w2, #0x0063, lsl #16         /* 'c' '\0' */
+	cmp	w1, w2
+	b.ne	.Lpc_default                 /* present but not hvc: SMC */
+	mov	w0, #1                       /* the DTB says HVC */
+	b	.Lpc_ret
+.Lpc_default:
+	mov	w0, #0
+	b	.Lpc_ret
+.Lpc_badf:
+	adr	x0, str_bad
 	bl	puts
-	mov	x0, #0
-	ldp	x29, x30, [sp], #16
-	ret
-11:	adr	x0, str_bad
+	mov	w0, #0
+	b	.Lpc_ret
+.Lpc_none:
+	adr	x0, str_no0
 	bl	puts
-	mov	x0, #0
-	ldp	x29, x30, [sp], #16
-	ret
-8:	mov	x0, #1                       /* DTB says HVC */
-	ldp	x29, x30, [sp], #16
+	mov	w0, #0
+.Lpc_ret:
+	ldr	x21, [sp], #16
+	ldp	x29, x30, [sp], #32
 	ret
 
 /* putx32: print w0 as 8 uppercase hex digits. The value parks in x19 and the
@@ -161,7 +247,7 @@ putx32:
 	mov	x19, x0
 	mov	x9, #32
 1:	sub	x9, x9, #4
-	lsr	x3, x19, x9            /* 64-bit shift: x19 is the parked value */
+	lsr	x3, x19, x9
 	and	w3, w3, #0xf
 	cmp	w3, #10
 	b.lo	2f
@@ -203,13 +289,16 @@ puts:
 	b	2b
 3:	ret
 
-.section .rodata
-str_ok:		.asciz "PSCI-OK\n"
-str_smc:	.asciz "PSCI-SMC\n"
-str_hvc:	.asciz "PSCI-HVC\n"
-str_no0:	.asciz "PSCI-NODTB\n"
-str_bad:	.asciz "PSCI-BADFDT\n"
-str_sp:		.asciz ":"
-str_ret:	.asciz "PSCI-RETURNED\n"
+	.section .rodata
+str_ok:		.asciz	"PSCI-OK\n"
+str_smc:	.asciz	"PSCI-SMC\n"
+str_hvc:	.asciz	"PSCI-HVC\n"
+str_no0:	.asciz	"PSCI-NODTB\n"
+str_bad:	.asciz	"PSCI-BADFDT\n"
+str_sp:		.asciz	":"
+str_ret:	.asciz	"PSCI-RETURNED\n"
+str_psci:	.asciz	"psci"
+str_method:	.asciz	"method"
+str_hvcv:	.asciz	"hvc"
 
 _image_end:

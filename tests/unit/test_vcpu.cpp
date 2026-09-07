@@ -441,7 +441,7 @@ TEST_F(VcpuTest, RunStopsAtBudgetAndAtHalted) {
   oemu_vcpu small{};
   const oemu_memops bus = oemu_memory_memops(&mem_);
   HaltFlag halt{false};
-  const oemu_env_ops env{&halt, nullptr, halted_of};
+  const oemu_env_ops env{&halt, nullptr, halted_of, nullptr};
   ASSERT_EQ(oemu_vcpu_init(&small, &bus, &env, OEMU_EL1, kText, kStack + 0x800U, 100U),
             OEMU_OK);
   uint64_t addr = kText;

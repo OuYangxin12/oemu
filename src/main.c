@@ -2,7 +2,8 @@
  * The oemu command line.
  *
  *   oemu run <image.elf> [--max-insns N]
- *   oemu boot -kernel <raw-bin> [--entry ADDR] [--max-insns N]
+ *   oemu boot -kernel <Image> [-append <cmdline>] [-m MiB] [-dtb <file>]
+ *             [--serial file:PATH] [--entry ADDR] [--max-insns N] [--smp N]
  *   oemu --help
  *
  * `run` boots a static AArch64 ET_EXEC image: read the file, hand it to
@@ -11,15 +12,17 @@
  * The guest's own stdout passes straight through, so
  * `oemu run prog.elf | diff - expected.txt` works.
  *
- * `boot` (M2c) starts a raw AArch64 image at EL1 with identity mapping -- the
- * kernel-boot protocol path. The machine layout mirrors the QEMU virt oracle
- * baseline (docs/linux-minimal-qemu.md) so the same guest runs on both: RAM
+ * `boot` (M2c, M4a) starts an AArch64 Linux Image at EL1 with identity
+ * mapping: Image-loader placement, a device-tree blob in x0, a real PL011,
+ * and a PSCI conduit that powers the machine down on SYSTEM_OFF. The machine layout mirrors the
+ * QEMU virt oracle baseline (docs/linux-minimal-qemu.md) so the same guest runs on both: RAM
  * 256 MiB at 0x40000000, the image at 0x40080000 (the AArch64 Image load
  * address; the header's `b _start` makes the load address a valid entry point,
  * so --entry defaults to it), and a stopgap UART at 0x09000000 (QEMU virt's
  * UART0 -- a temporary device only until M4a's real PL011 replaces it; the
  * write path emits one byte to stdout, every register reads 0). x0..x3 come in
- * zero: x0=DTB pointer is M4a's boot protocol, and there is no DTB yet.
+ * x0 carries the DTB, which the embedded fixture (tests/fixtures/boot.dtb,
+ * dtc-compiled from the mirrored .dts) supplies unless -dtb overrides it.
  *
  * The exit protocol, until PSCI exists (M4b): the guest writes the sentinel
  * byte 0x04 (EOT) to the UART data register. The device callback raises the
@@ -38,8 +41,11 @@
 #include "oemu/buffer.h"
 #include "oemu/elf.h"
 #include "oemu/exec.h"
+#include "oemu/fdt.h"
+#include "oemu/image.h"
 #include "oemu/machine.h"
 #include "oemu/memory.h"
+#include "oemu/psci.h"
 #include "oemu/status.h"
 #include "oemu/sysenv.h"
 #include "oemu/vcpu.h"
@@ -51,6 +57,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "boot_dtb.h" /* generated: the fixture blob as bytes */
+#include "oemu/pl011.h"
 
 /*
  * Stack policy. A freestanding guest's crt0 only needs a 16-byte-aligned SP --
@@ -90,13 +99,15 @@
  * protocol, UART address from virt's memory map.
  */
 #define BOOT_RAM_BASE        ((uint64_t)0x40000000ULL)
-#define BOOT_RAM_SIZE        ((uint64_t)0x10000000ULL) /* 256 MiB, as the oracle baseline */
+#define BOOT_RAM_DEFAULT     ((uint64_t)1024U) /* MiB; the fixture DTB's memory node */
+#define BOOT_DTB_SLOT        1U                /* one more region: the DTB rides the bus too */
 #define BOOT_IMAGE_BASE      ((uint64_t)0x40080000ULL) /* booting.rst kernel load address */
 #define BOOT_UART_BASE       ((uint64_t)0x09000000ULL) /* virt UART0 -- oracle-portable */
 #define BOOT_UART_SIZE       ((uint64_t)0x00001000ULL)
-#define BOOT_UART_DR         ((uint64_t)0x00ULL) /* PL011 DR offset: the only register we honour */
-#define BOOT_UART_EOT        (0x04U)             /* sentinel byte: the guest asks to stop */
-#define BOOT_REGION_CAPACITY 8U                  /* RAM + UART today; room for M4 devices */
+#define BOOT_DTB_MAX         ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
+#define BOOT_CMDLINE_MAX     (256U)           /* writable boot line width */
+#define BOOT_BOOTLINE_LEN    (257U)           /* the fixture property: pad + NUL */
+#define BOOT_REGION_CAPACITY 8U               /* RAM + UART + DTB + room for M4 devices */
 /* Instructions per scheduler slice. One vCPU, so a quantum is purely the
  * latency bound between machine-event polls; 1M keeps a stuck guest inside
  * the 60 s test budget while keeping syscall-free slices cheap. */
@@ -116,7 +127,9 @@ static uint64_t stack_base_for(const oemu_elf_image *img) {
 
 static void print_usage(FILE *out) {
   (void)fputs("usage: oemu run <image.elf> [--max-insns N]\n", out);
-  (void)fputs("       oemu boot -kernel <raw-bin> [--entry ADDR] [--max-insns N]\n", out);
+  (void)fputs("       oemu boot -kernel <Image> [-append <cmdline>] [-m MiB] [-dtb <file>]\n",
+              out);
+  (void)fputs("                 [--serial file:PATH] [--entry ADDR] [--max-insns N]\n", out);
   (void)fputs("       oemu --help\n", out);
 }
 
@@ -223,85 +236,233 @@ done:
 /* --- `oemu boot` (M2c) ----------------------------------------------------- */
 
 /*
- * The stopgap boot console. A PL011 write to DR emits exactly the low byte;
- * every register reads 0, which for FR means "TX FIFO not full, not busy" --
- * the answer that keeps a real driver writing. Writes to other offsets are
- * ignored. This is deliberately the smallest thing that can carry the markers
- * tests assert on: M4a's src/dev/pl011.c replaces it wholesale, and the guest
- * code changes not one line because the addresses and the write path match.
+ * The boot console is a real PL011 (src/dev/pl011.c): the fixture DTB's
+ * /pl011@9000000 node promises one, and guests hold it to that promise --
+ * they read the PID registers, program CR, and expect a FIFO. The sink
+ * drains TX bytes into the serial file (or stdout) on every scheduler
+ * slice, so markers appear as the guest writes them.
  */
-typedef struct boot_uart {
-  oemu_machine *machine;
+typedef struct boot_serial {
   FILE *out;
-} boot_uart;
+} boot_serial;
 
-static oemu_status boot_uart_read(void *ctx, uint64_t offset, oemu_mem_size size,
-                                  uint64_t *value_out) {
-  (void)ctx;
-  (void)offset;
-  (void)size;
-  *value_out = 0U;
-  return OEMU_OK;
+static void boot_serial_sink(void *user, unsigned char byte) {
+  boot_serial *ser = (boot_serial *)user;
+  (void)fputc((int)byte, ser->out);
+  (void)fflush(ser->out); /* markers must be visible even if the run dies later */
 }
 
-static oemu_status boot_uart_write(void *ctx, uint64_t offset, oemu_mem_size size,
-                                   uint64_t value) {
-  (void)size; /* stopgap: any width commits only its low byte */
-  boot_uart *uart = (boot_uart *)ctx;
-  if (offset != BOOT_UART_DR) {
-    return OEMU_OK; /* documented: writes elsewhere are ignored */
-  }
-  const int byte = (int)(value & 0xFFU);
-  if ((unsigned)byte == BOOT_UART_EOT) {
-    /* The exit protocol: a sticky machine event, not a host exit -- the run
-     * loop owns the process, the device only records the wish. */
-    oemu_machine_poweroff(uart->machine, 0);
-    return OEMU_OK;
-  }
-  (void)fputc(byte, uart->out);
-  (void)fflush(uart->out); /* markers must be visible even if the run dies later */
-  return OEMU_OK;
-}
+/* The run loop's `halted`: either a machine event (a device asked) or the
+ * PSCI power state -- SYSTEM_OFF lands on both sides at once, but checking
+ * both keeps each seam honest on its own. `syscall` stays NULL: at EL1 an
+ * SVC is an exception into the guest's vectors, not a host call. */
+typedef struct boot_env {
+  oemu_machine *machine;
+  oemu_psci *psci;
+} boot_env;
 
-/* The env's `halted` mirrors the machine's sticky event, so oemu_vcpu_run
- * notices a device-raised powerdown at the very next instruction boundary.
- * `syscall` is NULL on purpose: at EL1 an SVC is an exception into the guest's
- * vectors, not a host call -- the vCPU never consults it in system mode. */
 static bool boot_halted(const void *ctx) {
-  return oemu_machine_event_peek((const oemu_machine *)ctx) != OEMU_MACHINE_EVENT_NONE;
+  const boot_env *benv = (const boot_env *)ctx;
+  return (oemu_machine_event_peek(benv->machine) != OEMU_MACHINE_EVENT_NONE) ||
+         benv->psci->halted;
 }
 
-/* Assembles the little-endian doubleword the device model expects from eight
- * host-buffer bytes, so the image copy does not depend on host byte order. */
-static uint64_t load64le(const unsigned char *p) {
-  uint64_t v = 0U;
-  for (unsigned i = 0U; i < 8U; i++) {
-    v |= (uint64_t)p[i] << (8U * i);
+/* HVC/SMC arrive here before any exception: PSCI answers what it knows and
+ * the instruction steps; anything else falls through as the undefined
+ * exception the architecture prescribes for a bare-metal monitor call.
+ * A SYSTEM_OFF that landed powers the machine down, so the run loop's
+ * event poll turns it into a clean exit 0. */
+static bool boot_fw_call(void *ctx, bool is_hvc, uint16_t imm, const uint64_t args[3],
+                         uint64_t *ret0) {
+  (void)is_hvc; /* the fixture negotiates the conduit; both answer alike */
+  (void)imm;    /* oemu implements the 0.1-0.2 function IDs; imm is unused */
+  boot_env *benv = (boot_env *)ctx;
+  uint64_t r0 = 0U;
+  if (!oemu_psci_dispatch(benv->psci, args[0], &r0)) {
+    return false;
   }
-  return v;
+  *ret0 = r0;
+  if (benv->psci->halted) {
+    oemu_machine_poweroff(benv->machine, 0);
+  }
+  if (benv->psci->reset) {
+    oemu_machine_reset(benv->machine);
+  }
+  return true;
 }
 
-/* Copies the image into guest RAM through the bus itself (the machine
- * deliberately exposes no host pointer). Little-endian and 8-byte-chunked on
- * purpose, so a future big-endian host still boots the same image. */
-static oemu_status boot_load_image(oemu_aspace *as, const unsigned char *src, size_t len) {
-  uint64_t pa = BOOT_IMAGE_BASE;
-  while (len >= 8U) {
-    const oemu_status st = oemu_aspace_write(as, pa, OEMU_MEM_DWORD, load64le(src));
-    if (st != OEMU_OK) {
-      return st;
-    }
-    src += 8U;
-    pa += 8U;
-    len -= 8U;
+static uint32_t be32(const unsigned char *p) {
+  return ((uint32_t)p[0] << 24U) | ((uint32_t)p[1] << 16U) | ((uint32_t)p[2] << 8U) | p[3];
+}
+
+static size_t strnlen(const char *s, size_t cap) {
+  size_t n = 0U;
+  while ((n < cap) && (s[n] != '\0')) {
+    n++;
   }
-  for (; len > 0U; len--, src++, pa++) {
-    const oemu_status st = oemu_aspace_write(as, pa, OEMU_MEM_BYTE, *src);
-    if (st != OEMU_OK) {
-      return st;
-    }
+  return n;
+}
+
+/* The four FDT wire tokens the patchers dispatch on (spec values; the fdt
+ * module owns the same four in its internal header). */
+#define BOOT_FDT_MAGIC            0xD00DFEEDU
+#define BOOT_FDT_TOKEN_BEGIN_NODE 0x00000001U
+#define BOOT_FDT_TOKEN_END_NODE   0x00000002U
+#define BOOT_FDT_TOKEN_PROP       0x00000003U
+#define BOOT_FDT_TOKEN_END        0x00000009U
+
+/*
+ * Patch the chosen /chosen/bootline property in place inside a finished
+ * blob: the fixture carries a 256-space pad exactly so this write never
+ * changes the blob's size, offsets, or dtc-identity. Returns false when
+ * the blob has no bootline to write into.
+ */
+static bool dtb_patch_bootline(unsigned char *blob, size_t blob_len, const char *cmdline) {
+  const size_t clen = strlen(cmdline);
+  if (clen >= BOOT_CMDLINE_MAX) {
+    (void)fprintf(stderr, "oemu: -append: command line of %zu bytes exceeds %u\n", clen,
+                  BOOT_CMDLINE_MAX);
+    return false;
   }
-  return OEMU_OK;
+  const uint32_t off_struct = be32(blob + 8U);
+  const uint32_t off_strings = be32(blob + 12U);
+  unsigned char *p = blob + off_struct;
+  unsigned char *const end = blob + blob_len;
+  int depth = 0; /* only /chosen's bootline is ours; deeper matches are strangers */
+  while (p + 4U <= end) {
+    const uint32_t token = be32(p);
+    p += 4U;
+    if (token == BOOT_FDT_TOKEN_END) {
+      break;
+    }
+    if (token == BOOT_FDT_TOKEN_END_NODE) {
+      depth--;
+      continue;
+    }
+    if (token == BOOT_FDT_TOKEN_BEGIN_NODE) {
+      const size_t nl = strnlen((const char *)p, (size_t)(end - p));
+      const bool is_chosen = ((depth == 1) && (nl == 6U) && (memcmp(p, "chosen", 6U) == 0));
+      depth++;
+      p += ((nl + 1U + 3U) / 4U) * 4U;
+      if (!is_chosen) {
+        continue;
+      }
+      while (p + 4U <= end) {
+        const uint32_t t = be32(p);
+        p += 4U;
+        if (t == BOOT_FDT_TOKEN_END_NODE) {
+          depth--;
+          break;
+        }
+        if (t != BOOT_FDT_TOKEN_PROP) {
+          return false; /* chosen's children are not our problem */
+        }
+        const uint32_t dlen = be32(p);
+        const uint32_t name_off = be32(p + 4U);
+        const char *nm = (const char *)blob + off_strings + name_off;
+        if ((dlen == BOOT_BOOTLINE_LEN) && (strcmp(nm, "bootline") == 0)) {
+          (void)memset(p + 8U, ' ', BOOT_CMDLINE_MAX);
+          (void)memcpy(p + 8U, cmdline, clen);
+          p[8U + clen] = (unsigned char)'\0';
+          p[BOOT_BOOTLINE_LEN + 7U] = (unsigned char)'\0'; /* the pad's own terminator */
+          return true;
+        }
+        p += 8U + (((dlen + 3U) / 4U) * 4U);
+      }
+      return false;
+    }
+    if (token == BOOT_FDT_TOKEN_PROP) {
+      const uint32_t dlen = be32(p);
+      p += 8U + (((dlen + 3U) / 4U) * 4U);
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+/*
+ * Rewrite the single /memory@ node's reg <base size> pair to describe the
+ * RAM window we build. The fixture has exactly one memory node, 1 GiB at
+ * 0x40000000; `oemu boot -m` rewrites the size cell here so the tree never
+ * claims more (or different) memory than the machine has.
+ */
+static bool dtb_patch_node(unsigned char *blob, size_t blob_len, uint64_t base, uint64_t size) {
+  const uint32_t off_struct = be32(blob + 8U);
+  const uint32_t off_strings = be32(blob + 12U);
+  unsigned char *p = blob + off_struct;
+  unsigned char *const end = blob + blob_len;
+  int depth = 0;
+  bool in_wanted = false;
+  const char *want = "memory@";
+  while (p + 4U <= end) {
+    const uint32_t token = be32(p);
+    p += 4U;
+    if (token == BOOT_FDT_TOKEN_END) {
+      break;
+    }
+    if (token == BOOT_FDT_TOKEN_END_NODE) {
+      depth--;
+      in_wanted = false;
+      continue;
+    }
+    if (token == BOOT_FDT_TOKEN_BEGIN_NODE) {
+      const size_t nl = strnlen((const char *)p, (size_t)(end - p));
+      in_wanted = ((depth == 1) && (nl >= 7U) && (memcmp(p, want, 7U) == 0));
+      depth++;
+      p += ((nl + 1U + 3U) / 4U) * 4U;
+      continue;
+    }
+    if (token == BOOT_FDT_TOKEN_PROP) {
+      const uint32_t dlen = be32(p);
+      const uint32_t name_off = be32(p + 4U);
+      const char *nm = (const char *)blob + off_strings + name_off;
+      if (in_wanted && (strcmp(nm, "reg") == 0) && (dlen >= 16U)) {
+        unsigned char *v = p + 8U;
+        for (unsigned b = 0U; b < 8U; b++) {
+          v[b] = (unsigned char)(base >> (56U - 8U * b));
+          v[8U + b] = (unsigned char)(size >> (56U - 8U * b));
+        }
+        return true;
+      }
+      p += 8U + (((dlen + 3U) / 4U) * 4U);
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+/* Read a DTB: the caller's file, or the embedded fixture compiled from
+ * tests/fixtures/boot.dts. `bytes`/`len` are filled for the caller to free. */
+static int dtb_load(const char *path, unsigned char **bytes, size_t *len) {
+  if (path != NULL) {
+    oemu_buffer file;
+    if (oemu_buffer_init(&file, 0U) != OEMU_OK) {
+      return -1;
+    }
+    if (read_file(path, &file) != 0) {
+      oemu_buffer_dispose(&file);
+      return -1;
+    }
+    *len = oemu_buffer_len(&file);
+    *bytes = (unsigned char *)oemu_allocator_get()->alloc(*len, NULL);
+    if (*bytes == NULL) {
+      oemu_buffer_dispose(&file);
+      return -1;
+    }
+    (void)memcpy(*bytes, oemu_buffer_data(&file), *len);
+    oemu_buffer_dispose(&file);
+    return 0;
+  }
+  const size_t n = sizeof(oemu_boot_dtb);
+  *bytes = (unsigned char *)oemu_allocator_get()->alloc(n, NULL);
+  if (*bytes == NULL) {
+    return -1;
+  }
+  (void)memcpy(*bytes, oemu_boot_dtb, n);
+  *len = n;
+  return 0;
 }
 
 /*
@@ -310,13 +471,16 @@ static oemu_status boot_load_image(oemu_aspace *as, const unsigned char *src, si
  * acts. A separate function so `boot` itself keeps the goto-clean shape the
  * project's -Wjump-misses-init demands of functions with a cleanup label.
  */
-static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, uint64_t max_insns) {
+static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
+                    uint64_t max_insns) {
   uint64_t budget = max_insns;
   for (;;) {
     const uint64_t slice = (budget < BOOT_QUANTUM) ? budget : BOOT_QUANTUM;
     uint64_t done = 0U;
     const oemu_status st = oemu_vcpu_run(vcpu, slice, &done);
     budget -= done;
+    (void)oemu_pl011_pump(uart); /* the console drains on every slice boundary */
+    oemu_vcpu_set_irq(vcpu, oemu_pl011_irq_level(uart) != 0);
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
       return machine->exit_code & 0xFF; /* the code travels as a shell sees it */
@@ -341,78 +505,168 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, uint64_t max_insns) 
   }
 }
 
-/* Boots `kernel_path` as a raw image at EL1 and returns the process status. */
-static int boot(const char *kernel_path, uint64_t entry, uint64_t max_insns) {
+/* Everything `oemu boot` was told, after parsing and defaulting. */
+typedef struct boot_opts {
+  const char *kernel;      /* -kernel: required */
+  const char *cmdline;     /* -append: NULL when absent */
+  const char *dtb;         /* -dtb:    NULL -> embedded fixture */
+  const char *serial_path; /* --serial file:PATH; NULL -> stdout */
+  uint64_t ram_mib;        /* -m:      MiB, defaulting to the fixture's 1 GiB */
+  uint64_t entry;          /* --entry: 0 -> the Image header's own entry */
+  uint64_t max_insns;      /* --max-insns */
+} boot_opts;
+
+/*
+ * Boots an AArch64 Linux Image at EL1 with the M4a boot protocol:
+ * Image-loader placement, DTB in x0, a PL011 at virt's UART0 address, and
+ * a PSCI conduit whose SYSTEM_OFF exits the process 0. `ram_mib` sizes the
+ * RAM window; the DTB's memory node is patched to match, so `-m` never
+ * makes the tree lie about the machine.
+ */
+static int boot(const boot_opts *opts) {
   oemu_buffer image;
   oemu_machine machine = {0};
   oemu_vcpu vcpu = {0};
   oemu_env_ops env = {0};
   oemu_memops bus = {0};
-  boot_uart uart = {0};
-  oemu_device_ops uart_ops = {0};
-  oemu_status st = OEMU_OK;
+  oemu_pl011 uart = {0};
+  oemu_psci psci = {0};
+  boot_env benv = {0};
+  boot_serial ser = {0};
+  oemu_image hdr = {0};
+  unsigned char *dtb = NULL;
+  size_t dtb_len = 0U;
   size_t len = 0U;
+  FILE *serial = NULL;
+  const uint64_t ram = opts->ram_mib * (1U << 20);
+  uint64_t entry = 0U;
+  uint64_t dtb_pa = 0U;
+  oemu_status st = OEMU_OK;
   int result = EXIT_ERROR;
 
   if (oemu_buffer_init(&image, 0U) != OEMU_OK) {
     (void)fputs("oemu: out of memory\n", stderr);
     return EXIT_ERROR;
   }
-  if (read_file(kernel_path, &image) != 0) {
+  if (read_file(opts->kernel, &image) != 0) {
     goto done;
   }
   len = oemu_buffer_len(&image);
-  if (len > (size_t)(BOOT_RAM_BASE + BOOT_RAM_SIZE - BOOT_IMAGE_BASE)) {
-    (void)fprintf(stderr, "oemu: %s: image of %zu bytes does not fit below the RAM end\n",
-                  kernel_path, len);
+  if (dtb_load(opts->dtb, &dtb, &dtb_len) != 0) {
+    (void)fprintf(stderr, "oemu: could not load the device tree\n");
     goto done;
   }
-  /* The architecture requires a 4-byte-aligned PC, and the entry must be
-   * inside the machine -- an entry outside RAM is a caller error, not a
-   * guest-visible Instruction Abort at an address no region owns. */
-  if ((entry & 3U) != 0U || entry < BOOT_RAM_BASE || entry >= BOOT_RAM_BASE + BOOT_RAM_SIZE) {
-    (void)fprintf(stderr, "oemu: entry 0x%" PRIx64 " is not 4-aligned inside RAM\n", entry);
+  if ((dtb_len < 40U) || (be32(dtb) != BOOT_FDT_MAGIC) || (be32(dtb + 4U) > dtb_len) ||
+      (dtb_len > BOOT_DTB_MAX)) {
+    (void)fprintf(stderr, "oemu: %s is not a valid device tree blob\n",
+                  opts->dtb != NULL ? opts->dtb : "the embedded fixture");
+    goto done;
+  }
+  if (opts->cmdline != NULL) {
+    if (!dtb_patch_bootline(dtb, dtb_len, opts->cmdline)) {
+      (void)fprintf(stderr, "oemu: -append: this DTB has no /chosen/bootline to write\n");
+      goto done;
+    }
+  }
+  /* The tree's /memory reg must describe the RAM we actually build, or a
+   * guest trusts a lie. The fixture's single memory@40000000 node gets its
+   * size cell rewritten in place -- same width, no layout shift. A tree with
+   * no /memory node (a minimal probe fixture, say) asserts nothing about RAM,
+   * so there is nothing to keep honest: warn and carry on. */
+  if (!dtb_patch_node(dtb, dtb_len, BOOT_RAM_BASE, ram)) {
+    (void)fprintf(stderr, "oemu: note: the device tree has no /memory node to size\n");
+  }
+
+  /* booting.rst: magic, min-version, flags, and the text fitting RAM. */
+  st = oemu_image_parse_header(oemu_buffer_data(&image), &hdr);
+  if (st != OEMU_OK) {
+    (void)fprintf(stderr, "oemu: %s: %s\n", opts->kernel, oemu_status_str(st));
+    goto done;
+  }
+  entry = (opts->entry != 0U) ? opts->entry : BOOT_RAM_BASE + hdr.text_offset;
+  if ((entry & 3U) != 0U) {
+    (void)fprintf(stderr, "oemu: entry 0x%" PRIx64 " is not 4-aligned\n", entry);
+    goto done;
+  }
+  /* A caller-supplied entry must be somewhere the machine can fetch from.
+   * Kernel text always lands in RAM, so refuse an entry outside it rather
+   * than set the program counter at an address no region owns and let the
+   * guest die on a Data/Instruction Abort it can never name. */
+  if ((entry < BOOT_RAM_BASE) || (entry >= BOOT_RAM_BASE + ram)) {
+    (void)fprintf(stderr, "oemu: entry 0x%" PRIx64 " lies outside the machine's RAM\n", entry);
     goto done;
   }
 
-  st = oemu_machine_init(&machine, BOOT_RAM_BASE, BOOT_RAM_SIZE, BOOT_REGION_CAPACITY);
+  if (opts->serial_path != NULL) {
+    serial = fopen(opts->serial_path, "wb");
+    if (serial == NULL) {
+      (void)fprintf(stderr, "oemu: cannot open serial log '%s'\n", opts->serial_path);
+      goto done;
+    }
+  } else {
+    serial = stdout;
+  }
+
+  st = oemu_machine_init(&machine, BOOT_RAM_BASE, ram, BOOT_REGION_CAPACITY);
   if (st != OEMU_OK) {
     (void)fprintf(stderr, "oemu: machine init failed: %s\n", oemu_status_str(st));
     goto done;
   }
-  uart.machine = &machine;
-  uart.out = stdout;
-  uart_ops.ctx = &uart;
-  uart_ops.read = boot_uart_read;
-  uart_ops.write = boot_uart_write;
-  st = oemu_aspace_attach_device(&machine.aspace, BOOT_UART_BASE, BOOT_UART_SIZE, &uart_ops);
+  ser.out = serial;
+  oemu_pl011_init(&uart, &boot_serial_sink, &ser);
+  st = oemu_aspace_attach_device(&machine.aspace, BOOT_UART_BASE, BOOT_UART_SIZE, &uart.ops);
   if (st != OEMU_OK) {
     (void)fprintf(stderr, "oemu: attaching the boot UART failed: %s\n", oemu_status_str(st));
     goto done;
   }
+  /* x0 will carry this address; the DTB lives in plain RAM at the halfway
+   * mark -- inside the machine, past any kernel a -m 1024 guest unpacks. */
+  dtb_pa = BOOT_RAM_BASE + (ram / 2U);
+  bus = oemu_aspace_memops(&machine.aspace);
 
-  st = boot_load_image(&machine.aspace, oemu_buffer_data(&image), len);
+  /* Text lands at mem_base + text_offset per booting.rst, through the bus. */
+  st = oemu_image_load(&hdr, oemu_buffer_data(&image), len, &bus, BOOT_RAM_BASE, ram);
   if (st != OEMU_OK) {
-    (void)fprintf(stderr, "oemu: loading the image failed: %s\n", oemu_status_str(st));
+    (void)fprintf(stderr, "oemu: loading %s failed: %s\n", opts->kernel, oemu_status_str(st));
     goto done;
   }
+  /* The tree rides the bus too, byte by byte, at the halfway mark. */
+  {
+    uint64_t pa = dtb_pa;
+    for (size_t i = 0U; i < dtb_len; i++, pa++) {
+      st = oemu_aspace_write(&machine.aspace, pa, OEMU_MEM_BYTE, dtb[i]);
+      if (st != OEMU_OK) {
+        (void)fprintf(stderr, "oemu: placing the DTB failed: %s\n", oemu_status_str(st));
+        goto done;
+      }
+    }
+  }
 
-  /* Entry stack hint: the top of RAM, 16-aligned. Linux guests set their own
-   * SP before touching the stack; a smoke guest that relies on this lands in
-   * zero-filled RAM either way. */
-  env.ctx = &machine;
+  oemu_psci_init(&psci);
+  benv.machine = &machine;
+  benv.psci = &psci;
+  env.ctx = &benv;
   env.syscall = NULL;
-  env.halted = boot_halted;
-  bus = oemu_aspace_memops(&machine.aspace);
-  st = oemu_vcpu_init(&vcpu, &bus, &env, OEMU_EL1, entry, BOOT_RAM_BASE + BOOT_RAM_SIZE - 16U,
+  env.halted = &boot_halted;
+  env.fw_call = &boot_fw_call;
+  st = oemu_vcpu_init(&vcpu, &bus, &env, OEMU_EL1, entry, BOOT_RAM_BASE + ram - 16U,
                       BOOT_QUANTUM);
   if (st != OEMU_OK) {
     (void)fprintf(stderr, "oemu: vcpu init failed: %s\n", oemu_status_str(st));
     goto done;
   }
-  result = boot_run(&vcpu, &machine, max_insns);
+  /* The boot protocol: x0 carries the DTB's physical address. */
+  oemu_regs_write(&vcpu.cpu.regs, 0U, OEMU_REG_W64, dtb_pa);
+  result = boot_run(&vcpu, &machine, &uart, opts->max_insns);
+  (void)oemu_pl011_pump(&uart); /* whatever the guest queued before it died */
 
 done:
+  if ((serial != NULL) && (serial != stdout)) {
+    (void)fclose(serial);
+  }
+  if (dtb != NULL) {
+    oemu_allocator_get()->free(dtb, NULL);
+  }
   oemu_machine_dispose(&machine);
   oemu_buffer_dispose(&image);
   return result;
@@ -433,6 +687,31 @@ static int parse_max_insns(const char *text, uint64_t *out) {
 /* An entry address, written as C writes it: 0x-prefixed hex or plain decimal.
  * A leading '-' is refused -- strtoull would wrap it into a huge address that
  * then passes no sensible range check. */
+/* RAM size in MiB, decimal and positive: `-m 0` would build no machine. */
+static int parse_mib(const char *text, uint64_t *out) {
+  errno = 0;
+  char *end = NULL;
+  const unsigned long long value = strtoull(text, &end, 10);
+  if (end == text || *end != '\0' || errno != 0 || value == 0ULL || value > (1ULL << 32)) {
+    (void)fprintf(stderr, "oemu: invalid -m '%s'\n", text);
+    return -1;
+  }
+  *out = (uint64_t)value;
+  return 0;
+}
+
+/* Today the only --serial destination form is `file:PATH`, matching the
+ * oracle's `-serial file:...` spelling one for one. */
+static int parse_serial(const char *text, const char **path_out) {
+  static const char prefix[] = "file:";
+  if (strncmp(text, prefix, sizeof(prefix) - 1U) != 0 || text[sizeof(prefix) - 1U] == '\0') {
+    (void)fprintf(stderr, "oemu: --serial wants file:PATH (got '%s')\n", text);
+    return -1;
+  }
+  *path_out = text + sizeof(prefix) - 1U;
+  return 0;
+}
+
 static int parse_entry(const char *text, uint64_t *out) {
   errno = 0;
   char *end = NULL;
@@ -457,28 +736,66 @@ int main(int argc, char **argv) {
       print_usage(stderr);
       return EXIT_USAGE;
     }
-    uint64_t entry = BOOT_IMAGE_BASE; /* booting.rst: load address IS the entry point */
-    uint64_t max_insns = UINT64_MAX;
+    boot_opts opts = {0};
+    opts.kernel = argv[3];
+    opts.ram_mib = BOOT_RAM_DEFAULT;
+    opts.max_insns = UINT64_MAX;
     for (int i = 4; i < argc; i++) {
-      if (strcmp(argv[i], "--entry") == 0) {
-        if (i + 1 >= argc || parse_entry(argv[i + 1], &entry) != 0) {
+      const char *a = argv[i];
+      const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
+      if (strcmp(a, "-append") == 0 || strcmp(a, "-dtb") == 0) {
+        if (v == NULL) {
+          print_usage(stderr);
+          return EXIT_USAGE;
+        }
+        if (a[1] == 'a') {
+          opts.cmdline = v;
+        } else {
+          opts.dtb = v;
+        }
+        i++;
+      } else if (strcmp(a, "-m") == 0) {
+        if (v == NULL || parse_mib(v, &opts.ram_mib) != 0) {
           print_usage(stderr);
           return EXIT_USAGE;
         }
         i++;
-      } else if (strcmp(argv[i], "--max-insns") == 0) {
-        if (i + 1 >= argc || parse_max_insns(argv[i + 1], &max_insns) != 0) {
+      } else if (strcmp(a, "--serial") == 0) {
+        if (v == NULL || parse_serial(v, &opts.serial_path) != 0) {
           print_usage(stderr);
           return EXIT_USAGE;
         }
         i++;
+      } else if (strcmp(a, "--entry") == 0) {
+        if (v == NULL || parse_entry(v, &opts.entry) != 0) {
+          print_usage(stderr);
+          return EXIT_USAGE;
+        }
+        i++;
+      } else if (strcmp(a, "--max-insns") == 0) {
+        if (v == NULL || parse_max_insns(v, &opts.max_insns) != 0) {
+          print_usage(stderr);
+          return EXIT_USAGE;
+        }
+        i++;
+      } else if (strcmp(a, "--smp") == 0) {
+        (void)fprintf(stderr,
+                      "oemu: --smp is not supported yet; one vCPU boots alone (M4b+)\n");
+        return EXIT_USAGE;
+      } else if (strcmp(a, "-smp") == 0) {
+        if (v == NULL) {
+          print_usage(stderr);
+          return EXIT_USAGE;
+        }
+        (void)fprintf(stderr, "oemu: -smp is not supported yet; one vCPU boots alone (M4b+)\n");
+        return EXIT_USAGE;
       } else {
-        (void)fprintf(stderr, "oemu: unknown option '%s'\n", argv[i]);
+        (void)fprintf(stderr, "oemu: unknown option '%s'\n", a);
         print_usage(stderr);
         return EXIT_USAGE;
       }
     }
-    return boot(argv[3], entry, max_insns);
+    return boot(&opts);
   }
   if (argc < 3 || strcmp(argv[1], "run") != 0) {
     print_usage(stderr);

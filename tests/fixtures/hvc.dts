@@ -1,0 +1,2 @@
+/dts-v1/;
+/ { #address-cells=<2>; #size-cells=<2>; psci { compatible="arm,psci"; method="hvc"; }; };

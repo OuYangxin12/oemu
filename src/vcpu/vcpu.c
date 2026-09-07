@@ -189,7 +189,7 @@ oemu_status oemu_vcpu_step(oemu_vcpu *vcpu, oemu_insn *insn_out) {
   }
 
   const oemu_status st = oemu_exec_internal_dispatch_system(&vcpu->cpu, &vcpu->sysregs, &view,
-                                                            &insn, word, &vcpu->mmu);
+                                                            &insn, word, &vcpu->mmu, vcpu->env);
   if (st != OEMU_OK) {
     return st; /* BLOCKED (backstop: unreachable from here) or INVALID_ARG */
   }

@@ -236,23 +236,77 @@ constexpr uint32_t kBSpin = 0x14000000U;  // b    .
 constexpr uint32_t movz(const uint32_t rd, const uint32_t imm16) {
   return 0xD2800000U | ((imm16 & 0xFFFFU) << 5U) | rd;
 }
+// ldr x64, [xBase, #off]: unsigned offset, scaled by 8 (ARM ARM C6.2.219:
+// size=11 opc=01 fixed 0xF9400000, imm14 = off/8 at bit 10). Kept alongside
+// movz for tests that hand-build a load; [[maybe_unused]] so the compiler
+// does not flag it on the day no case happens to need it.
+[[maybe_unused]] constexpr uint32_t ldr(const uint32_t rt, const uint32_t rn,
+                                        const uint32_t off) {
+  return 0xF9400000U | ((off >> 3U) << 10U) | (rn << 5U) | rt;
+}
 }  // namespace boot_words
 
-// Byte-level boot image from big-endian-safe hand-packed words.
+// Byte-level boot image from big-endian-safe hand-packed words -- and from
+// the M4a protocol round: a real Linux Image header (booting.rst fields at
+// their documented offsets), the entry branch pointing past it, and the
+// guest words in the text at `text_offset`. The header is data the loader
+// reads, instructions the guest never executes; the branch skips it.
 std::vector<uint8_t> raw_image(const std::vector<uint32_t> &words) {
+  // booting.rst lets text sit at any 4 KiB-aligned offset under 2 MiB, and
+  // the loader requires it inside the file. The boot tests pin the default
+  // entry to 0x40080000 (mem_base 0x40000000 + text_offset), matching the
+  // load address every other guest and the QEMU oracle use, so the hole is
+  // 0x80000 -- exactly what a real Image carries.
+  constexpr uint32_t kTextOffset = 0x80000U;
   std::vector<uint8_t> bytes;
-  bytes.reserve(words.size() * 4U);
+  bytes.reserve(kTextOffset + words.size() * 4U);
+  // code0: b to the text -- the loader may enter at byte 0 and asks to be skipped.
+  const uint32_t branch = 0x14000000U | ((kTextOffset / 4U) & 0x03FFFFFFU);
+  auto put32 = [&bytes](const uint32_t v) {
+    for (unsigned i = 0U; i < 4U; i++) {
+      bytes.push_back(static_cast<uint8_t>((v >> (8U * i)) & 0xFFU));
+    }
+  };
+  auto put64 = [&bytes](const uint64_t v) {
+    for (unsigned i = 0U; i < 8U; i++) {
+      bytes.push_back(static_cast<uint8_t>((v >> (8U * i)) & 0xFFU));
+    }
+  };
+  put32(branch);             // 0x00 code0: b _start
+  put32(0U);                 // 0x04 res0
+  put64(kTextOffset);        // 0x08 text_offset (le64)
+  put64(words.size() * 4U);  // 0x10 image_size
+  put64(0x2U);               // 0x18 flags: little-endian, 4K pages
+  put64(0U);                 // 0x20 res1
+  put64(0U);                 // 0x28 res2
+  put64(0U);                 // 0x30 res3
+  put32(0x644D5241U);        // 0x38 magic "ARM\x64"
+  put32(0U);                 // 0x3C reserved
+  while (bytes.size() < kTextOffset) {
+    bytes.push_back(0U);  // the hole the loader skips
+  }
   for (const uint32_t w : words) {
-    bytes.push_back(static_cast<uint8_t>(w & 0xFFU));
-    bytes.push_back(static_cast<uint8_t>((w >> 8U) & 0xFFU));
-    bytes.push_back(static_cast<uint8_t>((w >> 16U) & 0xFFU));
-    bytes.push_back(static_cast<uint8_t>((w >> 24U) & 0xFFU));
+    put32(w);
   }
   return bytes;
 }
 
-// x1 = 0x09000000: the stopgap UART base, built with mov x1,#0 + movk.
+// x1 = 0x09000000: the PL011 base, built with mov x1,#0 + movk.
 const std::vector<uint32_t> kUartAddress = {0xD2800001U, boot_words::kMovkX1Uart};
+
+// Bring the console up the way a driver must: CR = UARTEX|UARTEN (0x300) at
+// register offset 0x18, so TX becomes legal and FR.TXFE can clear. Clobbers x0.
+std::vector<uint32_t> uart_enable() {
+  return {boot_words::movz(0U, 0x300U), 0xF9003020U};  // str x0, [x1, #0x18]
+}
+
+// PSCI SYSTEM_OFF (fnid 0x84000002) through the SMC conduit: the M4a exit
+// protocol. The fnid is assembled MOVK-style -- movz loads the low halfword
+// (#2), movk deposits the high one (#0x8400) -- both encodings harvested
+// from clang's own disassembly of that exact pair, not hand-derived.
+std::vector<uint32_t> psci_off() {
+  return {0xD2800040U, 0xF2B08000U, 0xD4000003U};
+}
 
 // A sparse file of exactly `size` bytes: ftruncate leaves holes that read
 // back as zeros, so testing the 256 MiB load ceiling costs no disk and no
@@ -287,9 +341,9 @@ class TempSparse {
 };
 
 // The load ceiling from src/main.c's documented layout: RAM 0x40000000 +
-// 256 MiB, image base 0x40080000. Contract, cited to the usage the CLI
+// the default 1 GiB, text at +0x80000. Contract, cited to the usage the CLI
 // prints and the task card pins.
-constexpr uint64_t kBootLoadCeiling = 0x10000000ULL - 0x80000ULL;
+constexpr uint64_t kBootLoadCeiling = 0x40000000ULL - 0x80000ULL;
 
 class CliBootTest : public CliTest {
  protected:
@@ -345,44 +399,54 @@ class CliBootTest : public CliTest {
   }
 };
 
-TEST_F(CliBootTest, BootSentinelImagePowersOffCleanly) {
-  // mov x0,#4 ; x1=UART ; str -> sentinel EOT: poweroff(0) asked, exit 0 given.
-  const std::vector<uint8_t> image =
-      raw_image({boot_words::movz(0U, 0x4U), kUartAddress[0], kUartAddress[1],
-                 boot_words::kStrX0X1, boot_words::kBrk0});
-  const TempImage file(image);
+TEST_F(CliBootTest, BootPsciSystemOffExitsCleanly) {
+  // The M4a exit protocol: SMC #0 with fnid 0x84000002 (SYSTEM_OFF) is
+  // answered by the PSCI conduit, powers the machine down, and oemu exits 0.
+  std::vector<uint32_t> words = psci_off();
+  words.push_back(boot_words::kBrk0);
+  const TempImage file(raw_image(words));
   ASSERT_TRUE(file.ok());
   const Captured r = capture_cli({"boot", "-kernel", file.path()});
   EXPECT_TRUE(r.exited) << "oemu did not exit normally (killed by a signal?)";
   EXPECT_EQ(r.code, 0);
-  EXPECT_TRUE(r.out.empty()) << "the sentinel must not reach stdout: " << r.out;
+  EXPECT_TRUE(r.out.empty()) << "a bare SYSTEM_OFF must print nothing: " << r.out;
 }
 
 TEST_F(CliBootTest, BootUartForwardsBytesExactly) {
-  // 'o' 'k' then EOT: the UART stream must arrive byte-for-byte, in order.
-  // The write at offset 8 sits between them and must leave no trace -- the
-  // documented stopgap behaviour is "other writes are ignored".
-  const std::vector<uint8_t> image =
-      raw_image({boot_words::movz(0U, 0x6FU), kUartAddress[0], kUartAddress[1],
-                 boot_words::kStrX0X1, boot_words::movz(0U, 0x6BU), boot_words::kStrX0X1,
-                 boot_words::kStrX0X1Off8,  // str x0, [x1, #8]: outside DR
-                 boot_words::movz(0U, 0x4U), boot_words::kStrX0X1});
-  const TempImage file(image);
+  // 'o' 'k' to the real PL011, in order, byte-for-byte, then SYSTEM_OFF.
+  // The driver must raise x1 to the UART base before any register access;
+  // a fresh vCPU boots with every register zero, so the address load comes
+  // first. The write at offset 8 (FR, read-only) sits between them and must
+  // leave no trace, and a DR read (empty RX) must neither trap nor print.
+  std::vector<uint32_t> words = kUartAddress;
+  const std::vector<uint32_t> en = uart_enable();
+  words.insert(words.end(), en.begin(), en.end());
+  words.push_back(boot_words::movz(0U, 0x6FU));
+  words.push_back(boot_words::kStrX0X1);
+  words.push_back(boot_words::movz(0U, 0x6BU));
+  words.push_back(boot_words::kStrX0X1);
+  words.push_back(boot_words::kStrX0X1Off8);  // str x0, [x1, #8]: a silent FR write
+  words.push_back(boot_words::kLdrX0X1);      // ldr x0, [x1]: empty RX reads 0
+  const std::vector<uint32_t> off = psci_off();
+  words.insert(words.end(), off.begin(), off.end());
+  const TempImage file(raw_image(words));
   ASSERT_TRUE(file.ok());
   const Captured r = capture_cli({"boot", "-kernel", file.path()});
   EXPECT_TRUE(r.exited);
-  EXPECT_EQ(r.out, "ok");
   EXPECT_EQ(r.code, 0);
+  EXPECT_EQ(r.out, "ok");
 }
 
-TEST_F(CliBootTest, BootUartRegistersReadAsZero) {
-  // Reading DR must not trap and must not stop the guest: load through the
-  // UART address, then exit normally. The stopgap contract is "every register
-  // reads 0"; M4a's PL011 will refine FR, guests must not care.
-  const std::vector<uint8_t> image =
-      raw_image({kUartAddress[0], kUartAddress[1], boot_words::kLdrX0X1,
-                 boot_words::movz(0U, 0x4U), boot_words::kStrX0X1});
-  const TempImage file(image);
+TEST_F(CliBootTest, BootUartResetStateReadsClean) {
+  // Reading DR at reset must not trap and must not stop the guest: the PL011
+  // answers 0 (RX FIFO empty). The exit travels the real protocol.
+  std::vector<uint32_t> words = kUartAddress;
+  const std::vector<uint32_t> en = uart_enable();
+  words.insert(words.end(), en.begin(), en.end());
+  words.push_back(boot_words::kLdrX0X1);  // ldr x0, [x1] -> 0, no trap
+  const std::vector<uint32_t> off = psci_off();
+  words.insert(words.end(), off.begin(), off.end());
+  const TempImage file(raw_image(words));
   ASSERT_TRUE(file.ok());
   const Captured r = capture_cli({"boot", "-kernel", file.path()});
   EXPECT_TRUE(r.exited);
@@ -393,19 +457,23 @@ TEST_F(CliBootTest, BootDefaultEntryIsTheImageBase) {
   // The image parks at word zero: reaching the park proves the default entry
   // is 0x40080000, and the budget burning down proves it is NOT -- the exit
   // code is what distinguishes the two.
-  const std::vector<uint8_t> parked =
-      raw_image({boot_words::kBSpin, boot_words::movz(0U, 0x4U), kUartAddress[0],
-                 kUartAddress[1], boot_words::kStrX0X1});
+  std::vector<uint32_t> tail = psci_off();
+  tail.push_back(boot_words::kBrk0);
+  std::vector<uint32_t> words = {boot_words::kBSpin};
+  words.insert(words.end(), tail.begin(), tail.end());
+  const std::vector<uint8_t> parked = raw_image(words);
   const TempImage file(parked);
   ASSERT_TRUE(file.ok());
   EXPECT_EQ(capture_cli({"boot", "-kernel", file.path(), "--max-insns", "4096"}).code, 3);
 }
 
 TEST_F(CliBootTest, BootEntryOverrideSkipsThePark) {
-  // Same image as above, entered one instruction in: the sentinel now runs.
-  const std::vector<uint8_t> parked =
-      raw_image({boot_words::kBSpin, boot_words::movz(0U, 0x4U), kUartAddress[0],
-                 kUartAddress[1], boot_words::kStrX0X1});
+  // Same image, entered one instruction past the park: SYSTEM_OFF now runs.
+  std::vector<uint32_t> tail = psci_off();
+  tail.push_back(boot_words::kBrk0);
+  std::vector<uint32_t> words = {boot_words::kBSpin};
+  words.insert(words.end(), tail.begin(), tail.end());
+  const std::vector<uint8_t> parked = raw_image(words);
   const TempImage file(parked);
   ASSERT_TRUE(file.ok());
   const Captured r = capture_cli({"boot", "-kernel", file.path(), "--entry", "0x40080004"});

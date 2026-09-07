@@ -70,3 +70,146 @@ scripts/qemu-oracle.sh build/guest/psci_off.bin PSCI-OK --expect-exit 0
   与 ID 审计（M4b 内）交叉核对 `/cpus`、`/psci` 节点值。
 - earlycon 不出字节的排障顺序：boot 协议（x0=DTB PA）→ UART MMIO →
   早期异常向量；L3 门天然把这三者拆成可独立排查的链路。
+
+## 实现决策（动工前定稿，2026-09-07）
+
+D-M4a-1 **模块与头**：三模块 `src/dev/pl011.c`、`src/fdt/fdt.c`、
+  `src/kernel/image.c`，公共头 `include/oemu/{pl011,fdt,image}.h`
+  （vcpu/boot 都要装配，属公共 API）；纯函数决策进各自
+  `<module>_internal.h`。
+
+D-M4a-2 **PL011 寄存器面（oracle 实测修订，tests/guest/pl011_probe.S
+  @ QEMU 10.2.1）**：偏移与语义逐字抄 QEMU hw/char/pl011.c 的可观测面：
+  DR/FR/ILPR/IBRD/FBRD/LCR_H/CR/FIFLS/INTIM(=IMSC)/ICR/IMSC(ro
+  alias)/RIS/MIS/DMACR*；PID@0xFE0.. = 0x11,0x10,0x14,0x00（**实测**
+  ——教科书 0x34 是 QEMU 不实现的），PCL@0xFD0.. 全 0；其余偏移读 0
+  写忽略（不发 Data Abort）。复位值实测：FR=0、**CR=0x90
+  (TXE|LOOPBACK)**、FIFLS=0、RIS=0。TX：写 DR **无条件透传**（实测：
+  CR=0x00/UARTEN=0 时写的 'A' 照样出现——QEMU 透传不看使能位；
+  LOOPBACK=1 时 TX 字节同时回环 RX 环）。原"TX 使能门控丢弃"决策
+  **作废**——实证观察 4 的丢弃只对 host→guest RX 方向成立。RX：
+  `oemu_pl011_inject(dev, byte)`：RXE/UARTEN 关闭 → OEMU_ERR_STATE
+  （调用方丢字节），16 项环满 → OEMU_ERR_FULL；注入置 RIS.RXIS。
+  中断面：RIS/IMSC/MIS(=RIS&IMSC)/ICR(写1清)/INTIM(写1清全 RIS，抄
+  QEMU)；irq 电平 `oemu_pl011_irq_level()` 查询，M4b 前无人拉线。
+  TX 环 16 项预嵌入结构体（零分配）；泵 `oemu_pl011_pump` 由 boot
+  每轮调用排空到 sink（stdout 或测试捕获器）。
+
+D-M4a-3 **FDT builder**：单缓冲 append-only API：`begin_node/prop_u32/
+  prop_u64list/prop_str/...` + `finish` 产出 blob 长度；容量 init
+  预分配（seam），满返回 OEMU_ERR_NO_MEMORY 对象完好；字符串去重表
+  可选（先不去重，正确性优先）。生成器必须可自反读（配套
+  `oemu_fdt_internal_get` 微型 reader 供测试对照与 boot 自检）。
+
+D-M4a-4 **DTB 布局与 QEMU virt 对齐**（oracle：10.2.1 dumpdtb 实测，
+  存 `build/m4-oracle/virt.dts`，不入库）：root compatible
+  "linux,dummy-virt" #a/#s=2；memory@40000000（device_type=memory）；
+  cpus/cpu@0（cortex-a53，reg=0）；intc@8000000（arm,cortex-a15-gic，
+  reg 双帧，#interrupt-cells=3，interrupt-controller）；timer（arm,
+  armv8-timer，4×PPI 13/14/11/10 flags 0x104，always-on）；psci
+  （arm,psci-1.0，**method="hvc"** 与 QEMU virt virtualization=off
+  一致——roadmap 写 "SMC conduit" 与此冲突，按 P2 实证优先取 hvc，
+  psci_off.S 本身探测 DT 选路不受害）；pl011@9000000（interrupts =
+  0 1 4 → SPI 33，clocks=<&osc>，配套 fixed-clock 24MHz osc@8000000?
+  ——时钟节点用 QEMU 同构 osc24m）；chosen（stdout-path、bootargs=
+  -append 值）。phandle 自有小编号（1=intc、2=cpu、3=osc），不抄 QEMU
+  编号——自洽即可。
+
+D-M4a-5 **DTB 路线（2026-09-07 用户拍板，方案 B）**：QEMU 的
+  `--append dtb` 生成 + `-dtb` 覆盖使 boot 路径**不需要运行时 builder**。
+  M4a boot 使用**提交的参考 blob**（tests/fixtures/boot.dtb：由
+  build/m4-oracle/virt.dtb 裁剪——memory/psci/chosen/aliases 改写为
+  oemu 布局后交 dtc 重编与再校验）；`oemu boot -dtb <file>` 覆盖可用；
+  `include/oemu/fdt.h`/`src/fdt` 保留为内部工具（builder 与 reader）。
+  ~~互操作差异~~ **谜底已揭**（2026-07，对照 dtc 1.7.2 源码）：v17 头必须
+  在 0x20/0x24 写入 `size_dt_strings`/`size_dt_struct`（非零）、
+  `last_comp_version`@0x18=16；空 rsvmap 为 16 字节（8 字节终止条目 +
+  8 字节对齐 pad，rsv@0x28、struct@0x38）；PROP 体词序 dlen 先、nameoff
+  后。builder 按此重写后 dtc/fdtget 全量校验通过，互操作恢复；boot DTB
+  仍用 fixture（dtc 编 .dts），builder 保留备用。
+
+D-M4a-6 **Image loader**：头 64B（booting.rst）：magic `ARM\x64`@0x38
+  LE、text_offset@0x8、image_size@0x10（LE64）、flags@0x30。拒绝矩阵
+  全部 `oemu_status`：bad magic→INVALID_IMAGE、flags 要求的
+  PAGE_SIZE(4K=bit0)/PHYS(LE=bit1)/KASLR(bit2→**接受并忽略**，我们
+  永不重定位？不：诚实拒绝 KASLR 位?tinyconfig 不带——拒绝并注因)、
+  BE(bit3)→拒绝、image_size≤0 或 >ram→REFUSE。text 读入
+  `mem_base+0x40080000? 不：**加载 PA = mem_base + text_offset**，
+  entry = 该 PA（booting.rst：text_offset 相对加载基址；QEMU 加载
+  0x40080000 = base+0x80000 与此一致）。initrd（M5）预留参数位。
+
+D-M4a-7 **oemu boot 参数面**：`-kernel <img>`（必填）、`-append
+  "<cmdline>"`（进 chosen/bootargs）、`-m <MiB>`（默认 256）、`-dtb
+  <file>`（外部 DTB 覆盖生成器）、`--serial <path>`（TX 落盘；缺省
+  stdout）。`--smp` 拒绝并注 M4b+。旧 `--entry` 保留（覆盖 loader
+  推导值）。
+
+D-M4a-8 **PSCI 最小拦截（仅够 psci_off 门）**：exec 的 HVC/SMC 分支
+  先过 env 的新 seam `fw_call`（有则消费，无则走现有异常）；boot 装
+  psci-driven env。功能面：0x84000000 VERSION → **0x00010001（实测
+  QEMU 10.2.1 probe：PSCI-VER=00010001，M4b 卡的 0x00020000 作废
+  ——oracle 说了算）**；0x84000002 SYSTEM_OFF / 0x84000003 SYSTEM_RESET
+  → 置 halted（boot 循环看到 halted → exit 0 / 重启）；CPU_ON(0xC4000003)/
+  CPU_OFF(0x84000002)…M4b 扩，本版回 NOT_SUPPORTED(-1)。conduit：
+  DTB 写 method="smc" 并接 SMC——QEMU 的 hvc 由它的 EL3 固件实现，
+  oemu 无 EL3，直接以 SMC 拦截履行同一契约（guest 探测 DTB 自选，
+  两端可观测行为一致：exit 0）；probe 资产冻结不动。住 `src/fw/
+  psci.c`。
+
+D-M4a-9 **TX 策略与 EOT 退役**：M2c stopgap UART 与 EOT sentinel 随
+  `oemu boot` 改造一并删除——psci_off 门用真 PSCI SYSTEM_OFF 停机，
+  不再需要魔法字节；el1_smoke.bin 的 EOT 依赖改由 PL011 + HVC
+  SYSTEM_OFF 重编（guest 资产同步改，oracle 重验）。
+
+## 完工记录（2026-09-08，实现落地）
+
+模块与参数面按 D-M4a 全部落地：`src/dev/pl011.c`、`src/fdt/fdt.c`、
+`src/kernel/image.c`、`src/fw/psci.c`、`src/main.c` 的 `oemu boot` 重写。
+
+### 验收门实测（本机，debug preset）
+
+```
+ctest -R 'Pl011|Fdt|Image|Boot'            100% (95)，仅 FdtTest.DtcAgrees... 跳过（dtc 不在 PATH，属既有跳过语义）
+make test                                 100% (811)
+make asan                                 100% (811)   ASan+UBSan 全过
+make format-check                         我的文件全绿；唯一命中 bench/corpus/k_addsub.c（本机 clang-format 21.1.8 与 CI 版本漂移，非本次改动，依既有约定不动语料）
+make tidy                                 exit 0（告警类别与既有 mmu.c/fdt.c 同类，非 -Werror）
+```
+
+L3 全链 e2e（本机）：
+
+```
+oemu boot -kernel build/guest/psci_off.bin --max-insns 5000000
+  → PSCI-OK
+  → PSCI-SMC
+  → exit 0
+```
+
+boot → 装载 fixture DTB（x0=0x60000000，运行时校验 magic/totalsize）→
+guest 探测 /psci method → PL011 打出 PSCI-OK/PSCI-SMC → SMC VERSION 协商
+→ SMC SYSTEM_OFF(0x84000002) 被 boot_fw_call 消费 → powerdown(0) → exit 0。
+
+### 新增测试（用例只增不减）
+
+- `tests/support/image_builder.h`：逐字节 booting.rst Image 头/文件构造器（elf_builder 模式）。
+- `tests/unit/test_image.cpp`（INTERNAL）：parse 接受矩阵（每 LE 页大小、text_offset 0..2MiB-1、size=0）、拒绝矩阵（坏 magic、非分支 code0、每个 BE 位→UNSUPPORTED、未对齐/≥2MiB offset）、load 到真机总线读回、截断→FORMAT、超 RAM→RANGE、NULL→INVALID_ARG、真实 psci_off.bin 装载（缺则跳过）。
+- `tests/unit/test_image_check.cpp`（death）：`phys->write==NULL` 触发 OEMU_REQUIRE。
+- `tests/unit/test_pl011.cpp`（INTERNAL，经 aspace MMIO 驱动）：复位面（CR=PL011_CR_RESET、FR=0、DR 空读 0）、PID 11/10/14/00、PCL 全 0、未实现偏移静默；TX 无条件透传、按序排空、满环丢最旧计数；BUSY/TXFE 翻转；RIS.TIEM 置位、RIS 写忽略、ICR 清位；irq 电平随 mask；RX 注入未使能→STATE、注入读回退休 RLIS、满环→FULL；loopback 回环；配置寄存器往返。
+- `tests/unit/test_pl011_check.cpp`（death）：init/pump/irq_level 的 NULL 契约。
+- `tests/unit/test_cli.cpp` Boot 面按真协议重写（真 Image 头 + SYSTEM_OFF/BRK 终止 + 复位态断言）。
+
+### 与设计的偏差（实证驱动）
+
+1. **TX 环 16 → 64**（`include/oemu/pl011.h`）：模型在 run-loop 切片边界才排空 TX，一段未泵出的 guest banner 会静默丢最旧字节；64 容纳横幅，溢出丢最旧仍作最后防线并计数。
+2. **guest probe 重写为健壮版**：`tests/guest/psci_off.S` 的 FDT walk 改为 do-while 边界检查 + 立即数比较（去掉热循环里的 `adr str` 与无界名字解引用——旧版在 oemu 精确异常下 data-abort，QEMU 平坦地址空间侥幸容忍）。probe 现对 method="smc"/"hvc" 均正确解析；committed fixture 为 smc，e2e 门走 SMC。
+3. **el1_smoke.S 退出协议改 PSCI SYSTEM_OFF**（D-M4a-9 兑现）：加 `.balign 0x1000` 使 Image 头 text_offset 与文件自洽，EOT sentinel 退役。
+4. **`raw_image`/Image 头字段偏移修正**：boot 测试的字节构造头此前把 magic 放到 0x30；按 booting.rst 校正到 0x38，text_offset 取 0x80000（钉默认入口 0x40080000）。
+5. **boot 增加 entry 越 RAM 拒绝**：`--entry` 落在 RAM 窗外时按 caller 错误 exit 1，而非让 guest 在无主地址上取指崩溃。
+6. **CR 复位值钉模型常量**：test_pl011 断 `PL011_CR_RESET`（代码实测 TXE|LBE）；本卡片正文 "0x90" 为早期笔误，以实现与 oracle 一致的常量为准。
+
+### 不变量复核
+
+- [x] 设备回调零分配；TX/RX 环预嵌入结构体（`oemu_pl011` 内联数组）。
+- [x] 未实现 MMIO 偏移行为成文：读返 0、写忽略、绝不 Data Abort（pl011_read/write default 分支 + 注释）。
+- [x] loader 拒绝路径全部 `oemu_status`，半加载前返回（parse 先于任何 bus 写）。
+- [x] boot 全路径 `goto done` 统一 fclose/free/dispose，无泄漏（clang-analyzer 的 `serial!=stdout` 守卫为误报）。

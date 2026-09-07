@@ -3,10 +3,10 @@
  *
  * Boots at EL1 (exactly as `oemu boot` and `qemu -kernel` deliver one), arms
  * the EL1 vector table, takes and returns from an SVC, prints the "BOOT-OK"
- * marker on the stopgap UART, and exits: a sentinel write powers oemu off
- * (exit code 0); under the QEMU oracle that write is invisible, so the guest
- * falls through to BRK #0 and parks -- the oracle runner timeout-kills after
- * the markers are on the wire, the same ending mmu_smoke.S already uses.
+ * marker on the PL011, and exits over the PSCI conduit: an SMC SYSTEM_OFF
+ * powers the machine down for a clean exit 0 under both oemu and the QEMU
+ * oracle (each serves the call itself). A BRK/park below is only a dead-man's
+ * switch for a platform that somehow does not answer the SMC.
  *
  * The point is the round trip, not the program: reaching "BOOT-OK" proves
  * EL1 entry, VBAR plumbing, SVC delivery, ELR/ERET return and the UART write
@@ -31,15 +31,18 @@
 _start_of_image:
 	b	_start                       /* +0x00 code0: branch to the entry */
 	.word	0                            /* +0x04 code1 (unused) */
-	.quad	0x80000                      /* +0x08 text_offset: 4K/39-48-bit */
-	.quad	_image_end - _start_of_image /* +0x10 image_size (LE bytes) */
+	.quad	0x1000                       /* +0x08 text_offset: 4K-aligned, inside the file */
+	.quad	_image_end - _start_of_image /* +0x10 image_size (LE bytes, whole file) */
 	.quad	0x2                          /* +0x18 flags: LE, 4K pages (bits1-2=01) */
 	.quad	0                            /* +0x20 reserved */
 	.quad	0                            /* +0x28 reserved */
 	.quad	0                            /* +0x30 reserved */
 	.word	0x644d5241                   /* +0x38 magic "ARM\x64" */
 	.word	0                            /* +0x3c pad to the 64-byte header */
-
+	/* The header advertises text_offset 0x1000, so the file must actually
+	 * carry its text at that byte offset: materialise the pad or a strict
+	 * loader (booting.rst) sees text_offset past the end of the file. */
+	.balign	0x1000
 _start:
 	/* Stack below the image (0x4007F000 is untouched RAM; the print helpers
 	 * are non-leaf and must spill x30). Same choice as mmu_smoke. */
@@ -80,14 +83,17 @@ _start:
 	adr	x0, str_ok
 	bl	puts
 
-	/* Exit protocol (task card): sentinel byte 0x04 (EOT) to the UART data
-	 * register. oemu's stopgap device turns it into a machine powerdown;
-	 * QEMU's PL011 just swallows the byte, which is exactly as planned --
-	 * the BRK below is the oracle-side ending. */
-	movz	x1, #0x0000
-	movk	x1, #0x0900, lsl #16
-	mov	w0, #0x04
-	strb	w0, [x1]
+	/* Exit protocol (M4a): the PSCI conduit, not a UART sentinel. Negotiate
+	 * the version then issue SYSTEM_OFF (0x84000002) over SMC -- the same
+	 * contract `oemu boot` answers and the kernel obeys. Under the QEMU
+	 * oracle the SMC is served by its own PSCI emulation and the machine
+	 * powers down there too; the BRK/park below is only a dead-man's switch. */
+	movz	x0, #0x0
+	movk	x0, #0x8400, lsl #16     /* 0x84000000 PSCI_VERSION */
+	smc	#0
+	movz	x0, #0x2
+	movk	x0, #0x8400, lsl #16     /* 0x84000002 SYSTEM_OFF */
+	smc	#0
 
 	brk	#0
 	/* Fall through to the park anyway: if the BRK vector runs, it parks too. */
