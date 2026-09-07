@@ -16,6 +16,7 @@
 #define OEMU_SRC_MMU_INTERNAL_H
 
 #include "oemu/macros.h"
+#include "oemu/mmu.h"
 #include "oemu/status.h"
 
 #include <stdbool.h>
@@ -113,6 +114,8 @@ typedef struct oemu_mmu_desc {
   bool table;       /* bits [1:0] == 0b11 (only meaningful at levels 0..2) */
   bool block_page;  /* bits [1:0] == 0b01 */
   uint64_t address; /* bits [47:12], address-size-checked by the caller */
+  bool ng;          /* bit [11]: not-global (stored for the TLB tag; nothing
+                     * compares it yet -- oemu invalidates wholesale) */
   bool af;          /* bit [10] */
   unsigned ap;      /* bits [7:6]: AP[2] in bit 1, AP[1] in bit 0 */
   bool xn;          /* bit [54] (UXN) */
@@ -135,6 +138,42 @@ uint32_t oemu_mmu_internal_table_attrs(uint64_t descriptor);
 /* The 64-bit VA-indexed offset into a 4 KiB, 8-byte-entry table at `level`
  * (0..3), already shifted to bit 3: the caller ORs it onto the table base. */
 uint64_t oemu_mmu_internal_index(uint64_t va, unsigned level);
+
+/* --- the TLB's white-box surface (M3b) ---------------------------------------
+ *
+ * The parity test needs the walk with the cache bypassed, and the decision
+ * tables need to see what the cache actually stored. Both go here, not
+ * through the public header: they observe the layer, they are not what a
+ * caller builds on.
+ */
+
+/* TLB entry flag bits (the oemu_tlb_entry.flags packing). */
+#define OEMU_TLB_NG  0x01U
+#define OEMU_TLB_AP  0x06U /* shifted right by 1: the two-bit AP field */
+#define OEMU_TLB_XN  0x08U
+#define OEMU_TLB_PXN 0x10U
+
+/*
+ * One full translation with the TLB bypassed in both directions -- no
+ * lookup, no fill, no counters, no epoch side effects: exactly the
+ * function the cache is only allowed to have memorised. The parity test
+ * compares this against the served path access by access. `cur` is the
+ * executing EL (the public entry derives it from PSTATE; tests that probe
+ * both ELs pass it directly). Same return convention as
+ * oemu_mmu_translate.
+ */
+OEMU_NODISCARD oemu_status oemu_mmu_internal_walk(const oemu_mmu *mmu, uint64_t va, oemu_el cur,
+                                                  bool is_write, bool is_fetch,
+                                                  uint64_t *pa_out, oemu_mmu_fault *fault_out);
+
+/*
+ * The entry at one set (index = VA[23:12] >> 12 % entries -- just the
+ * index number, 0..OEMU_MMU_TLB_ENTRIES-1). False when the slot is free.
+ * Lets the decision tables pin the tag layout itself: which fields a fill
+ * stores, what survives at which level, and that an evicted slot is empty
+ * rather than stale.
+ */
+bool oemu_mmu_internal_tlb_peek(const oemu_mmu *mmu, unsigned index, oemu_tlb_entry *out);
 
 OEMU_END_DECLS
 

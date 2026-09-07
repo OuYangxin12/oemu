@@ -316,6 +316,15 @@ oemu_add_test(test_mmu
   LABELS unit
 )
 
+# M3b parity: every served answer against the bypassed walk -- the cache
+# may only be faster. It needs the internal bypass and the peek, so it is
+# a whitebox target; the suite names carry "Tlb" for -R Tlb.
+oemu_add_test(test_mmu_parity
+  SOURCES unit/test_mmu_parity.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
 # Reaches into src/mmu/mmu_internal.h: the DFSC table, the walk geometry,
 # the permission matrix, and the syndrome composition.
 oemu_add_test(test_mmu_internal

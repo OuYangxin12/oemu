@@ -325,9 +325,27 @@ TEST(SysAction, DcZvaIsImplementedFirst) {
   EXPECT_EQ(oemu_exec_internal_sys_action(Sel(3, 7, 4, 1)), OEMU_EXEC_SYS_DC_ZVA); /* 0x1BA1 */
 }
 
-TEST(SysAction, TlbiSpaceIsNoop) {
-  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 8, 7, 0)), OEMU_EXEC_SYS_NOP); /* vmalle1 */
-  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 8, 3, 0)), OEMU_EXEC_SYS_NOP);
+TEST(SysAction, TlbiSpaceInvalidatesSinceM3b) {
+  /* M3a classified these as NOP ("no TLB yet"); M3b grew the TLB and an
+   * invalidation request must invalidate. Every encoding in the space
+   * answers with the whole cache -- flush-all is the honest superset of
+   * every subset until precise invalidation lands. */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 8, 7, 6)), OEMU_EXEC_SYS_TLBI); /* vmalle1is */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 8, 7, 4)), OEMU_EXEC_SYS_TLBI); /* alle1is */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 8, 7, 0)), OEMU_EXEC_SYS_TLBI); /* aside1is */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 8, 7, 1)), OEMU_EXEC_SYS_TLBI); /* vae1is */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 8, 3, 0)), OEMU_EXEC_SYS_TLBI); /* vmalle1 */
+  /* The EL2-owned banks and the stage-2 space: oemu has no EL2 or stage 2,
+   * and the CRn 9 encodings' effect on stage-1 entries is covered by
+   * flush-all exactly as before. */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(1, 8, 7, 4)), OEMU_EXEC_SYS_TLBI); /* alle2is */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 9, 7, 1)), OEMU_EXEC_SYS_TLBI); /* s12e1is */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 9, 7, 4)),
+            OEMU_EXEC_SYS_TLBI); /* alle1is, s12 bank */
+  /* Outside the window the answer stayed what it was before M3b: an op1
+   * the space does not define falls past every window to Undefined. */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(3, 8, 7, 1)), OEMU_EXEC_SYS_TRAP);
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(6, 8, 7, 6)), OEMU_EXEC_SYS_TRAP);
 }
 
 TEST(SysAction, IcAndDcMaintainanceIsNoop) {

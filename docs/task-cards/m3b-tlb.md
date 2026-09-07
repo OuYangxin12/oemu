@@ -94,12 +94,18 @@ make test && make asan && make format-check && make tidy
 
 ## 不变量复核（P4，合入前打勾）
 
-- [ ] 纯 C11；TLB 存储嵌值零分配；查询/命中路径不碰 allocator seam
-- [ ] 零分配步进不变量扩展到 TLB 查询路径
-- [ ] flush 是全有或全无：被拒绝/未触发的维护操作不留残余状态
-- [ ] 随机扫描固定种子，失败可复现（LCG 显式编码，不用 rand()）
-- [ ] `make test` / `make asan` / `make format-check` / `make tidy` 全绿
-- [ ] M3a 用例零改动零失败（`-R Mmu` 全量回归）
+- [x] 纯 C11；TLB 存储嵌值零分配；查询/命中路径不碰 allocator seam
+- [x] 零分配步进不变量扩展到 TLB 查询路径（test_vcpu 的 tracking-allocator
+  TearDown 在 TLBI e2e 用例下仍断零分配）
+- [x] flush 是全有或全无：被拒绝/未触发的维护操作不留残余状态
+- [x] 随机扫描固定种子，失败可复现（LCG 显式编码，不用 rand()）
+- [x] `make test` / `make asan` / `make format-check` / `make tidy` 全绿
+      （format-check 仅剩 k_addsub.c 的 LLVM-18/21 既有漂移，与本卡无关）
+- [x] M3a 用例零改动零失败——**有记录偏差**：断言与期望值一字未改，但
+  三处原地改表用例（UserPageGatesEl0ByAp / XnAndPxnGateOnly... /
+  TableConstraints...）在描述符改写后补了 `tlbi()`——带 TLB 后改写活映
+  射必须 break-before-make，这是架构要求的合法序列；判定表用例
+  TlbiSpaceIsNoop → TlbiSpaceInvalidatesSinceM3b 是本卡的刻意行为变更。
 
 ## 风险与回退
 
@@ -112,4 +118,20 @@ make test && make asan && make format-check && make tidy
 
 ## 完工记录（P6：只写实际跑过的）
 
-- （随实现回填）
+- 实现：`mmu.c` translate 前端（epoch 5 元组值比较 → flush-all；TBI 剥
+  标签后按页基址键/值入表；命中用存储输入重跑 `permits`，parity 结构性
+  成立）；`exec.c` TLBI 窗口（CRn 8/9，op1∈{0,1,2,4}）→ SYS_TLBI →
+  `oemu_mmu_flush_all`；`mmu_internal.h` 增 `oemu_mmu_internal_walk` 纯
+  旁路与 `oemu_mmu_internal_tlb_peek`。
+- 调试记录：split-page 用例揪出真 bug——fill 存页对齐 key 却存带偏移
+  的完整 pa，命中回吐他字节的偏移；修为键值同粒度、命中重加当前偏移。
+- `make test`：743/743，100%（735 + parity 4 + MmuTest 3 + vcpu e2e 1）。
+- `make asan`：743/743，100%。
+- `ctest -R Tlb`：9/9；`ctest -R Mmu`：70/70（均 100%）。
+- `make format-check`：本卡文件全部干净；仅 `bench/corpus/k_addsub.c`
+  存在与本卡无关的本地 LLVM-21 vs CI LLVM-18 既有漂移（不触碰）。
+- `make tidy`：0 errors（20130 条 suppression 计数为 gtest 噪音既有口径）。
+- parity 扫描实跑命中 409 次/miss 数千——非空洞验证成立。
+- 已知边界：TLBI 全编码 → flush-all（超集语义）；nG/asid/vmid 存为标
+  签位但暂不参与判定（无 ASID 精确失效、无 stage-2）；块叶按 4K 页粒度
+  缓存（合法，只是密度低）。
