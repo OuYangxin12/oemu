@@ -355,8 +355,13 @@ TEST(SysAction, IcAndDcMaintainanceIsNoop) {
   EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 7, 10, 6)), OEMU_EXEC_SYS_NOP); /* dc cgdsw */
 }
 
-TEST(SysAction, AddressTranslateTraps) {
-  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 7, 8, 0)), OEMU_EXEC_SYS_TRAP); /* at s1e1r */
+TEST(SysAction, AddressTranslate) {
+  /* Stage-1 address translate (S1E*, op1 == 0) is honoured: it walks and
+   * publishes PAR_EL1. Stage-2 (S12E*, op1 == 4) has no stage-2 here, so it
+   * stays Undefined rather than lying about PAR_EL1. */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 7, 8, 0)), OEMU_EXEC_SYS_AT);   /* at s1e1r */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 7, 8, 1)), OEMU_EXEC_SYS_AT);   /* at s1e1w */
+  EXPECT_EQ(oemu_exec_internal_sys_action(Sel(0, 7, 8, 2)), OEMU_EXEC_SYS_AT);   /* at s1e0r */
   EXPECT_EQ(oemu_exec_internal_sys_action(Sel(4, 7, 8, 6)), OEMU_EXEC_SYS_TRAP); /* at s12e0r */
 }
 

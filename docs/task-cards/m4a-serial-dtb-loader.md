@@ -213,3 +213,53 @@ guest 探测 /psci method → PL011 打出 PSCI-OK/PSCI-SMC → SMC VERSION 协�
 - [x] 未实现 MMIO 偏移行为成文：读返 0、写忽略、绝不 Data Abort（pl011_read/write default 分支 + 注释）。
 - [x] loader 拒绝路径全部 `oemu_status`，半加载前返回（parse 先于任何 bus 写）。
 - [x] boot 全路径 `goto done` 统一 fclose/free/dispose，无泄漏（clang-analyzer 的 `serial!=stdout` 守卫为误报）。
+
+### L3 真内核引导进展（本轮，linux-6.6.156 tinyconfig Image）
+
+目标：真内核 earlycon 打 "Booting Linux"。oracle（QEMU virt 同一
+Image+DTB）确认能出横幅并跑到 "No working init"（无 initrd，预期）。
+
+本轮为把 oemu 推到"真能在自己 MMU 下建页表、读 ID/调试寄存器、跑通用
+定时器、进 earlycon"而落地的**正确且必要**的修复：
+
+- `src/mmu/mmu.c`：walk 分派改为**按层级**——type 0b11 在 level 0..2
+  是表、在 level 3 是 4KiB **页**（旧实现把 0b11 一律当表，于是内核
+  每一条真实 L3 PTE 都被判成坏表 → fixmap/vmalloc 全崩）。配套把
+  `MmuTest.TableDescriptorBelowThePageLevelFaults` 更正为
+  `LastLevelTableBitsResolveAsAPage`（末级 0b11=页，spec 正解）。
+- AT（地址翻译）：`OEMU_EXEC_SYS_AT`（stage-1 S1E*，op1==0）执行真
+  走表并写 `PAR_EL1`（`.get` 行，sel 0x03a0）；stage-2 S12E*(op1==4)
+  仍诚实 Undefined。`VcpuTest` 的 AT 用例由"Trap Undefined"更正为
+  "publishes PAR_EL1"。内核 `at s1e1r; mrs par; tbnz par,#0` 探测路
+  由此打通。
+- `src/dev/pl011*`：寄存器面按 TRM/驱动更正（FR.TXFE=0x80、TXFF=0x20，
+  删幻影 INTMASKSET/CLR）——早期 earlycon 轮询 FR 的两条 while 需要
+  正确 TXFE/TXFF 才不死锁。
+- 通用定时器（M4b 的最小子集，boot 必需）：CNTFRQ/CNTPCT/CNTVCT/
+  CNTVOFF/CNTP_CTL/CVAL/TVAL/CNTKCTL sysreg 行 + `oemu_sysregs.cntvct`
+  随步进的计数器（`src/vcpu/vcpu.c`）。没有 CNTVCT，内核
+  `__delay_cycles`/calibrate 的忙等会因未定义而**无限自旋**卡死早期引导。
+- ID/调试寄存器：ID_AA64PFR1/2、ZFR0、SMFR0、DFR1/2、AFR0、ISAR2..5、
+  MMFR2/3 与 MDSCR_EL1 以 F_WI（读 0/忽略写）入表，内核启动探测不再 trap。
+- `src/kernel/image.c`+`image_internal.h`：Image 头按 booting.rst 重写
+  （接受 BTI 头式 0xd503201f；endian bit0 + pages 字段 [2:1]；16K/64K
+  诚实 UNSUPPORTED）。`tests/support/image_builder.h`/`test_image.cpp`
+  随此 spec 更正（LE 16K/64K 现期望 UNSUPPORTED；镜像 flag 镜像用例改写）。
+- `src/decode`+`src/exec`：`MSR #imm`（SPSel/DAIF，`OEMU_OP_MSR_IMM`
+  +`do_msr_immediate`）与 PRFM/字面量 load 的 HINT no-op 化。内核早期
+  `msr daifset/daifclr` 必需。
+
+门禁：`make test`/`make asan` 100%（811）；`make format-check` 我的文件
+全绿（唯 bench/corpus/k_addsub.c 本机 clang-format 版本漂移，属既有，不动
+语料）；`make tidy` exit 0。
+
+**L3 门仍未闭合**（诚实记录）：内核已在 oemu 下深跑到 printk/panic
+路径，但**未打出横幅**。当前卡点是内核自身早期页表构造里的一处 oops
+级联——首个异常是 `__create_pgd_mapping` 处一条 `WARN_ON((phys^virt)
+& ~PAGE_MASK)`（可存活），随后内核在 `prb_reserve`（printk 环形缓冲
+预约）处踩 **level-1 translation fault**（FAR=0x802d88b0，随迭代递增）：
+printk 的 log buffer 指针处在一个未被任何页表覆盖的低位 VA，于是每次
+printk 自陷 → oops 再陷 → 最终停在 `panic()` 的忙等（tx_emitted=0）。
+根因指向 oemu 对内核早期自身结构的仿真保真度仍有缺口（怀疑与线性映射
+/ 内核写回读一致、或早期映射被上述 WARN 跳过的组合有关），属 M4b 量级
+（GIC/timer-IRQ/更忠实 paging）的工作，非单点可修，故本轮如实记录为未完。

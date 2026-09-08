@@ -48,6 +48,7 @@
 #include "oemu/psci.h"
 #include "oemu/status.h"
 #include "oemu/sysenv.h"
+#include "oemu/sysreg.h"
 #include "oemu/vcpu.h"
 
 #include <errno.h>
@@ -471,6 +472,42 @@ static int dtb_load(const char *path, unsigned char **bytes, size_t *len) {
  * acts. A separate function so `boot` itself keeps the goto-clean shape the
  * project's -Wjump-misses-init demands of functions with a cleanup label.
  */
+/* Where the guest was when we gave up. A boot emulator that cannot say
+ * "the guest is stuck at PC 0x..., having taken an exception with this
+ * syndrome" is only half a debugger, and a hang is the single most common
+ * early-boot failure -- so the timeout path reports the architectural
+ * context (PC, EL, and the EL1 exception latch) rather than just a count. */
+static void boot_sysrd(const oemu_vcpu *vcpu, uint32_t sel, uint64_t *out) {
+  const oemu_status st = oemu_sysreg_read(&vcpu->sysregs, sel, out);
+  (void)st;
+}
+
+static void boot_hang_report(const oemu_vcpu *vcpu, const char *why, uint64_t insns) {
+  uint64_t el = 0U;
+  uint64_t elr = 0U;
+  uint64_t esr = 0U;
+  uint64_t far = 0U;
+  uint64_t spsr = 0U;
+  uint64_t sctlr = 0U;
+  uint64_t midr = 0U;
+  boot_sysrd(vcpu, OEMU_SYSREG_CURRENT_EL, &el);
+  boot_sysrd(vcpu, OEMU_SYSREG_ELR_EL1, &elr);
+  boot_sysrd(vcpu, OEMU_SYSREG_ESR_EL1, &esr);
+  boot_sysrd(vcpu, OEMU_SYSREG_FAR_EL1, &far);
+  boot_sysrd(vcpu, OEMU_SYSREG_SPSR_EL1, &spsr);
+  boot_sysrd(vcpu, OEMU_SYSREG_SCTLR_EL1, &sctlr);
+  boot_sysrd(vcpu, OEMU_SYSREG_MIDR_EL1, &midr);
+  (void)fprintf(stderr, "oemu: %s after %" PRIu64 " instructions\n", why, insns);
+  (void)fprintf(stderr,
+                "oemu:   PC=0x%016" PRIx64 " EL=%" PRIu64 " SCTLR_EL1=0x%" PRIx64
+                " MIDR_EL1=0x%" PRIx64 "\n",
+                vcpu->cpu.regs.pc, el, sctlr, midr);
+  (void)fprintf(stderr,
+                "oemu:   ESR_EL1=0x%" PRIx64 " FAR_EL1=0x%016" PRIx64 " ELR_EL1=0x%016" PRIx64
+                " SPSR_EL1=0x%" PRIx64 "\n",
+                esr, far, elr, spsr);
+}
+
 static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
                     uint64_t max_insns) {
   uint64_t budget = max_insns;
@@ -490,15 +527,17 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
       return EXIT_ERROR;
     }
     if (st == OEMU_ERR_BLOCKED) {
+      boot_hang_report(vcpu, "guest parked", max_insns - budget);
       (void)fputs("oemu: guest parked at WFI/WFE with nothing to wake it\n", stderr);
       return EXIT_BLOCKED;
     }
     if (st != OEMU_OK && st != OEMU_ERR_TIMEOUT) {
       (void)fprintf(stderr, "oemu: boot failed: %s\n", oemu_status_str(st));
+      boot_hang_report(vcpu, "boot stopped", max_insns - budget);
       return EXIT_ERROR;
     }
     if (budget == 0U) {
-      (void)fprintf(stderr, "oemu: timeout after %" PRIu64 " instructions\n", max_insns);
+      boot_hang_report(vcpu, "timeout", max_insns);
       return EXIT_TIMEOUT;
     }
     oemu_vcpu_rearm(vcpu);

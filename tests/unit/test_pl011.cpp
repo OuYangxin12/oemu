@@ -9,9 +9,10 @@
  * qemu-system-aarch64 with tests/guest/pl011_probe.S: the peripheral ID
  * table, a FR that starts at zero, and a loopback that mirrors DR into RX.
  *
- * The model renumbers a few registers from the ARM TRM (FR at 0x04, CR at
- * 0x18, RIS/MIS at 0x30/0x34) to match the driver that boots the guests we
- * must run; the tests cite the same internal constants the driver does.
+ * The register offsets and flag bits the tests use come straight from
+ * dev/pl011_internal.h, which mirrors the ARM PL011 TRM (FR at 0x18, CR at
+ * 0x30, IMSC at 0x38, RIS/MIS at 0x3C/0x40, ICR at 0x44) -- the same numbering
+ * the kernel's arm,pl011 driver and QEMU implement.
  */
 #include "oemu/aspace.h"
 #include "oemu/machine.h"
@@ -255,11 +256,16 @@ TEST_F(Pl011, BaudAndLineRegistersRoundTrip) {
   EXPECT_EQ(0x02U, rd(PL011_REG_FIFLS));
 }
 
-TEST_F(Pl011, IntMaskSetAndClearAdjustImMask) {
-  wr(PL011_REG_INTMASKSET, PL011_INT_RLIS);
-  EXPECT_NE(0U, rd(PL011_REG_INTIM) & PL011_INT_RLIS);
-  wr(PL011_REG_INTMASKCLR, PL011_INT_RLIS);
+TEST_F(Pl011, IntMaskIsWrittenWhole) {
+  /* The PL011 has no interrupt-mask set/clear pair: the driver writes the
+   * whole IMSC in one access. A write therefore overwrites the mask, it does
+   * not accumulate -- the earlier model's phantom SET/CLR registers were not
+   * part of the real register file. */
+  wr(PL011_REG_INTIM, PL011_INT_RLIS);
+  EXPECT_EQ(PL011_INT_RLIS, rd(PL011_REG_INTIM) & PL011_INT_RLIS);
+  wr(PL011_REG_INTIM, PL011_INT_TIEM); /* whole-mask overwrite */
   EXPECT_EQ(0U, rd(PL011_REG_INTIM) & PL011_INT_RLIS);
+  EXPECT_NE(0U, rd(PL011_REG_INTIM) & PL011_INT_TIEM);
 }
 
 TEST_F(Pl011, SinklessPumpStillDrainsAndCounts) {

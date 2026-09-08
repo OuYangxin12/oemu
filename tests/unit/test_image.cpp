@@ -58,12 +58,17 @@ TEST(ImageParse, AcceptsAWellFormedLittleEndianHeader) {
   EXPECT_EQ(0ULL, info.entry_pa);
 }
 
-TEST(ImageParse, AcceptsEveryLittleEndianPageSize) {
-  for (const uint64_t flags : {img::kFlagLe4K, img::kFlagLe16K, img::kFlagLe64K}) {
-    const std::vector<uint8_t> h = header(kTextOffset, 0U, flags);
-    oemu_image info{};
-    EXPECT_EQ(OEMU_OK, oemu_image_parse_header(h.data(), &info)) << "flags=" << flags;
-    EXPECT_EQ(flags, info.flags);
+TEST(ImageParse, AcceptsLittleEndian4KButRefusesLargerPages) {
+  /* oemu's walker is 4K-only, so a 4K (or unspecified) little-endian image is
+   * admitted while 16K/64K are refused outright rather than mistranslated. */
+  oemu_image info{};
+  const std::vector<uint8_t> four = header(kTextOffset, 0U, img::kFlagLe4K);
+  EXPECT_EQ(OEMU_OK, oemu_image_parse_header(four.data(), &info));
+  EXPECT_EQ(img::kFlagLe4K, info.flags);
+  for (const uint64_t big : {img::kFlagLe16K, img::kFlagLe64K}) {
+    const std::vector<uint8_t> h = header(kTextOffset, 0U, big);
+    EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_image_parse_header(h.data(), &info))
+        << "flags=" << big;
   }
 }
 
@@ -317,9 +322,15 @@ TEST(ImageBuilderOffsets, MirrorBootinRstLayout) {
   EXPECT_EQ(OEMU_IMAGE_OFF_FLAGS, img::kOffFlags);
   EXPECT_EQ(OEMU_IMAGE_OFF_MAGIC, img::kOffMagic);
   EXPECT_EQ(OEMU_IMAGE_MAGIC, img::kMagic);
-  EXPECT_EQ(OEMU_IMAGE_FLAG_BE4K, img::kFlagBe4K);
-  EXPECT_EQ(OEMU_IMAGE_FLAGS_REJECTED,
-            img::kFlagBe4K | img::kFlagBe16K | img::kFlagBe64K | img::kFlagBe32);
+  EXPECT_EQ(OEMU_IMAGE_FLAG_ENDIAN_BE, img::kFlagEndianBe);
+  EXPECT_EQ(OEMU_IMAGE_FLAG_PAGES_SHIFT, (unsigned)img::kPagesShift);
+  EXPECT_EQ(OEMU_IMAGE_PAGE_4K, img::kPage4K);
+  EXPECT_EQ(OEMU_IMAGE_PAGE_16K, img::kPage16K);
+  EXPECT_EQ(OEMU_IMAGE_PAGE_64K, img::kPage64K);
+  /* The builder's big-endian composites must really carry the endianness bit
+   * the library keys on -- that is the whole reason they are refused. */
+  EXPECT_EQ(img::kFlagEndianBe, img::kFlagBe4K & OEMU_IMAGE_FLAG_ENDIAN_BE);
+  EXPECT_EQ(img::kFlagEndianBe, img::kFlagBe32 & OEMU_IMAGE_FLAG_ENDIAN_BE);
 }
 
 TEST(ImageParse, BranchEncodingTargetsTheDeclaredTextOffset) {

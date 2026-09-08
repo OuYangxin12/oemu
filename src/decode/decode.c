@@ -566,6 +566,18 @@ static oemu_status decode_hints_and_barriers(uint32_t word, oemu_insn *insn) {
     insn->op = OEMU_OP_BARRIER;
     return OEMU_OK;
   }
+  if (crn == 0x4U) {
+    /* MSR (immediate): the op0==0 group also carries the immediate-form MSR
+     * (SPSel/DAIF/PAN/DIT/SSBS/UAIR), which the head-asm hits before the C
+     * kernel runs. The register select is op2 (bits 7:5) and imm4 is bits
+     * 11:8; the executor applies the two bits that matter and no-ops the rest.
+     * Only op2 1..7 are defined; 0 and any other are reserved -> Undefined. */
+    insn->operand_kind = OEMU_OPERAND_IMM;
+    insn->uimm = op2;
+    insn->imm = (int64_t)crm;
+    insn->op = OEMU_OP_MSR_IMM;
+    return OEMU_OK;
+  }
   /* Cache and TLB maintenance (CRn 7/8) needs a memory model to mean anything. */
   return OEMU_ERR_UNSUPPORTED;
 }
@@ -1054,8 +1066,14 @@ static oemu_status classify_load_store(uint32_t opc, oemu_mem_size size, oemu_in
   }
   /* opc 2 and 3 are the sign-extending loads. */
   if (size == OEMU_MEM_DWORD) {
-    /* No sign-extending 64-bit load exists; opc 2 at dword is PRFM. */
-    return (opc == 0x2U) ? OEMU_ERR_UNSUPPORTED : OEMU_ERR_DECODE;
+    /* No sign-extending 64-bit load exists; opc 2 at dword is PRFM, an
+     * architecturally-ignorable prefetch hint -- decode it as a no-op rather
+     * than refusing, because the kernel issues it in hot paths. */
+    if (opc == 0x2U) {
+      insn->op = OEMU_OP_HINT;
+      return OEMU_OK;
+    }
+    return OEMU_ERR_DECODE; /* opc 3 at dword is unallocated */
   }
   if (size == OEMU_MEM_WORD && opc == 0x3U) {
     return OEMU_ERR_DECODE; /* LDRSW to a 32-bit register is not encodable */
@@ -1213,7 +1231,9 @@ static oemu_status decode_ldst_pair(uint32_t word, oemu_insn *insn) {
 static oemu_status decode_ldst_literal(uint32_t word, uint64_t pc, oemu_insn *insn) {
   const uint32_t opc = BITS(word, 30, 2);
   if (opc == 0x3U) {
-    return OEMU_ERR_UNSUPPORTED; /* PRFM literal */
+    insn->op = OEMU_OP_HINT; /* PRFM literal: an ignorable prefetch hint */
+    insn->operand_kind = OEMU_OPERAND_NONE;
+    return OEMU_OK;
   }
   if (opc == 0x2U) {
     insn->op = OEMU_OP_LDRS; /* LDRSW literal */
@@ -1528,6 +1548,8 @@ const char *oemu_opcode_name(oemu_opcode op) {
       return "mrs";
     case OEMU_OP_MSR:
       return "msr";
+    case OEMU_OP_MSR_IMM:
+      return "msr.imm";
     case OEMU_OP_SYS:
       return "sys";
     default:

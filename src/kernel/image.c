@@ -3,21 +3,21 @@
  *
  * The header layout is Documentation/arch/arm64/booting.rst:
  *
- *   0x00 code0 / branch          0x20 res1  (8 bytes)
- *   0x04 res0                    0x28 res2  (8 bytes)
- *   0x08 text_offset (le32)      0x30 res3  (8 bytes)
- *   0x10 image_size (le64)       0x38 magic (le32 "ARM\x64")
- *   0x18 flags     (le64)        0x3C reserved
+ *   0x00 code0 (branch, or a bti pad)   0x20 res1  (8 bytes)
+ *   0x04 code1 (branch when code0=bti)  0x28 res2  (8 bytes)
+ *   0x08 text_offset (le64)             0x30 res3  (8 bytes)
+ *   0x10 image_size (le64)              0x38 magic (le32 "ARM\x64")
+ *   0x18 flags     (le64)               0x3C reserved
  *
- * The flags matrix (D-M4a-6): big-endian variants are refused (oemu is
- * little-endian, period). Page-size bits are accepted-and-ignored -- the
- * kernel brings its own tables and oemu's walker is page-size agnostic
- * for the kernel's own choices -- and the acceptance set follows the
- * QEMU oracle (which admits every LE flavour), not a stricter reading
- * that would reject the very Image our e2e gate boots.
+ * The flags field (D-M4a-6, per booting.rst): bit 0 is endianness (oemu is
+ * little-endian, so a big-endian kernel is refused); bits 1-2 are the kernel
+ * page size (oemu walks 4K granules, so 16K/64K are refused and 4K/unspecified
+ * are accepted); bit 3 is a placement hint we honour by loading at the base we
+ * already use. The QEMU oracle admits the same set.
  */
 #include "oemu/check.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 #include "image_internal.h"
@@ -35,22 +35,33 @@ oemu_status oemu_image_parse_header(const unsigned char *head, oemu_image *out) 
   if ((head == NULL) || (out == NULL)) {
     return OEMU_ERR_INVALID_ARG;
   }
-  /* The branch at code0 must be an unconditional A64 branch (bit pattern
-   * 0b000101 as bits 31:26): the loader contract says execution may enter
-   * at the header top and the kernel asks to be skipped, not consulted.
-   * QEMU checks this too; a file whose first word is not a branch is not
-   * an Image even if the magic happens to be present. */
-  const uint32_t code0 = img_le32(head);
-  if ((code0 & 0xFC000000U) != 0x14000000U) {
+  /* booting.rst: code0/code1 are responsible for branching to stext. An
+   * unannotated Image carries the branch in code0; a BTI-annotated Image
+   * (CONFIG_ARM64_BTI_KERNEL) puts a `bti` landing pad in code0 and the
+   * branch in code1. Both are legitimate -- accept a branch at code0, or a
+   * bti at code0 backed by a branch at code1. The first word being neither
+   * is not an Image even if the magic is present. */
+  const uint32_t code0 = img_le32(head + OEMU_IMAGE_OFF_CODE0);
+  const uint32_t code1 = img_le32(head + OEMU_IMAGE_OFF_CODE1);
+  const bool code0_branch = (code0 & OEMU_IMAGE_BRANCH_MASK) == OEMU_IMAGE_BRANCH_BITS;
+  const bool code0_bti = (code0 & OEMU_IMAGE_BTI_MASK) == OEMU_IMAGE_BTI_BITS;
+  const bool code1_branch = (code1 & OEMU_IMAGE_BRANCH_MASK) == OEMU_IMAGE_BRANCH_BITS;
+  if (!code0_branch && !(code0_bti && code1_branch)) {
     return OEMU_ERR_FORMAT;
   }
   if (img_le32(head + 0x38U) != OEMU_IMAGE_MAGIC) {
     return OEMU_ERR_FORMAT;
   }
+  /* Endianness is bit 0: a big-endian kernel is refused outright (oemu fetches
+   * little-endian). Page size is bits 1-2: only 4K (or the legacy unspecified
+   * 0) is served by oemu's walker, so 16K/64K are refused rather than silently
+   * mistranslated. The placement bit (3) and reserved bits are not a refusal. */
   const uint64_t flags = img_le64(head + 0x18U);
-  /* Big-endian flavours: bits 3 (4K BE), 4 (16K BE), 5 (64K BE) and the
-   * BE32 advertisement 7. oemu fetches and loads little-endian only. */
-  if ((flags & 0xB8U) != 0U) {
+  if ((flags & OEMU_IMAGE_FLAG_ENDIAN_BE) != 0U) {
+    return OEMU_ERR_UNSUPPORTED;
+  }
+  const uint64_t page_size = (flags >> OEMU_IMAGE_FLAG_PAGES_SHIFT) & 3ULL;
+  if ((page_size == OEMU_IMAGE_PAGE_16K) || (page_size == OEMU_IMAGE_PAGE_64K)) {
     return OEMU_ERR_UNSUPPORTED;
   }
   /* booting.rst: text_offset is a 64-bit little-endian doubleword, 4 KiB
@@ -90,7 +101,7 @@ oemu_status oemu_image_load(oemu_image *out, const unsigned char *bytes, size_t 
   }
   /* The text must lie inside the file and inside the machine. */
   if ((size_t)info.text_offset >= len) {
-    return OEMU_ERR_FORMAT; /* text_offset points past the file */
+    return OEMU_ERR_FORMAT;
   }
   const size_t text_len = len - (size_t)info.text_offset;
   if ((uint64_t)info.text_offset + (uint64_t)text_len > ram_size) {

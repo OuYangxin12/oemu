@@ -307,10 +307,16 @@ static oemu_status walk(const oemu_sysregs *sr, const oemu_memops *phys, uint64_
     if (!d.valid) {
       MMU_FAULT(OEMU_MMU_FAULT_TRANSLATION, level);
     }
-    if (d.table) {
-      if (level >= 3) {
-        MMU_FAULT(OEMU_MMU_FAULT_TRANSLATION, 3); /* no level below the page level */
-      }
+    /* Descriptor type is level-dependent, not absolute. Type 0b11 is a table
+     * pointer at levels 0..2 but a 4 KiB PAGE (leaf) at level 3 -- the leaf
+     * level has nothing below it -- and type 0b01 is a block/page at any level
+     * >= 1. Reading 0b11 as unconditionally-a-table makes every real guest
+     * level-3 page table entry look like an invalid table, which is exactly
+     * what breaks the kernel's fixmap and vmalloc mappings. */
+    const bool is_table = d.table && (level < 3);
+    const bool is_leaf = d.table || d.block_page;
+
+    if (is_table) {
       tattrs |= oemu_mmu_internal_table_attrs(raw);
       base = d.address;
       if ((base >> out_bits) != 0U) {
@@ -320,7 +326,7 @@ static oemu_status walk(const oemu_sysregs *sr, const oemu_memops *phys, uint64_
       level++;
       continue;
     }
-    if (!d.block_page) {
+    if (!is_leaf) {
       MMU_FAULT(OEMU_MMU_FAULT_TRANSLATION, level); /* bits [1:0] == 0b10: reserved */
     }
     if (level == 0) {

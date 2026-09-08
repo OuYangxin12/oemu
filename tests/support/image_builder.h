@@ -35,14 +35,23 @@ inline constexpr uint32_t kMagic = 0x644D5241U; /* "ARM\x64" */
 /* code0: b . + <text_offset>, the unconditional-branch the loader demands. */
 inline constexpr uint32_t kBranchTo0x80000 = 0x14020000U;
 
-/* The page-size / endianness flag bits (booting.rst flags[7:0]). */
-inline constexpr uint64_t kFlagLe4K = 0x01U;
-inline constexpr uint64_t kFlagLe16K = 0x02U;
-inline constexpr uint64_t kFlagLe64K = 0x04U;
-inline constexpr uint64_t kFlagBe4K = 0x08U;
-inline constexpr uint64_t kFlagBe16K = 0x10U;
-inline constexpr uint64_t kFlagBe64K = 0x20U;
-inline constexpr uint64_t kFlagBe32 = 0x80U;
+/* The booting.rst flags word: bit 0 is endianness (0=LE, 1=BE), bits 2:1 are
+ * the page size (0=unspecified, 1=4K, 2=16K, 3=64K). The library models this
+ * exactly, so the byte-built test headers speak the same language. */
+inline constexpr uint64_t kFlagEndianBe = 0x01U;
+inline constexpr unsigned kPagesShift = 1U;
+inline constexpr uint64_t kPage4K = 1U;
+inline constexpr uint64_t kPage16K = 2U;
+inline constexpr uint64_t kPage64K = 3U;
+inline constexpr uint64_t kFlagLe4K = (kPage4K << kPagesShift);
+inline constexpr uint64_t kFlagLe16K = (kPage16K << kPagesShift);
+inline constexpr uint64_t kFlagLe64K = (kPage64K << kPagesShift);
+inline constexpr uint64_t kFlagBe4K = kFlagEndianBe | (kPage4K << kPagesShift);
+inline constexpr uint64_t kFlagBe16K = kFlagEndianBe | (kPage16K << kPagesShift);
+inline constexpr uint64_t kFlagBe64K = kFlagEndianBe | (kPage64K << kPagesShift);
+/* A big-endian image carrying a reserved flag bit -- still big-endian, so
+ * refused on the endianness check before the reserved bit is ever examined. */
+inline constexpr uint64_t kFlagBe32 = kFlagEndianBe | 0x80U;
 
 inline void put16(std::vector<uint8_t> &v, uint64_t off, uint16_t value) {
   v[off] = (uint8_t)(value & 0xFFU);

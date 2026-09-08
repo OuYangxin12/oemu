@@ -659,11 +659,16 @@ oemu_exec_sys_action oemu_exec_internal_sys_action(uint32_t sel) {
       ((op1 == 0U) || (op1 == 1U) || (op1 == 2U) || (op1 == 4U))) {
     return OEMU_EXEC_SYS_TLBI;
   }
-  /* AT (op1 in {0,4}, CRn 7, CRm 8/9: the full S1E* table of Linux
-   * asm/sysreg.h): a translation request needs the MMU (M3), and executing it
-   * as a no-op would silently lie about PAR_EL1. The GCS/SW DC ops share
-   * CRn 7 with CRm >= 10, which is why the window stops at 9. */
-  if ((crn == 7U) && ((crm == 8U) || (crm == 9U)) && ((op1 == 0U) || (op1 == 4U))) {
+  /* AT (op1 in {0,4}, CRn 7, CRm 8/9: the full S1E and S12E table of Linux
+   * asm/sysreg.h): a translation request needs the MMU (M3). Stage-1 AT
+   * (op1 == 0, the S1E ops the running EL1 kernel probes with) is honoured by
+   * walking and publishing the result in PAR_EL1. Stage-2 AT (op1 == 4,
+   * the S12E ops) has no stage-2 translation to perform here, so it stays
+   * Undefined -- executing it as a no-op would silently lie about PAR_EL1. */
+  if ((crn == 7U) && ((crm == 8U) || (crm == 9U)) && (op1 == 0U)) {
+    return OEMU_EXEC_SYS_AT;
+  }
+  if ((crn == 7U) && ((crm == 8U) || (crm == 9U)) && (op1 == 4U)) {
     return OEMU_EXEC_SYS_TRAP;
   }
   /* DC and IC invalidation/clean space (CRn 7/10/11/15 with op1 in {0,3}):
@@ -737,6 +742,46 @@ static oemu_status do_msr_system(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_ins
   return OEMU_OK;
 }
 
+/* MSR (immediate): SPSel (bank switch) and the DAIF masks are the only bits
+ * with architectural effect; PAN/DIT/SSBS/UAIR are modelled as no-ops (the ID
+ * registers honestly advertise those features absent). A reserved selector is
+ * Undefined. Selector = op2 (insn.uimm), imm4 = insn.imm, both set by the
+ * decoder from bits 7:5 and 11:8. */
+#define MSR_IMM_SPSel   5U
+#define MSR_IMM_DAIFSET 6U
+#define MSR_IMM_DAIFCLR 7U
+static oemu_status do_msr_immediate(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_insn *in,
+                                    uint32_t word) {
+  const uint32_t op2 = (uint32_t)in->uimm;
+  const uint32_t imm = ((uint32_t)in->imm) & 0xfU;
+  oemu_status st = OEMU_OK;
+  switch (op2) {
+    case MSR_IMM_SPSel:
+      st = oemu_sysreg_write(sr, OEMU_SYSREG_SPSEL, (uint64_t)(imm & 1U));
+      break;
+    case MSR_IMM_DAIFSET:
+    case MSR_IMM_DAIFCLR: {
+      uint64_t daif = 0U;
+      if (oemu_sysreg_read(sr, OEMU_SYSREG_DAIF, &daif) != OEMU_OK) {
+        return OEMU_ERR_FAULT;
+      }
+      const uint64_t next =
+          (op2 == MSR_IMM_DAIFSET) ? (daif | (uint64_t)imm) : (daif & (uint64_t)(~imm & 0xfU));
+      st = oemu_sysreg_write(sr, OEMU_SYSREG_DAIF, next);
+      break;
+    }
+    case 1U: /* SSBS */
+    case 2U: /* DIT  */
+    case 3U: /* UAIR */
+    case 4U: /* PAN  */
+      break; /* modelled as no-op */
+    default: /* reserved selector */
+      oemu_exc_undefined(&cpu->regs, sr, word);
+      return OEMU_ERR_FAULT;
+  }
+  return (st == OEMU_OK) ? OEMU_OK : OEMU_ERR_FAULT;
+}
+
 /* SYS op: DC/IC/TLBI policy is the classifier's; a trap is an Undefined with
  * the fetched encoding as ISS. */
 static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *mem,
@@ -757,6 +802,26 @@ static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *me
         oemu_mmu_flush_all(mmu);
       }
       return OEMU_OK;
+    case OEMU_EXEC_SYS_AT: {
+      /* AT (stage-1): translate [Rt] in the current regime and publish the
+       * verdict in PAR_EL1 -- bit 0 (F) set means the translation failed,
+       * clear means it succeeded and the output address is carried in the
+       * upper fields. The kernel's idmap/feature probes are `at s1e1r;
+       * mrs par; tbnz par, #0`, so only F is consulted; the walk's own
+       * fault (permission, translation, ...) is folded into F, which is all
+       * PAR_EL1 promises for a fault. A read-vs-write probe differs only in
+       * the write forms (op2 1/3). */
+      const uint64_t at_addr = read_g(cpu, in->rd, false, OEMU_REG_W64);
+      const uint32_t at_op2 = (word >> 5) & 0x7U;
+      const bool at_write = (at_op2 == 1U) || (at_op2 == 3U);
+      uint64_t at_pa = 0U;
+      oemu_mmu_fault at_fault;
+      const oemu_status at_st =
+          (mmu != NULL) ? oemu_mmu_translate(mmu, at_addr, at_write, false, &at_pa, &at_fault)
+                        : OEMU_ERR_FAULT;
+      sr->par_el1 = (at_st == OEMU_OK) ? (at_pa & ~(uint64_t)1U) : 1U;
+      return OEMU_OK;
+    }
     case OEMU_EXEC_SYS_DC_ZVA:
       break;
   }
@@ -861,6 +926,8 @@ oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
     sys = do_mrs_system(cpu, sr, in, word);
   } else if (in->op == OEMU_OP_MSR) {
     sys = do_msr_system(cpu, sr, in, word);
+  } else if (in->op == OEMU_OP_MSR_IMM) {
+    sys = do_msr_immediate(cpu, sr, in, word);
   } else if (in->op == OEMU_OP_SYS) {
     sys = do_sys(cpu, sr, mem, mmu, in, word);
   } else {
@@ -1281,6 +1348,11 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       break;
     case OEMU_OP_MSR:
       st = do_msr(cpu, in);
+      break;
+    case OEMU_OP_MSR_IMM:
+      /* The user-mode subset does not touch privileged mode bits; system mode
+       * intercepts this before the shared switch. */
+      st = OEMU_ERR_UNSUPPORTED;
       break;
 
     default:

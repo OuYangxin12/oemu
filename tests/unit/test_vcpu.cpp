@@ -403,13 +403,16 @@ TEST_F(VcpuTest, DcZvaUnalignedIsAnAlignmentAbort) {
             EcBase(OEMU_EXC_EC_DABORT_SAME) | (uint32_t)kIlBit | (1U << 6) | 0x21U);
 }
 
-TEST_F(VcpuTest, AtTrapsUndefinedUntilM3) {
+TEST_F(VcpuTest, AtPublishesParEl1OnStage1Translate) {
+  /* AT is no longer Undefined: a stage-1 translate publishes its verdict in
+   * PAR_EL1. With stage-1 off the walk is the identity, so `at s1e1r, x0`
+   * succeeds and PAR_EL1.F (bit 0) reads clear with the output address. */
   set_x(0, kData);
   program({0xD5087800U /* at s1e1r, x0 */});
   ASSERT_EQ(step(), OEMU_OK);
-  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x200U);
-  EXPECT_EQ(vcpu_.sysregs.esr_el[OEMU_EL1],
-            EcBase(OEMU_EXC_EC_UNKNOWN) | (uint32_t)kIlBit | (0xD5087800U & 0x01FFFFFFU));
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText + 4U); /* it retired, no trap */
+  EXPECT_EQ(vcpu_.sysregs.par_el1 & 1U, 0U);            /* F clear: it translated */
+  EXPECT_EQ(vcpu_.sysregs.par_el1, kData);              /* the output address */
 }
 
 TEST_F(VcpuTest, WfiAndWfeParkWithoutTheEvent) {
