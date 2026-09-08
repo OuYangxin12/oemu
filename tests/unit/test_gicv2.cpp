@@ -33,15 +33,12 @@ constexpr uint64_t kRegion = 0x00010000ULL;
 constexpr uint64_t DIST_CTL = 0x000;
 constexpr uint64_t DIST_TYPER = 0x004;
 constexpr uint64_t DIST_IIDR = 0x008;
-constexpr uint64_t DIST_IGROUP0 = 0x080;
 constexpr uint64_t DIST_ISENABLER0 = 0x100;
 constexpr uint64_t DIST_ICENABLER0 = 0x180;
 constexpr uint64_t DIST_ISPENDR0 = 0x200;
-constexpr uint64_t DIST_ICPENDR0 = 0x280;
 constexpr uint64_t DIST_ISACTIVER0 = 0x300;
 constexpr uint64_t DIST_PRIORITY0 = 0x400;
 constexpr uint64_t DIST_TARGET0 = 0x800;
-constexpr uint64_t DIST_CFG0 = 0xC00;
 constexpr uint64_t DIST_SGIR = 0xF00;
 constexpr uint64_t DIST_CID0 = 0xF88;
 constexpr uint64_t DIST_PID2 = 0xFE8;
@@ -49,7 +46,6 @@ constexpr uint64_t DIST_PID2 = 0xFE8;
 /* CPU interface offsets. */
 constexpr uint64_t CPU_CTL = 0x000;
 constexpr uint64_t CPU_PMR = 0x004;
-constexpr uint64_t CPU_BPR = 0x008;
 constexpr uint64_t CPU_IAR = 0x00C;
 constexpr uint64_t CPU_EOIR = 0x010;
 
