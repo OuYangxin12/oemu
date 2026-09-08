@@ -173,11 +173,24 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
 #define OEMU_SYSREG_CNTFRQ_EL0    ((uint32_t)0x1f00)
 #define OEMU_SYSREG_CNTPCT_EL0    ((uint32_t)0x1f01)
 #define OEMU_SYSREG_CNTVCT_EL0    ((uint32_t)0x1f02)
-#define OEMU_SYSREG_CNTVOFF_EL1   ((uint32_t)0x0700)
-#define OEMU_SYSREG_CNTKCTL_EL1   ((uint32_t)0x0708)
-#define OEMU_SYSREG_CNTP_CVAL_EL1 ((uint32_t)0x0710)
-#define OEMU_SYSREG_CNTP_CTL_EL1  ((uint32_t)0x0711)
-#define OEMU_SYSREG_CNTP_TVAL_EL1 ((uint32_t)0x0718)
+/* The EL1 generic-timer bank shares one 14-bit selector field with the EL0
+ * views (op0/op1/CRn fall above the mask), so all five sit in the 0x1f__ range
+ * -- not 0x07__. Getting the base wrong made every EL1 timer access miss the
+ * table and take a hyp-trap oops, which is what killed the boot in
+ * arch_timer_shutdown_virt the moment the GIC let init get this far. */
+#define OEMU_SYSREG_CNTVOFF_EL1   ((uint32_t)0x1f03)
+#define OEMU_SYSREG_CNTKCTL_EL1   ((uint32_t)0x0708) /* 0x0708, not 0x1f08: read from vmlinux */
+#define OEMU_SYSREG_CNTP_CVAL_EL1 ((uint32_t)0x1f12)
+#define OEMU_SYSREG_CNTP_CTL_EL1  ((uint32_t)0x1f11)
+#define OEMU_SYSREG_CNTP_TVAL_EL1 ((uint32_t)0x1f13)
+#define OEMU_SYSREG_CNTPCTSS_EL0  ((uint32_t)0x1f05)
+#define OEMU_SYSREG_CNTVCTSS_EL0  ((uint32_t)0x1f06)
+/* Virtual timer (EL1 clockevent the arch timer drives). The kernel reaches
+ * these through their EL0-accessible encodings (op0 folds into the two bits
+ * the selector mask discards), so CNTV_CTL_EL0 / CNTV_CVAL_EL0 are the names
+ * that appear in the guest; the counter it reads is CNTVCT_EL0 (0x1f02). */
+#define OEMU_SYSREG_CNTV_CVAL_EL0 ((uint32_t)0x1f1a)
+#define OEMU_SYSREG_CNTV_CTL_EL0  ((uint32_t)0x1f19)
 /* Default generic-timer counter frequency: the Arm default the QEMU virt
  * machine and this DT both present, so the guest's clock source and oemu's
  * counter agree. */
@@ -300,6 +313,8 @@ typedef struct oemu_sysregs {
   uint64_t mair_el1;
   uint64_t par_el1; /* written by AT*, read by MRS: F bit = translation failed */
   uint64_t cntvoff_el1;
+  uint64_t cntv_ctl_el1;  /* virtual timer control: ENABLE|IMASK|STATUS */
+  uint64_t cntv_cval_el1; /* virtual timer comparator */
   uint64_t cntkctl_el1;
   uint64_t cntp_ctl_el1;
   uint64_t cntp_cval_el1;
