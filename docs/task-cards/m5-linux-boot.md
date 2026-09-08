@@ -55,7 +55,6 @@ make boot-linux LINUX=... INITRD=...
 ## 落地进度
 
 ### 第 1 轮：boot 期生成 virt 设备树 + `-initrd`（本提交）
-
 M5 的头号依赖是 `/chosen/linux,initrd-start/end`，而本机无 `dtc`、外部 DTB
 又被 gitignore。据此把路线图 M4a 一直推迟的「DTB 生成器」补上——`boot` 默认
 用 `oemu_fdt` 现场生成 virt 树（无 `-dtb` 时），彻底摆脱外部 blob 与 `dtc`，
@@ -80,6 +79,16 @@ initrd 单元由此白送。
 format-check 仅剩 `bench/corpus/k_addsub.c` 预存漂移。实证：`boot -kernel
 guest/build/Image`（**不给 -dtb**）用生成树一路到 `No working init found.`
 终态，与外部 DTB 一致。
+
+### 第 2 轮：PL011 中断改接 GIC SPI 33（本提交）
+
+`boot_run` 每片把 UART 的实时电平刷进 GIC 第 33 行的 pending，vCPU 的 IRQ 线
+只由 `oemu_gicv2_irq_level` 决定。此前 PL011 直接顶一根扁平 IRQ 线——驱动 `IAR`
+会读回 1023(spurious) 而丢弃中断，字节永远送不进 tty。改接后（本提交）无 initrd
+启动仍抵达 `No working init found.` 终态、门全绿（877/877）。PL011 的 RX 模型
+（`oemu_pl011_inject`/`irq_level`、16 深 RX ring、MIS）M4a 就写好了，缺的只是
+这根接线。下一轮：stdin→inject 泵 + guest initramfs/`/init`/getty，跑通
+`Run /init`+三标记+poweroff→exit 0。
 
 ### 待办（后续轮）
 

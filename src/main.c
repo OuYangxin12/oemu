@@ -111,10 +111,12 @@
 #define BOOT_GIC_DIST_SIZE ((uint64_t)0x00010000ULL)
 #define BOOT_GIC_CPU_BASE  ((uint64_t)0x08010000ULL) /* virt GICC -- DT reg[1] */
 #define BOOT_GIC_CPU_SIZE  ((uint64_t)0x00010000ULL)
-#define BOOT_GIC_LINES     64U              /* two groups: NR_IRQS 64, as the oracle */
-#define BOOT_DTB_MAX       ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
-#define BOOT_CMDLINE_MAX   (256U)           /* writable boot line width */
-#define BOOT_BOOTLINE_LEN  (257U)           /* the fixture property: pad + NUL */
+#define BOOT_GIC_LINES     64U /* two groups: NR_IRQS 64, as the oracle */
+/* The PL011's single line: /interrupts = <0 1 4> -> SPI, offset 1 -> id 33. */
+#define BOOT_UART_SPI     33U
+#define BOOT_DTB_MAX      ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
+#define BOOT_CMDLINE_MAX  (256U)           /* writable boot line width */
+#define BOOT_BOOTLINE_LEN (257U)           /* the fixture property: pad + NUL */
 /* The initrd sits at the three-quarter mark of RAM -- clear of kernel text at
  * the base, clear of the DTB at the half mark, and clear of the boot stack at
  * the very top by BOOT_INITRD_MARGIN. A tree that advertises the initrd must
@@ -522,8 +524,8 @@ static void boot_hang_report(const oemu_vcpu *vcpu, const char *why, uint64_t in
                 esr, far, elr, spsr);
 }
 
-static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
-                    const oemu_gicv2 *gic, uint64_t max_insns) {
+static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oemu_gicv2 *gic,
+                    uint64_t max_insns) {
   uint64_t budget = max_insns;
   for (;;) {
     const uint64_t slice = (budget < BOOT_QUANTUM) ? budget : BOOT_QUANTUM;
@@ -531,12 +533,13 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
     const oemu_status st = oemu_vcpu_run(vcpu, slice, &done);
     budget -= done;
     (void)oemu_pl011_pump(uart); /* the console drains on every slice boundary */
-    /* The IRQ line is the OR of every source the machine models. The PL011
-     * still drives it directly (its console is polled, so this stays low in
-     * practice); the GIC aggregates the DT-declared sources -- today none are
-     * wired, so it reads low and the vCPU simply never takes a spurious IRQ. */
-    oemu_vcpu_set_irq(vcpu,
-                      (oemu_pl011_irq_level(uart) != 0) || (oemu_gicv2_irq_level(gic) != 0));
+    /* The PL011 is a level source on GIC SPI 33 (the DT's /interrupts). Refresh
+     * the distributor's pending bit from the UART's live level each slice, so a
+     * received byte reaches the driver as interrupt 33 -- not a flat pin whose
+     * GICC_IAR the driver would read back as spurious. The vCPU's IRQ is then
+     * the GIC's word alone. */
+    oemu_gicv2_set_pending(gic, BOOT_UART_SPI, oemu_pl011_irq_level(uart) != 0);
+    oemu_vcpu_set_irq(vcpu, oemu_gicv2_irq_level(gic) != 0);
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
       return machine->exit_code & 0xFF; /* the code travels as a shell sees it */
