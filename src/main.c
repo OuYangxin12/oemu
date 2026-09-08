@@ -50,6 +50,7 @@
 #include "oemu/sysenv.h"
 #include "oemu/sysreg.h"
 #include "oemu/vcpu.h"
+#include "oemu/virt_dtb.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -100,21 +101,26 @@
  * and size from docs/linux-minimal-qemu.md, image address from the booting.rst
  * protocol, UART address from virt's memory map.
  */
-#define BOOT_RAM_BASE        ((uint64_t)0x40000000ULL)
-#define BOOT_RAM_DEFAULT     ((uint64_t)1024U) /* MiB; the fixture DTB's memory node */
-#define BOOT_DTB_SLOT        1U                /* one more region: the DTB rides the bus too */
-#define BOOT_IMAGE_BASE      ((uint64_t)0x40080000ULL) /* booting.rst kernel load address */
-#define BOOT_UART_BASE       ((uint64_t)0x09000000ULL) /* virt UART0 -- oracle-portable */
-#define BOOT_UART_SIZE       ((uint64_t)0x00001000ULL)
-#define BOOT_GIC_DIST_BASE   ((uint64_t)0x08000000ULL) /* virt GICD -- DT reg[0] */
-#define BOOT_GIC_DIST_SIZE   ((uint64_t)0x00010000ULL)
-#define BOOT_GIC_CPU_BASE    ((uint64_t)0x08010000ULL) /* virt GICC -- DT reg[1] */
-#define BOOT_GIC_CPU_SIZE    ((uint64_t)0x00010000ULL)
-#define BOOT_GIC_LINES       64U              /* two groups: NR_IRQS 64, as the oracle */
-#define BOOT_DTB_MAX         ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
-#define BOOT_CMDLINE_MAX     (256U)           /* writable boot line width */
-#define BOOT_BOOTLINE_LEN    (257U)           /* the fixture property: pad + NUL */
-#define BOOT_REGION_CAPACITY 8U               /* RAM + UART + DTB + room for M4 devices */
+#define BOOT_RAM_BASE      ((uint64_t)0x40000000ULL)
+#define BOOT_RAM_DEFAULT   ((uint64_t)1024U) /* MiB; the fixture DTB's memory node */
+#define BOOT_DTB_SLOT      1U                /* one more region: the DTB rides the bus too */
+#define BOOT_IMAGE_BASE    ((uint64_t)0x40080000ULL) /* booting.rst kernel load address */
+#define BOOT_UART_BASE     ((uint64_t)0x09000000ULL) /* virt UART0 -- oracle-portable */
+#define BOOT_UART_SIZE     ((uint64_t)0x00001000ULL)
+#define BOOT_GIC_DIST_BASE ((uint64_t)0x08000000ULL) /* virt GICD -- DT reg[0] */
+#define BOOT_GIC_DIST_SIZE ((uint64_t)0x00010000ULL)
+#define BOOT_GIC_CPU_BASE  ((uint64_t)0x08010000ULL) /* virt GICC -- DT reg[1] */
+#define BOOT_GIC_CPU_SIZE  ((uint64_t)0x00010000ULL)
+#define BOOT_GIC_LINES     64U              /* two groups: NR_IRQS 64, as the oracle */
+#define BOOT_DTB_MAX       ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
+#define BOOT_CMDLINE_MAX   (256U)           /* writable boot line width */
+#define BOOT_BOOTLINE_LEN  (257U)           /* the fixture property: pad + NUL */
+/* The initrd sits at the three-quarter mark of RAM -- clear of kernel text at
+ * the base, clear of the DTB at the half mark, and clear of the boot stack at
+ * the very top by BOOT_INITRD_MARGIN. A tree that advertises the initrd must
+ * not let it overlap what the kernel unpacks there. */
+#define BOOT_INITRD_MARGIN   ((uint64_t)16U << 20) /* headroom to the RAM top */
+#define BOOT_REGION_CAPACITY 8U                    /* RAM + UART + DTB + room for M4 devices */
 /* Instructions per scheduler slice. One vCPU, so a quantum is purely the
  * latency bound between machine-event polls; 1M keeps a stuck guest inside
  * the 60 s test budget while keeping syscall-free slices cheap. */
@@ -134,8 +140,10 @@ static uint64_t stack_base_for(const oemu_elf_image *img) {
 
 static void print_usage(FILE *out) {
   (void)fputs("usage: oemu run <image.elf> [--max-insns N]\n", out);
-  (void)fputs("       oemu boot -kernel <Image> [-append <cmdline>] [-m MiB] [-dtb <file>]\n",
-              out);
+  (void)fputs(
+      "       oemu boot -kernel <Image> [-initrd <cpio>] [-append <cmdline>] "
+      "[-m MiB] [-dtb <file>]\n",
+      out);
   (void)fputs("                 [--serial file:PATH] [--entry ADDR] [--max-insns N]\n", out);
   (void)fputs("       oemu --help\n", out);
 }
@@ -559,12 +567,23 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
 typedef struct boot_opts {
   const char *kernel;      /* -kernel: required */
   const char *cmdline;     /* -append: NULL when absent */
-  const char *dtb;         /* -dtb:    NULL -> embedded fixture */
+  const char *dtb;         /* -dtb:    NULL -> the generated virt tree */
+  const char *initrd;      /* -initrd: NULL -> no initial ramdisk */
   const char *serial_path; /* --serial file:PATH; NULL -> stdout */
   uint64_t ram_mib;        /* -m:      MiB, defaulting to the fixture's 1 GiB */
   uint64_t entry;          /* --entry: 0 -> the Image header's own entry */
   uint64_t max_insns;      /* --max-insns */
 } boot_opts;
+/* Where the initrd goes: the three-quarter mark of RAM. Returns 0 (a signal
+ * the caller turns into an error) when the ramdisk, plus a margin for the boot
+ * stack and kernel heap, would not fit between that mark and the top of RAM. */
+static uint64_t boot_initrd_addr(uint64_t ram, uint64_t len) {
+  const uint64_t base = BOOT_RAM_BASE + (ram / 4U) * 3U;
+  if ((base + len + BOOT_INITRD_MARGIN) > (BOOT_RAM_BASE + ram)) {
+    return 0U;
+  }
+  return base;
+}
 
 /*
  * Boots an AArch64 Linux Image at EL1 with the M4a boot protocol:
@@ -585,13 +604,20 @@ static int boot(const boot_opts *opts) {
   boot_env benv = {0};
   boot_serial ser = {0};
   oemu_image hdr = {0};
-  unsigned char *dtb = NULL;
+  oemu_buffer initrd = {0};
+  oemu_fdt gen = {0};
+  unsigned char *dtb = NULL;        /* the -dtb blob we own and may patch */
+  const unsigned char *tree = NULL; /* the blob as placed on the bus (read-only view) */
   size_t dtb_len = 0U;
   size_t len = 0U;
   FILE *serial = NULL;
   const uint64_t ram = opts->ram_mib * (1U << 20);
   uint64_t entry = 0U;
   uint64_t dtb_pa = 0U;
+  uint64_t initrd_pa = 0U;
+  size_t initrd_len = 0U;
+  bool generated = (opts->dtb == NULL); /* no -dtb -> build the virt tree ourselves */
+  bool have_initrd = (opts->initrd != NULL);
   oemu_status st = OEMU_OK;
   int result = EXIT_ERROR;
 
@@ -603,29 +629,70 @@ static int boot(const boot_opts *opts) {
     goto done;
   }
   len = oemu_buffer_len(&image);
-  if (dtb_load(opts->dtb, &dtb, &dtb_len) != 0) {
-    (void)fprintf(stderr, "oemu: could not load the device tree\n");
-    goto done;
-  }
-  if ((dtb_len < 40U) || (be32(dtb) != BOOT_FDT_MAGIC) || (be32(dtb + 4U) > dtb_len) ||
-      (dtb_len > BOOT_DTB_MAX)) {
-    (void)fprintf(stderr, "oemu: %s is not a valid device tree blob\n",
-                  opts->dtb != NULL ? opts->dtb : "the embedded fixture");
-    goto done;
-  }
-  if (opts->cmdline != NULL) {
-    if (!dtb_patch_bootline(dtb, dtb_len, opts->cmdline)) {
-      (void)fprintf(stderr, "oemu: -append: this DTB has no /chosen/bootline to write\n");
+  if (have_initrd) {
+    if (oemu_buffer_init(&initrd, 0U) != OEMU_OK) {
+      (void)fputs("oemu: out of memory\n", stderr);
       goto done;
     }
+    if (read_file(opts->initrd, &initrd) != 0) {
+      goto done;
+    }
+    initrd_len = oemu_buffer_len(&initrd);
   }
-  /* The tree's /memory reg must describe the RAM we actually build, or a
-   * guest trusts a lie. The fixture's single memory@40000000 node gets its
-   * size cell rewritten in place -- same width, no layout shift. A tree with
-   * no /memory node (a minimal probe fixture, say) asserts nothing about RAM,
-   * so there is nothing to keep honest: warn and carry on. */
-  if (!dtb_patch_node(dtb, dtb_len, BOOT_RAM_BASE, ram)) {
-    (void)fprintf(stderr, "oemu: note: the device tree has no /memory node to size\n");
+  if (generated) {
+    /* Build the device tree in-process (oemu/fdt): the only way to hand the
+     * guest a /chosen with linux,initrd-start/end without an offline dtc. The
+     * -append command line lands in /chosen/bootargs, the property the kernel
+     * actually reads -- unlike the fixture's decoy /chosen/bootline. */
+    if (oemu_fdt_init(&gen, BOOT_DTB_MAX) != OEMU_OK) {
+      (void)fputs("oemu: out of memory building the device tree\n", stderr);
+      goto done;
+    }
+    if (have_initrd) {
+      initrd_pa = boot_initrd_addr(ram, (uint64_t)initrd_len);
+      if (initrd_pa == 0U) {
+        (void)fprintf(
+            stderr, "oemu: -initrd of %zu bytes does not fit the -m %" PRIu64 " MiB machine\n",
+            initrd_len, opts->ram_mib);
+        goto done;
+      }
+    }
+    const oemu_virt_dtb_params vp = {BOOT_RAM_BASE, ram, initrd_pa,
+                                     initrd_pa + (uint64_t)initrd_len, opts->cmdline};
+    st = oemu_virt_dtb_build(&gen, &vp);
+    if (st != OEMU_OK) {
+      (void)fprintf(stderr, "oemu: building the device tree failed: %s\n", oemu_status_str(st));
+      goto done;
+    }
+    tree = oemu_fdt_bytes(&gen);
+    dtb_len = oemu_fdt_length(&gen);
+  } else {
+    if (dtb_load(opts->dtb, &dtb, &dtb_len) != 0) {
+      (void)fprintf(stderr, "oemu: could not load the device tree\n");
+      goto done;
+    }
+    if ((dtb_len < 40U) || (be32(dtb) != BOOT_FDT_MAGIC) || (be32(dtb + 4U) > dtb_len) ||
+        (dtb_len > BOOT_DTB_MAX)) {
+      (void)fprintf(stderr, "oemu: %s is not a valid device tree blob\n", opts->dtb);
+      goto done;
+    }
+    if (opts->cmdline != NULL) {
+      if (!dtb_patch_bootline(dtb, dtb_len, opts->cmdline)) {
+        (void)fprintf(stderr, "oemu: -append: this DTB has no /chosen/bootline to write\n");
+        goto done;
+      }
+    }
+    /* The tree's /memory reg must describe the RAM we actually build, or a
+     * guest trusts a lie. A tree with no /memory node asserts nothing, so warn
+     * and carry on. */
+    if (!dtb_patch_node(dtb, dtb_len, BOOT_RAM_BASE, ram)) {
+      (void)fprintf(stderr, "oemu: note: the device tree has no /memory node to size\n");
+    }
+    if (have_initrd) {
+      (void)fprintf(stderr,
+                    "oemu: note: -initrd needs the generated tree; drop -dtb to inject it\n");
+    }
+    tree = dtb;
   }
 
   /* booting.rst: magic, min-version, flags, and the text fitting RAM. */
@@ -704,9 +771,21 @@ static int boot(const boot_opts *opts) {
   {
     uint64_t pa = dtb_pa;
     for (size_t i = 0U; i < dtb_len; i++, pa++) {
-      st = oemu_aspace_write(&machine.aspace, pa, OEMU_MEM_BYTE, dtb[i]);
+      st = oemu_aspace_write(&machine.aspace, pa, OEMU_MEM_BYTE, tree[i]);
       if (st != OEMU_OK) {
         (void)fprintf(stderr, "oemu: placing the DTB failed: %s\n", oemu_status_str(st));
+        goto done;
+      }
+    }
+  }
+  /* The ramdisk lands where the generated tree promised it. The address was
+   * checked to fit at build time, so a bus write only fails on a real fault. */
+  if (have_initrd) {
+    const unsigned char *ib = oemu_buffer_data(&initrd);
+    for (uint64_t pa = initrd_pa, i = 0U; i < (uint64_t)initrd_len; i++, pa++) {
+      st = oemu_aspace_write(&machine.aspace, pa, OEMU_MEM_BYTE, ib[i]);
+      if (st != OEMU_OK) {
+        (void)fprintf(stderr, "oemu: placing the initrd failed: %s\n", oemu_status_str(st));
         goto done;
       }
     }
@@ -734,8 +813,15 @@ done:
   if ((serial != NULL) && (serial != stdout)) {
     (void)fclose(serial);
   }
-  if (dtb != NULL) {
+  /* The generated tree is owned by the fdt builder (dtb points into it); an
+   * -dtb blob is a lone allocation from dtb_load. Two different owners. */
+  if (generated) {
+    oemu_fdt_dispose(&gen);
+  } else if (dtb != NULL) {
     oemu_allocator_get()->free(dtb, NULL);
+  }
+  if (have_initrd) {
+    oemu_buffer_dispose(&initrd);
   }
   oemu_machine_dispose(&machine);
   oemu_buffer_dispose(&image);
@@ -823,6 +909,13 @@ int main(int argc, char **argv) {
         } else {
           opts.dtb = v;
         }
+        i++;
+      } else if (strcmp(a, "-initrd") == 0) {
+        if (v == NULL) {
+          print_usage(stderr);
+          return EXIT_USAGE;
+        }
+        opts.initrd = v;
         i++;
       } else if (strcmp(a, "-m") == 0) {
         if (v == NULL || parse_mib(v, &opts.ram_mib) != 0) {

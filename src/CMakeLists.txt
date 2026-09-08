@@ -21,6 +21,7 @@ add_library(oemu
   kernel/image.c
   dev/pl011.c
   dev/gicv2.c
+  dev/virt_dtb.c
   fw/psci.c
   vcpu/vcpu.c
   elf/elf.c
