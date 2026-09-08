@@ -110,11 +110,28 @@ timer 一接上 jiffies 走动、内核越过该点——但随即在 `FAR=0x28`
 （scheduler 跑起来后的一个空指针，属**下一个**保真 bug，非回退：无 initrd 路径
 仍干净 panic、冒烟与四门全绿 882/882）。
 
+### 第 4 轮：定位 initramfs 普通文件 populate 崩溃（oracle 实证 oemu 保真 bug）
+
+- 用 System.map 反解崩溃 PC：内核在 `chown_common+0x48`（`ldr x0,[x20,#0x28]`，
+  x20=0）取一级翻译错，FAR=0x28。`chown_common` 以 **dentry->d_inode==NULL（负
+  dentry）** 被调用。临时在 `oemu_exc_take` 加一次性首异常追踪（已回退）确认：
+  全程**第一个**同步异常就是这条 data abort（非更早的 undefined/SError）。
+- **判别实验**：① timer 关掉（PPI 改 63）仍崩 → timer 无罪（连线正确、保留）。
+  ② dir-only initramfs 干净 panic、任何**普通文件**条目（含 0 字节、改名 foo）
+  即崩 → 触发点是往 rootfs(tmpfs) populate 一个 regular file。③ **QEMU oracle**
+  跑同一 Image+同一 foo.cpio：正常 unpack、走到默认 init 搜索后干净 panic——
+  ⇒ 这是 **oemu 的保真 bug**，不是内核/initramfs 问题。
+- 结论：initramfs 里普通文件的 create/lookup 在 oemu 上返回了负 dentry（QEMU
+  上是正 dentry），下游 `init_chown`→`chown_common` 遂取空 inode。root cause 需
+  oemu↔QEMU 执行流对齐（见待办），非单靠静态读能定位。四门仍 882/882（本提交
+  未动可执行代码；timer/接线保留）。
+
 ### 待办（后续轮）
 
-- 中断接线：virtual timer PPI(27) 经可注入 clock 触发 + PL011 SPI(33) RX 中断
-  → 喂进 GIC `set_pending`，否则交互 shell 收不到喂入的字节。
-- stdin raw mode → PL011 RX，喂入时序与 oracle 对齐（guest 起来后再喂）。
-- guest 侧 initramfs（`gen_init_cpio` 现成）+ 静态 busybox + `/init`（打印三
-  标记后 `poweroff`）。镜像 gitignore，脚本入库。
-- L3 门 `tests/guest/boot-smoke.sh`（缺镜像即跳过）+ `make boot-linux`。
+- **root cause**：写一次性「指令 trace」小工具（或复用 exec 内建计数）在 oemu 与
+  `qemu -d in_asm,exec` 各跑同一段 populate，二分对齐到分叉指令。头号嫌疑：
+  dentry 发布所用路径——`hlist_bl` 位自旋锁 / `cmpxchg`（LL/SC）跨异常未清 monitor、
+  或 tmpfs 页清（DC ZVA/页拷贝）某指令 oemu 与真机有差。先证 `do_exclusive` 的
+  monitor 是否应在任意 plain store 命中同址时失效（现仅 STXR 清）。
+- 修好后：喂 stdin（`-serial stdio`）取 `SHELL_ALIVE` + `poweroff`→exit 0。
+- L3 门 `scripts/boot-linux-gate.sh`（缺镜像即跳过）+ `make boot-linux` target。
