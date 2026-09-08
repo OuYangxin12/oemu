@@ -125,13 +125,22 @@ timer 一接上 jiffies 走动、内核越过该点——但随即在 `FAR=0x28`
   上是正 dentry），下游 `init_chown`→`chown_common` 遂取空 inode。root cause 需
   oemu↔QEMU 执行流对齐（见待办），非单靠静态读能定位。四门仍 882/882（本提交
   未动可执行代码；timer/接线保留）。
+- **追补（PC-ring + dentry 探针，均一次性、已回退）**：exec 内加每指令 PC 环形缓冲
+  + 首异常时 dump，并就地经 memops 读回 dentry 字段。定论调用链：`do_name →
+  filp_open(O_CREAT)`（返回**非** err 的 struct file）`→ vfs_fchown → chown_common`；
+  探针读到 `mnt`/`dentry` 均有效、`d_inode(+0x30)==0x0`（**内存里真的为 0**，非
+  oemu 读错值）——即 `filp_open(O_CREAT)` 在 oemu 上把一次 create 变成"返回成功但
+  dentry 为负"，QEMU 上则是正 dentry。故是 **oemu 执行态分歧**（create 那一路某指令
+  语义/标志位有差），非取数 bug、非 timer、非 initramfs。dentry 处 d_flags 亦见
+  RCU/PARALLEL 位，像一份被留在负态的 dentry。
 
 ### 待办（后续轮）
 
-- **root cause**：写一次性「指令 trace」小工具（或复用 exec 内建计数）在 oemu 与
-  `qemu -d in_asm,exec` 各跑同一段 populate，二分对齐到分叉指令。头号嫌疑：
-  dentry 发布所用路径——`hlist_bl` 位自旋锁 / `cmpxchg`（LL/SC）跨异常未清 monitor、
-  或 tmpfs 页清（DC ZVA/页拷贝）某指令 oemu 与真机有差。先证 `do_exclusive` 的
-  monitor 是否应在任意 plain store 命中同址时失效（现仅 STXR 清）。
+- **root cause（已缩小到 filp_open(O_CREAT) 的 create 路径）**：做一次单步 oracle
+  diff：oemu 侧加 `--trace`（反汇编每步 PC，已有 PC-ring 雏形）+ 在 `shmem_create`/
+  `vfs_create`/`d_add` 边界断点；QEMU 侧 `qemu-system-aarch64 -singlestep
+  -d in_asm,int` 跑同段。对齐到第一条分歧指令。重点排查：dentry 发布相关原子
+  （`hlist_bl` 位锁 `test_and_set_bit`=LL/SC、`cmpxchg`）、`d_add`/`__d_add` 内联路径、
+  `do_exclusive` 的 monitor（现仅 STXR 清、不在同址 plain store 时失效——先证伪/证真）。
 - 修好后：喂 stdin（`-serial stdio`）取 `SHELL_ALIVE` + `poweroff`→exit 0。
 - L3 门 `scripts/boot-linux-gate.sh`（缺镜像即跳过）+ `make boot-linux` target。
