@@ -263,3 +263,32 @@ printk 自陷 → oops 再陷 → 最终停在 `panic()` 的忙等（tx_emitted=
 根因指向 oemu 对内核早期自身结构的仿真保真度仍有缺口（怀疑与线性映射
 / 内核写回读一致、或早期映射被上述 WARN 跳过的组合有关），属 M4b 量级
 （GIC/timer-IRQ/更忠实 paging）的工作，非单点可修，故本轮如实记录为未完。
+
+### L3 续：ID 保真度（oracle 校准到 Cortex-A53）
+
+关键发现：内核 panic 前算出的线性映射是错的、prb_reserve 取到野指针。
+用新探测 guest `tests/guest/id_probe.S`（QEMU `-cpu cortex-a53`）实测 oracle
+的 ID 集，纠正了 oemu 谎报的 CPU 身份：
+
+- oracle 横幅行本身印 `Booting Linux ... [0x410fd034]` —— 即 Cortex-**A53**。
+  oemu 之前谎报 A76（MIDR 0x411FD080）+ 拼凑的 ID_AA64* 集。
+- `ID_AA64MMFR0_EL1` 旧值 0x0FF00021（VA_BITS=36）是错的；oracle =
+  **0x1122**（VA_BITS=**42**、PA_BITS=42）。VA_BITS 决定内核 TCR/线性映射
+  布局，错一位就整片线性映射错位 → prb_reserve 野指针 → panic。
+- 一并校准：MIDR 0x410FD034、REVIDR 0x100、PFR0 0x22、ISAR0 0x11120、
+  DFR0 0x10305106、CTR_EL0 0x84448004、CLIDR 0x0A200023。
+- VA_BITS 变 42 后 walk 起始层级变 0，内核跑进早期 `__cpu_setup`，它写
+  TCR2/PIR*/DISR/OSL*/PMUSERENR/AMUSERENR——oemu 缺这些 → MSR/MRS trap
+  Undefined 卡死。按 RAZ/WI 补齐（对应 FEAT 均已在 ID 里报"无"）。
+
+结果：引导推进过 `__cpu_setup`，抵达 `create_pgd_mapping`。
+
+**仍未出横幅**（诚实）：`create_pgd_mapping` 处 BRK WARN（x0=pgdir=0、
+x1=phys=0、x2=virt=0x40000000000001，一个 phys=0 的假 fixmap 槽，可存活）；
+随后 `prb_reserve+0x17c` 解引用 `x0=0x802d88b0`。而 `printk_rb` 静态结构本身在
+合法高 VA（`x19=0xffffffc080280850`）。`0x802d88b0` 恰是合法内核 VA
+`0xffffffc0802d88b0`（= phys 0x402d88b0 的线性映射）**砍掉高 32 位**的结果——
+即某处把运行时 64 位指针截断成 32 位（截断的 store / 或 32 位宽的地址算术）。
+定位需一条对 QEMU 的**总线写日志差分**（oemu 侧记录 setup_log_buf 前后对
+printk_rb 那几十字节的每次写，比对是哪个 width/指令丢的高位），属更深的
+写路径保真度排查，下一轮继续。
