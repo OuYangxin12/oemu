@@ -20,6 +20,7 @@ add_library(oemu
   fdt/fdt.c
   kernel/image.c
   dev/pl011.c
+  dev/gicv2.c
   fw/psci.c
   vcpu/vcpu.c
   elf/elf.c
@@ -30,6 +31,7 @@ target_sources(oemu PRIVATE
   fdt/fdt_internal.h
   kernel/image_internal.h
   dev/pl011_internal.h
+  dev/gicv2_internal.h
   buffer/buffer_internal.h
   regs/regs_internal.h
   decode/decode_internal.h

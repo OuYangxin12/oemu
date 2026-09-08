@@ -60,6 +60,7 @@
 #include <string.h>
 
 #include "boot_dtb.h" /* generated: the fixture blob as bytes */
+#include "oemu/gicv2.h"
 #include "oemu/pl011.h"
 
 /*
@@ -105,6 +106,11 @@
 #define BOOT_IMAGE_BASE      ((uint64_t)0x40080000ULL) /* booting.rst kernel load address */
 #define BOOT_UART_BASE       ((uint64_t)0x09000000ULL) /* virt UART0 -- oracle-portable */
 #define BOOT_UART_SIZE       ((uint64_t)0x00001000ULL)
+#define BOOT_GIC_DIST_BASE   ((uint64_t)0x08000000ULL) /* virt GICD -- DT reg[0] */
+#define BOOT_GIC_DIST_SIZE   ((uint64_t)0x00010000ULL)
+#define BOOT_GIC_CPU_BASE    ((uint64_t)0x08010000ULL) /* virt GICC -- DT reg[1] */
+#define BOOT_GIC_CPU_SIZE    ((uint64_t)0x00010000ULL)
+#define BOOT_GIC_LINES       64U              /* two groups: NR_IRQS 64, as the oracle */
 #define BOOT_DTB_MAX         ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
 #define BOOT_CMDLINE_MAX     (256U)           /* writable boot line width */
 #define BOOT_BOOTLINE_LEN    (257U)           /* the fixture property: pad + NUL */
@@ -509,7 +515,7 @@ static void boot_hang_report(const oemu_vcpu *vcpu, const char *why, uint64_t in
 }
 
 static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
-                    uint64_t max_insns) {
+                    const oemu_gicv2 *gic, uint64_t max_insns) {
   uint64_t budget = max_insns;
   for (;;) {
     const uint64_t slice = (budget < BOOT_QUANTUM) ? budget : BOOT_QUANTUM;
@@ -517,7 +523,12 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
     const oemu_status st = oemu_vcpu_run(vcpu, slice, &done);
     budget -= done;
     (void)oemu_pl011_pump(uart); /* the console drains on every slice boundary */
-    oemu_vcpu_set_irq(vcpu, oemu_pl011_irq_level(uart) != 0);
+    /* The IRQ line is the OR of every source the machine models. The PL011
+     * still drives it directly (its console is polled, so this stays low in
+     * practice); the GIC aggregates the DT-declared sources -- today none are
+     * wired, so it reads low and the vCPU simply never takes a spurious IRQ. */
+    oemu_vcpu_set_irq(vcpu,
+                      (oemu_pl011_irq_level(uart) != 0) || (oemu_gicv2_irq_level(gic) != 0));
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
       return machine->exit_code & 0xFF; /* the code travels as a shell sees it */
@@ -569,6 +580,7 @@ static int boot(const boot_opts *opts) {
   oemu_env_ops env = {0};
   oemu_memops bus = {0};
   oemu_pl011 uart = {0};
+  oemu_gicv2 gic = {0};
   oemu_psci psci = {0};
   boot_env benv = {0};
   boot_serial ser = {0};
@@ -658,6 +670,25 @@ static int boot(const boot_opts *opts) {
     (void)fprintf(stderr, "oemu: attaching the boot UART failed: %s\n", oemu_status_str(st));
     goto done;
   }
+  /* The DT's /interrupt-controller node promises a GICv2 (distributor at
+   * 0x08000000, CPU interface at 0x08010000), and init_IRQ holds the kernel to
+   * that promise -- without it gic_of_init aborts and the whole boot dies. A
+   * single-CPU secure model, 64 lines so SPI 32..63 covers the DT's sources. */
+  oemu_gicv2_init(&gic, BOOT_GIC_LINES);
+  st = oemu_aspace_attach_device(&machine.aspace, BOOT_GIC_DIST_BASE, BOOT_GIC_DIST_SIZE,
+                                 &gic.dist_ops);
+  if (st != OEMU_OK) {
+    (void)fprintf(stderr, "oemu: attaching the GIC distributor failed: %s\n",
+                  oemu_status_str(st));
+    goto done;
+  }
+  st = oemu_aspace_attach_device(&machine.aspace, BOOT_GIC_CPU_BASE, BOOT_GIC_CPU_SIZE,
+                                 &gic.cpu_ops);
+  if (st != OEMU_OK) {
+    (void)fprintf(stderr, "oemu: attaching the GIC CPU interface failed: %s\n",
+                  oemu_status_str(st));
+    goto done;
+  }
   /* x0 will carry this address; the DTB lives in plain RAM at the halfway
    * mark -- inside the machine, past any kernel a -m 1024 guest unpacks. */
   dtb_pa = BOOT_RAM_BASE + (ram / 2U);
@@ -696,7 +727,7 @@ static int boot(const boot_opts *opts) {
   }
   /* The boot protocol: x0 carries the DTB's physical address. */
   oemu_regs_write(&vcpu.cpu.regs, 0U, OEMU_REG_W64, dtb_pa);
-  result = boot_run(&vcpu, &machine, &uart, opts->max_insns);
+  result = boot_run(&vcpu, &machine, &uart, &gic, opts->max_insns);
   (void)oemu_pl011_pump(&uart); /* whatever the guest queued before it died */
 
 done:
