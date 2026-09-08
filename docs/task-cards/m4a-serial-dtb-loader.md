@@ -325,3 +325,30 @@ x4(prot)=0xfffffffdffdfe000` 调用——这组参数明显错乱（size/prot �
 寄存器（与 UMADDL 同类的"窄读"问题，可能藏在 fixmap/线性映射的早期地址算术里，
 如 `fix_to_virt` / `__phys_to_virt` 路径，或某条 add/adrp/mov 的宽度）。下一步
 沿 create_pgd 调用者帧链上溯，定位是哪条指令把 virt 变成 0x40000000000001。
+
+### L3 续：create_pgd 致命 brk 已定位为 fixmap 路径的指令执行 bug
+
+沿 `__primary_switched` 帧链上溯，致命 brk 的调用者是
+`early_fdt_map → fixmap_remap_fdt → create_mapping_noalloc →
+__create_pgd_mapping_locked`（内核早期把 FDT 映射进 fixmap）。
+
+已用一次性探针**逐一排除**了引导 ABI / DTB 本身的问题：
+- 入口实测 `x0 = 0x48000000`，`read@x0 = 0xd00dfeed`（合法 FDT magic），
+  booting.rst 确认 **x0=DTB phys 是正确约定**（不是 x1）。
+- `early_fdt_map` 入口实测 `x0 = x21 = 0x48000000`（FDT 物理地址**完好传到这里**）。
+
+即：DTB 地址一路正确送到 `early_fdt_map`。但在
+`fixmap_remap_fdt`→`create_mapping_noalloc`→`__create_pgd_mapping_locked` 内部，
+到 brk 时参数变成 `phys(x1)=0`（原 `0x48000000`）、`virt(x2)=0x40000000000001`
+（`__fix_to_virt(FIX_FDT)` 的错误值）。`create_pgd` 因此 `WARN_ON` → die → panic。
+
+结论：这是**又一条被 oemu 执行错的指令**，症状与 UMADDL 同类（把地址/指针算错），
+藏在 fixmap/`pgd_offset_pgd`/`__fix_to_virt` 的地址算术里。phys 由 `0x48000000`
+变 0、`__fix_to_virt` 返回 `0x40000000000001` 都是错乱迹象。
+
+**下一轮精确动作**：把指令级 trace 限定在 `fixmap_remap_fdt`(0x…8005?)、
+`create_mapping_noalloc`、`__create_pgd_mapping_locked`(0xffffffc08001c…)、
+`pgd_offset_pgd` 的地址上，逐条与 QEMU oracle（同 `-cpu cortex-a53`）对比，
+定位是哪条指令（疑 adrp/adr_l、`bfi/ubfm/sbfm` 宽度、或 `__fix_to_virt` 里
+对 fixaddr 基址的读取）算错了地址。修好它，`early_fdt_map` 成功，内核应能
+进入 `console_init` 并首次打印 earlycon 横幅。
