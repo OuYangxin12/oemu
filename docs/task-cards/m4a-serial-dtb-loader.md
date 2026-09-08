@@ -352,3 +352,45 @@ __create_pgd_mapping_locked`（内核早期把 FDT 映射进 fixmap）。
 定位是哪条指令（疑 adrp/adr_l、`bfi/ubfm/sbfm` 宽度、或 `__fix_to_virt` 里
 对 fixaddr 基址的读取）算错了地址。修好它，`early_fdt_map` 成功，内核应能
 进入 `console_init` 并首次打印 earlycon 横幅。
+
+### L3 再续：更正前判 + 精确锁定（本轮实测，未改 src）
+
+**推翻前一轮的"参数被污染"假说**：那条 brk 的 `phys=0 / virt=0x40000000000001`
+是我早先在别的执行点抓的，误导了方向。本轮逐条单步实测：
+
+- 用**相同** Image+DTB 在 QEMU（`-cpu cortex-a53 -accel tcg`）实跑，能一路
+  印到横幅（`Booting Linux …` + `earlycon: pl11 at MMIO 0x9000000`），故当前
+  拦路石 100% 是 **oemu 侧**的 bug，不是 DTB/装载/ABI/内核配置。
+- fixmap noalloc 的 `__create_pgd_mapping` 入口参数**完全正确**
+  （`pgdir=0x…80341000 phys=0x48000000 virt=0xfffffffdfddfe000 size=0x1000`），
+  且其首个 PUD 迭代正常走"复用已建表"分支——**参数没有被污染**。
+- 致命 brk 实为 `alloc_init_pte` 里的 `BUG_ON(!pgtable_alloc)`：控制流是
+  `+0x36c`(c2cc `ldr x1,[x21]`; `and/cmp/b.eq` 未命中) → `c2ec cbnz x1` 未跳
+  （因 x1=0）→ `c30c cbz x0`（x0=`[sp,#152]`=pgtable_alloc=**NULL**）→ brk。
+  即 noalloc 变体在此处**需要新建一张 PTE 表却无分配器**。
+- 该处 `x21=0xfffffffdfdc3a770`；oemu 翻译读回 **0**（status=0，无故障）。手动
+  按总线下走同样的表链得到同一叶 PTE（`0xe8000040305703`→页落 `0x40305000`，
+  偏移处内容确为 0），`and …,#3=3` 亦正确。**读取无误**：这个 PMD 槽在物理内存
+  里就是 0，即 `early_fixmap_init` 没把整段 fixmap 的这张 PTE 表建全。
+
+**关键新事实**：`TCR_EL1.T1SZ = 25` → 内核实际以 **VA_BITS=39**（3 级：
+start_level=1，PGD/PMD/PTE）运行，**不是**我之前经 `ID_AA64MMFR0_EL1=0x1122`
+宣称的 42 位。A53 本就只支持 39 位 VA / 40 位 PA，该 ID 值可疑（待与 QEMU 对
+齐）。因此页表几何与 fixmap 自映射须在 39 位下被正确演练。
+
+**结论（当前精确拦路石）**：内核早期把整段 fixmap 预映射（`early_fixmap_init`
+给每个子区间填了 PTE 表），随后 `early_fdt_map` 的 `create_mapping_noalloc`
+理应"零分配"地复用这些表。但在 oemu 里，FDT 所在的这个 PMD 槽读回 0 →
+noalloc 无路可走 → `BUG_ON` → die → panic（早于 console_init，故仍无横幅）。
+下一步：判定是 `early_fixmap_init` 的一条 **store** 在 oemu 里落到了错的物理页
+（写入 `pmdp` 用的 fixmap 别名地址），还是 oemu 对**自映射 fixmap VA**（把页表
+自身再映射一次的 39 位 fixmap 别名）的**翻译**与 QEMU 不同。
+
+**可复现的取证通道（本轮验证）**：
+- gdb 单步 QEMU 需 `aarch64` 远程目标，本环境只有 x86 原生 gdb（拒 aarch64），
+  **不可用**；`-gdbstub` 需 `-accel tcg` 才开 TCP。
+- 可用通道：`-d exec`（每 TB 记 guest PC，已能确认 QEMU 跑过
+  `early_fixmap_init`/`fixmap_remap_fdt`/`__create_pgd_mapping` 全链）；
+  `-monitor tcp:…,server` 可用（`x/1gx <VA>` 走 QEMU 真 MMU，能验 `…dfe000`
+  读到 FDT magic `0xd00dfeed`，但 create_pgd 期那个瞬态 fixmap 别名已拆除）。
+- 建议：加一条 `-plugin`（TCG 指令级 trace）或找一份 aarch64 gdb 做逐条比对。
