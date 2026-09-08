@@ -164,3 +164,58 @@ distributor 寄存器（VA 0xffffffc080360004，oemu 该处无设备）触发数
 
 门：make test 829/829、make asan 829/829、make tidy exit 0、format-check 仅
 `bench/corpus/k_addsub.c` 预存漂移。
+
+## 第 3 轮落地：GICv2 + arch timer + CRC32 → 抵达 oracle 终态（本提交）
+
+第 2 轮把内核推到 `gic_of_init`，需要 GICv2。本轮补齐 GICv2 + arch timer +
+CRC32，内核一路跑到 **init 任务**并复现 QEMU oracle 的**终态**。三个独立提交
+（`048689a` gicv2、`1267618` sysreg、`521da15` crc）：
+
+- **GICv2 设备**（`src/dev/gicv2.c`、`include/oemu/gicv2.h`、
+  `src/dev/gicv2_internal.h`，`boot_run` 接线）：照抄 qemu `arm_gic`。
+  GICD_PIDR2=0x2B 身份、固定 64 线（两组）TYPER、banked
+  enable/pending/active/priority/target/config 窗口、优先级扫描 CPU interface
+  （IAR 应答最高优先级、EOI 清 active）。未建模偏移读 0/写丢弃，**绝不取异常**
+  （正是 `gic_of_init` 里数据异常杀死启动的那处）。SGI/PPI 目标固定本 CPU，
+  SPI 目标可写。`oemu_gicv2_internal_scan` 抽成纯判定表（白盒）。
+  一处真 bug：`lines_of` 早先返回"组数"(2) 而非"线数"(64)，扫描只会越过 id 1。
+- **arch timer 选择子纠正**（`include/oemu/sysreg.h`、`src/sysreg/sysreg.c`）：
+  客户机按**它真正发射的字**命中寄存器，不能靠别名表。四个 `_EL1` 选择子此前
+  全错（0x07xx 基底匹配不到任何项），每次访问漏表→ hyp-trap oops 死在
+  `time_init`。直接从 `vmlinux` 反推：`CNTKCTL_EL1` 真是 **0x0708**（别名会让人
+  误以为 0x1f08），而 `CNTVOFF` 与 `CNTP_*` 特权视图折进 **0x1f__** 段。补
+  `CNTVCTSS/CNTPCTSS`（自同步计数）与虚拟时钟对 `CNTV_CTL_EL0/CNTV_CVAL_EL0`，
+  并把表按选择子**重排升序**（EL1 组移出 0x07xx 槽）。`TPIDRRO_EL0` 曾被标
+  RO，但它只是 EL0 只读：`__switch_to` 每次上下文切换清零它，故必须 EL1 可写
+  （否则 `msr tpidrro_el0, xzr` oops）。
+- **CRC32B/H/W/X**（`src/decode/decode.c`、`src/exec/exec.c`、
+  `exec_internal.h`、`include/oemu/decode.h`）：A53 置 `ID_AA64ISAR0_EL1.CRC`，
+  内核 crc32 库跑硬件指令，不实现就撞未定义陷阱。照架构 CRC() 伪码
+  （反射 CRC-32，poly 0x04C11DB7）实现；数据宽度 = 1<<opcode 低两位，结果 32 位、
+  种子 Rn。越过内核自带 crc32 自检即 oracle 确认。
+
+测试：`test_gicv2.cpp`(12 黑盒)、`test_gicv2_internal.cpp`(10 白盒扫描判定表)、
+`test_exec_internal.cpp` 增 CRC32 表(12)、`test_decode.cpp` 增 CRC 译码(1)。
+
+**终态达成**（`boot -kernel guest/build/Image`，同 DTB）——oemu 与
+`qemu-system-aarch64 -cpu cortex-a53` oracle 逐字一致：
+```
+Run /sbin/init as init process
+Run /etc/init as init process
+Run /bin/init as init process
+Run /bin/sh as init process
+Kernel panic - not syncing: No working init found.
+```
+内核轨迹：banner → psci → GIC 探测过 → `time_init`/arch_timer 过 →
+`Freeing unused kernel memory` → `Switched to clocksource arch_sys_counter` →
+`rest_init → schedule → __switch_to`（上下文切换过）→ **init(pid1) 起来**跑
+`kernel_init`（crc32 自检过）→ 找不到 init 程序 → 终态 panic。唯一残差是
+`CPU features:` 位图行（oracle 多报若干能力位），属**有意**诚实偏离，非终态。
+
+门：make test 865/865、make asan 865/865（较上轮 +36）、make tidy exit 0、
+format-check 仅 `bench/corpus/k_addsub.c` 预存漂移。
+
+**下一里程碑（M5）**：busybox initramfs 让 init 真跑起来（当前无 initrd 故
+init-not-found 即正确终态）；`--smp 4` 全调度；WFI 停步进的 yield 语义。
+timer IRQ 交付（`CNTV_CVAL`→PPI→IAR）本轮未接——内核靠调度器选中 init_task
+即达终态，无需 tick；若后续 idle 等 tick 再补 gtimer（可注入 clock 硬约束）。
