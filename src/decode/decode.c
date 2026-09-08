@@ -1212,8 +1212,14 @@ static oemu_status decode_ldst_pair(uint32_t word, oemu_insn *insn) {
       insn->index_mode = OEMU_INDEX_PRE;
       break;
     default:
-      /* form == 0 is the non-temporal LDNP/STNP pair. */
-      return OEMU_ERR_UNSUPPORTED;
+      /* form 0: the non-temporal pair LDNP/STNP. The non-temporal hint is
+       * advice about the cache, not about the access: the load/store happen
+       * exactly as for the untagged forms, so we execute them as LDP/STP
+       * with no offset. Linux reaches for STNP in __pi_clear_page whenever
+       * DCZID_EL0.DZP says DC ZVA is off, so leaving these unsupported kills
+       * the kernel before its first page is ever cleared. */
+      insn->index_mode = OEMU_INDEX_NONE;
+      break;
   }
 
   insn->rd = field_rd(word);
