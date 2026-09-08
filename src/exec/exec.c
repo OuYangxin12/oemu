@@ -600,6 +600,25 @@ static oemu_status do_bitfield(oemu_cpu *cpu, const oemu_insn *in) {
   return OEMU_OK;
 }
 
+uint32_t oemu_exec_internal_crc32(uint32_t crc_in, uint64_t data, unsigned bytes) {
+  /* The architecture's CRC() pseudocode verbatim: XOR the running sum's MSB
+   * with the incoming data LSB, shift the sum left, feed the data right, and
+   * fold in the polynomial where they differ. LSB-first => the reflected
+   * CRC-32 the guest's crc32() returns. */
+  const uint32_t poly = 0x04C11DB7U;
+  uint32_t crc = crc_in;
+  const unsigned nbits = bytes * 8U;
+  for (unsigned j = 0U; j < nbits; ++j) {
+    const uint32_t topbit = ((crc >> 31) ^ (uint32_t)(data & UINT64_C(1))) & UINT32_C(1);
+    crc <<= 1;
+    data >>= 1;
+    if (topbit != 0U) {
+      crc ^= poly;
+    }
+  }
+  return crc;
+}
+
 static oemu_status do_csel(oemu_cpu *cpu, const oemu_insn *in) {
   const uint64_t a = read_g(cpu, in->rn, false, in->width);
   const uint64_t b = read_g(cpu, in->rm, false, in->width);
@@ -1179,6 +1198,16 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       break;
     }
 
+    case OEMU_OP_CRC32: {
+      /* Reflected CRC-32 (poly 0x04C11DB7). The data operand is Rm: its low
+       * `in->uimm` bytes (all 8 for CRC32X, read from the full 64-bit
+       * register); the seed is Rn's low 32 bits; the result is 32-bit. */
+      const uint32_t seed = (uint32_t)read_g(cpu, in->rn, false, OEMU_REG_W32);
+      const uint64_t data = read_g(cpu, in->rm, false, OEMU_REG_W64);
+      write_g(cpu, in->rd, false, OEMU_REG_W32,
+              oemu_exec_internal_crc32(seed, data, (unsigned)in->uimm));
+      break;
+    }
     case OEMU_OP_RBIT:
       write_g(cpu, in->rd, false, in->width,
               oemu_exec_internal_rbit(read_g(cpu, in->rn, false, in->width), in->width));

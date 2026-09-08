@@ -125,6 +125,7 @@ typedef enum oemu_opcode {
   OEMU_OP_LSRV,
   OEMU_OP_ASRV,
   OEMU_OP_RORV,
+  OEMU_OP_CRC32, /* CRC32B/H/W/X; the byte count rides in insn.uimm */
 
   /* one-source */
   OEMU_OP_RBIT,

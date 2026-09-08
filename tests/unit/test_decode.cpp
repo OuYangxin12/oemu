@@ -701,6 +701,19 @@ TEST(DecodeDataProcessing, DecodesDivideAndVariableShift) {
   EXPECT_EQ(OEMU_OP_RORV, DecodeOk(0x9ac22c20U).op);
 }
 
+TEST(DecodeDataProcessing, DecodesCrc32) {
+  // Cortex-A53 implements the CRC extension, so these must decode, and the
+  // data width (1<<low bits of the opcode) is carried in uimm for the executor.
+  EXPECT_EQ(OEMU_OP_CRC32, DecodeOk(0x1ac24020U).op);  // crc32b w0, w1, w2
+  EXPECT_EQ(OEMU_OP_CRC32, DecodeOk(0x1ac24420U).op);  // crc32h w0, w1, w2
+  EXPECT_EQ(OEMU_OP_CRC32, DecodeOk(0x1ac24820U).op);  // crc32w w0, w1, w2
+  EXPECT_EQ(OEMU_OP_CRC32, DecodeOk(0x9ac24c20U).op);  // crc32x x0, x1, x2
+  EXPECT_EQ(1u, DecodeOk(0x1ac24020U).uimm);
+  EXPECT_EQ(2u, DecodeOk(0x1ac24420U).uimm);
+  EXPECT_EQ(4u, DecodeOk(0x1ac24820U).uimm);
+  EXPECT_EQ(8u, DecodeOk(0x9ac24c20U).uimm);
+}
+
 TEST(DecodeDataProcessing, RevIsWidthDependent) {
   // opcode 0b000010 is REV at 32-bit width but REV32 at 64-bit.
   EXPECT_EQ(OEMU_OP_REV, DecodeOk(0x5ac00820U).op);    // rev w0, w1
