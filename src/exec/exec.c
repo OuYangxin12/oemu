@@ -553,8 +553,13 @@ static oemu_status do_bitfield(oemu_cpu *cpu, const oemu_insn *in) {
   const uint64_t src = read_g(cpu, in->rn, false, in->width);
 
   /* ARM gives SBFM/UBFM as "take the low `len` bits of ROR(Xn, #immR)", where
-   * a wrapped range (immR > immS) shortens len instead of erroring. */
-  const unsigned len = (msb < lsb) ? (bits - lsb + msb) : (msb - lsb + 1U);
+   * a wrapped range (immR > immS) shortens len instead of erroring. Note the
+   * wrap adds back the two pieces' overlap-free count: len = regsize - immR +
+   * immS + 1, NOT regsize - immR + immS. Getting that off by one truncates
+   * e.g. UBFIZ #3,#9 (the wrapping spelling of `lsl #3` on a 9-bit index) to
+   * 11 bits -- which drops the top bit of a PMD index and lands a page-table
+   * walk in the wrong slot. */
+  const unsigned len = (msb < lsb) ? (bits - lsb + msb + 1U) : (msb - lsb + 1U);
   uint64_t rot;
   if (lsb == 0U) {
     rot = src;
