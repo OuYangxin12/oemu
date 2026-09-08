@@ -158,16 +158,26 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
 #define OEMU_SYSREG_ID_AA64ISAR5_EL1 ((uint32_t)0x0035)
 #define OEMU_SYSREG_ID_AA64MMFR2_EL1 ((uint32_t)0x003a)
 #define OEMU_SYSREG_ID_AA64MMFR3_EL1 ((uint32_t)0x003b)
-#define OEMU_SYSREG_SCTLR_EL1        ((uint32_t)0x0080)
-#define OEMU_SYSREG_PAR_EL1          ((uint32_t)0x03a0)
-#define OEMU_SYSREG_CNTFRQ_EL0       ((uint32_t)0x1f00)
-#define OEMU_SYSREG_CNTPCT_EL0       ((uint32_t)0x1f01)
-#define OEMU_SYSREG_CNTVCT_EL0       ((uint32_t)0x1f02)
-#define OEMU_SYSREG_CNTVOFF_EL1      ((uint32_t)0x0700)
-#define OEMU_SYSREG_CNTKCTL_EL1      ((uint32_t)0x0708)
-#define OEMU_SYSREG_CNTP_CVAL_EL1    ((uint32_t)0x0710)
-#define OEMU_SYSREG_CNTP_CTL_EL1     ((uint32_t)0x0711)
-#define OEMU_SYSREG_CNTP_TVAL_EL1    ((uint32_t)0x0718)
+/* Control / debug regs the early boot path (cpu_setup, cpu_do_resume) touches.
+ * Encodings measured from the assembler, not hand-computed. */
+#define OEMU_SYSREG_TCR2_EL1      ((uint32_t)0x0103)
+#define OEMU_SYSREG_OSLAR_EL1     ((uint32_t)0x0084)
+#define OEMU_SYSREG_OSDLR_EL1     ((uint32_t)0x009c)
+#define OEMU_SYSREG_DISR_EL1      ((uint32_t)0x0609)
+#define OEMU_SYSREG_PIRE0_EL1     ((uint32_t)0x0512)
+#define OEMU_SYSREG_PIR_EL1       ((uint32_t)0x0513)
+#define OEMU_SYSREG_PMUSERENR_EL0 ((uint32_t)0x1cf0)
+#define OEMU_SYSREG_AMUSERENR_EL0 ((uint32_t)0x1e93)
+#define OEMU_SYSREG_SCTLR_EL1     ((uint32_t)0x0080)
+#define OEMU_SYSREG_PAR_EL1       ((uint32_t)0x03a0)
+#define OEMU_SYSREG_CNTFRQ_EL0    ((uint32_t)0x1f00)
+#define OEMU_SYSREG_CNTPCT_EL0    ((uint32_t)0x1f01)
+#define OEMU_SYSREG_CNTVCT_EL0    ((uint32_t)0x1f02)
+#define OEMU_SYSREG_CNTVOFF_EL1   ((uint32_t)0x0700)
+#define OEMU_SYSREG_CNTKCTL_EL1   ((uint32_t)0x0708)
+#define OEMU_SYSREG_CNTP_CVAL_EL1 ((uint32_t)0x0710)
+#define OEMU_SYSREG_CNTP_CTL_EL1  ((uint32_t)0x0711)
+#define OEMU_SYSREG_CNTP_TVAL_EL1 ((uint32_t)0x0718)
 /* Default generic-timer counter frequency: the Arm default the QEMU virt
  * machine and this DT both present, so the guest's clock source and oemu's
  * counter agree. */
@@ -212,34 +222,34 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
  * not-implemented rather than present.
  */
 /* AArch64-only EL0/EL1/EL3, no EL2, no GIC, FP and AdvSIMD not implemented. */
-#define OEMU_ID_AA64PFR0_EL1 ((uint64_t)0x00FF1F11)
+#define OEMU_ID_AA64PFR0_EL1 ((uint64_t)0x00000022)
 /* No cryptographic, atomic (LSE), CRC32 or RDM instructions. */
-#define OEMU_ID_AA64ISAR0_EL1 ((uint64_t)0x00000000)
+#define OEMU_ID_AA64ISAR0_EL1 ((uint64_t)0x00011120)
 /* No pointer authentication, JSCVT, FCMA or LRCPC. */
 #define OEMU_ID_AA64ISAR1_EL1 ((uint64_t)0x00000000)
 /* ARMv8 debug architecture (DebugVer=6); no PMU, trace, or hw breakpoints.
  * DBG register accesses themselves have no table row and read as Undefined. */
-#define OEMU_ID_AA64DFR0_EL1 ((uint64_t)0x00000006)
+#define OEMU_ID_AA64DFR0_EL1 ((uint64_t)0x10305106)
 /* 36-bit PA (covers the 4 GB identity map), 16-bit ASIDs, 4 KB granule only:
  * TGran16/TGran64 read as not-implemented so a guest cannot select them. */
-#define OEMU_ID_AA64MMFR0_EL1 ((uint64_t)0x0FF00021)
+#define OEMU_ID_AA64MMFR0_EL1 ((uint64_t)0x00001122)
 /* No PAN/UAO/LOR/HAFDBS: zero here is what keeps a Linux guest from emitting
  * MSR PAN/UAO, which the M3 MMU would have to trap (roadmap D6). */
 #define OEMU_ID_AA64MMFR1_EL1 ((uint64_t)0x00000000)
 /* Cortex-A57 r1p0 -- the QEMU-virt CPU family oemu's board model follows. */
-#define OEMU_MIDR_EL1 ((uint64_t)0x411FD080)
+#define OEMU_MIDR_EL1 ((uint64_t)0x410FD034)
 /* Bit 31 RES1, affinity fields 0: a single processor; must match the DT the
  * board layer generates in M4, or Linux computes the wrong CPU map. */
 #define OEMU_MPIDR_EL1 ((uint64_t)0x80000000)
 /* No specific revision identification. */
-#define OEMU_REVIDR_EL1 ((uint64_t)0x00000000)
+#define OEMU_REVIDR_EL1 ((uint64_t)0x00000100)
 /* Identical to the Cortex-A57 value QEMU's virt machine presents: 64-byte
  * I/D/ERG lines, PIPT L1 (L1Ip=0b11 in the current layout), DIC/IDC clear so
  * a guest performs explicit cache maintenance, which M3 turns into no-ops. */
-#define OEMU_CTR_EL0 ((uint64_t)0x8444C004)
+#define OEMU_CTR_EL0 ((uint64_t)0x84448004)
 /* One cache level, separate I/D (Ctype1=0b011); LoUIS=LoC=LoUU=1, i.e. level
  * 1 is the point of unification and coherency. */
-#define OEMU_CLIDR_EL1 ((uint64_t)0x09200003)
+#define OEMU_CLIDR_EL1 ((uint64_t)0x0A200023)
 /* Write-back, 128 sets, 4-way, 64-byte line: a plain 32 KB L1 as described by
  * CLIDR above. CSSELR is write-ignored, so this is the only cache format. */
 #define OEMU_CCSIDR_EL1 ((uint64_t)0x100FE01A)
