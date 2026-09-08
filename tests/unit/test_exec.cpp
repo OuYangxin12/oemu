@@ -403,6 +403,28 @@ TEST_F(ExecTest, WideningMultiplyAddsAndSubtractsInSixtyFourBits) {
   EXPECT_EQ(x(0), UINT64_C(0xFFFFFFFFFFFFFFFA)); /* 0 - 6 */
 }
 
+TEST_F(ExecTest, WideningAddendIsFullSixtyFourBits) {
+  // The third operand (Ra) of {S,U}MADDL/MSUBL is a full 64-bit addend, not a
+  // word: a regression that read it as W32 dropped its top half and silently
+  // corrupted the real kernel's ring-buffer arithmetic, which scales an index
+  // by an element size and adds a 64-bit base (`umaddl x0, w2, w1, x0`).
+  // Encodings mirror the ones verified in the test above (only the operands
+  // and the addend's width are what matters here).
+  program({0x9b220c20U, /* smaddl x0,w1,w2,x3 */ 0x9ba28c20U /* umsubl x0,w1,w2,x3 */});
+  // A 64-bit base plus a small scaled index: the top half must survive the add.
+  set_x(1, 2U);                           /* index 2 */
+  set_x(2, 24U);                          /* element size 24 -> +48 */
+  set_x(3, UINT64_C(0xffffffc0802d8850)); /* kernel-linear-map base pointer */
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0xffffffc0802d8880)); /* base + 48, high half intact */
+  // Umul with a zero product still has to pass the 64-bit addend straight through.
+  set_x(1, 0U);
+  set_x(2, 0U);
+  set_x(3, UINT64_C(0xffffffc0802d88b0));
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0xffffffc0802d88b0));
+}
+
 TEST_F(ExecTest, MulHighCoversTheTrickyCorners) {
   program({0x9bc27c20U, /* umulh x0,x1,x2 */ 0x9b427c20U /* smulh x0,x1,x2 */});
   set_x(1, UINT64_MAX);

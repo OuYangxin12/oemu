@@ -1221,22 +1221,25 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
     case OEMU_OP_SMSUBL:
     case OEMU_OP_UMADDL:
     case OEMU_OP_UMSUBL: {
-      /* The widening family: three 32-bit sources (sign choice per op), one
-       * 64-bit destination. */
+      /* The widening family: two 32-bit multiplicands (sign choice per op),
+       * but the ADDEND (Ra) and the destination are full 64-bit. Ra is the
+       * third operand added to the widened product; reading it as W32 drops
+       * the top half of a 64-bit pointer, so a guest that scales an index by
+       * an element size and adds a base address faults on a bogus low
+       * address -- Linux's to_desc does exactly `umaddl x0, w2, w1, x0` on the
+       * printk ring pointer, which is what stalled the earlycon banner. */
       const bool sgn = (in->op == OEMU_OP_SMADDL) || (in->op == OEMU_OP_SMSUBL);
+      const bool add = (in->op == OEMU_OP_SMADDL) || (in->op == OEMU_OP_UMADDL);
       const uint64_t n = read_g(cpu, in->rn, false, OEMU_REG_W32);
       const uint64_t m = read_g(cpu, in->rm, false, OEMU_REG_W32);
-      const uint64_t a = read_g(cpu, in->ra, false, OEMU_REG_W32);
+      const uint64_t a = read_g(cpu, in->ra, false, OEMU_REG_W64);
       uint64_t prod;
       if (sgn) {
         prod = (uint64_t)((int64_t)(int32_t)(uint32_t)n * (int64_t)(int32_t)(uint32_t)m);
       } else {
         prod = (n & UINT32_MAX) * (m & UINT32_MAX);
       }
-      const uint64_t acc = sgn ? (uint64_t)(int64_t)(int32_t)(uint32_t)a : (a & UINT32_MAX);
-      write_g(cpu, in->rd, false, OEMU_REG_W64,
-              ((in->op == OEMU_OP_SMADDL) || (in->op == OEMU_OP_UMADDL)) ? (acc + prod)
-                                                                         : (acc - prod));
+      write_g(cpu, in->rd, false, OEMU_REG_W64, add ? (a + prod) : (a - prod));
       break;
     }
     case OEMU_OP_SMULH:
