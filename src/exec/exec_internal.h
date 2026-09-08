@@ -86,6 +86,16 @@ uint64_t oemu_exec_internal_rev16(uint64_t value, oemu_reg_width width);
 uint64_t oemu_exec_internal_rev32(uint64_t value);
 
 /*
+ * Reflected CRC-32 (Arm CRC extension, polynomial 0x04C11DB7): the pure core
+ * of CRC32B/H/W/X. `crc_in` seeds the running sum, `data`'s low `bytes` bytes
+ * feed the shift register (8 for CRC32X, 1 for CRC32B), and the 32-bit result
+ * is returned. Bit order is LSB-first, exactly as the
+ * architecture's CRC() pseudocode, so the guest's crc32 library gets the same
+ * value the oracle does.
+ */
+uint32_t oemu_exec_internal_crc32(uint32_t crc_in, uint64_t data, unsigned bytes);
+
+/*
  * Executes one already-decoded instruction (op != OEMU_OP_UNKNOWN), including
  * the PC update: branches land on insn->imm, everything else advances by 4.
  * Same precise-fault contract as oemu_exec_step.

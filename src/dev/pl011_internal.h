@@ -59,6 +59,7 @@ OEMU_BEGIN_DECLS
 #define PL011_CR_UARTEN 0x01U
 #define PL011_CR_SIREN  0x02U
 #define PL011_CR_SIRLP  0x04U
+#define PL011_CR_FEN    0x10U /* fifo enable: off means immediate pass-through */
 #define PL011_CR_LBE    0x80U
 #define PL011_CR_TXE    0x100U
 #define PL011_CR_RXE    0x200U

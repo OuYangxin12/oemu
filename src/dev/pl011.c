@@ -166,8 +166,25 @@ static oemu_status pl011_write(void *ctx, uint64_t offset, oemu_mem_size size, u
     case PL011_REG_DR:
       /* Emitted unconditionally: measured (probe DROP1|A) that the oracle
        * passes a DR byte through even while CR disables the UART. The
-       * loopback bit mirrors it into RX as well. */
-      pl011_tx_push(uart, (unsigned char)v);
+       * loopback bit mirrors it into RX as well.
+       *
+       * With the FIFO off (CR.FEN=0 -- the state every real driver leaves
+       * it in, including the kernel's arm,pl011 console driver) the oracle's
+       * pass-through is IMMEDIATE: QEMU hands the byte to the chardev in the
+       * write itself, so FR.TXFE is already reasserted when the guest's
+       * transmit spin re-reads FR. A queue-then-pump design looked equivalent
+       * from the outside but is not: earlycon spins on TXFE inside one
+       * execution slice, and a deferred queue left FR lying -- Linux's
+       * __pi_putc ate its own tail and the panic printout died mid-word.
+       * The ring only models the FIFO (FEN=1), where bytes really do queue. */
+      if ((uart->cr & PL011_CR_FEN) == 0U) {
+        if (uart->sink != NULL) {
+          uart->sink(uart->sink_user, (unsigned char)v);
+        }
+        uart->tx_emitted++;
+      } else {
+        pl011_tx_push(uart, (unsigned char)v);
+      }
       uart->ris |= PL011_INT_TIEM;
       if ((uart->cr & PL011_CR_LBE) != 0U) {
         /* Loopback mirrors the byte into RX; a full ring drops it -- the

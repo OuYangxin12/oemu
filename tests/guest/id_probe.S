@@ -162,6 +162,147 @@ _start:
 	bl	putx64
 	bl	putnl
 
+	mrs	x21, S3_0_C0_C0_5	/* GMID_EL1 (raw encoding: clang lacks the mnemonic) */
+	adr	x0, l_gmid
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, cntfrq_el0
+	adr	x0, l_cntfrq
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	/* The AArch32 ID group, dumped for the record. Linux's
+	 * __cpuinfo_store_cpu reads all of these ONLY when id_aa64pfr0_32bit_el0
+	 * is true -- an MRS of them is a synchronous Undefined on an AArch64-only
+	 * core. oemu has no AArch32, so it advertises ID_AA64PFR0_EL1.EL0=0 and the
+	 * kernel never reaches this path; oemu therefore implements NONE of these
+	 * (they would trap). This dump documents the one place oemu's ID set
+	 * deliberately differs from the cortex-a53 oracle, which runs AArch32 at
+	 * EL0 and returns nonzero here. Run under qemu -cpu cortex-a53 only. */
+	mrs	x21, id_pfr0_el1
+	adr	x0, l_pfr0_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_pfr1_el1
+	adr	x0, l_pfr1_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_dfr0_el1
+	adr	x0, l_dfr0_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_isar0_el1
+	adr	x0, l_isar0_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_isar1_el1
+	adr	x0, l_isar1_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_isar2_el1
+	adr	x0, l_isar2_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_isar3_el1
+	adr	x0, l_isar3_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_isar4_el1
+	adr	x0, l_isar4_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_isar5_el1
+	adr	x0, l_isar5_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_mmfr0_el1
+	adr	x0, l_mmfr0_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_mmfr1_el1
+	adr	x0, l_mmfr1_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_mmfr2_el1
+	adr	x0, l_mmfr2_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_mmfr3_el1
+	adr	x0, l_mmfr3_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_mmfr4_el1
+	adr	x0, l_mmfr4_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, id_mmfr5_el1
+	adr	x0, l_mmfr5_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, MVFR0_EL1
+	adr	x0, l_mvfr0_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
+	mrs	x21, MVFR1_EL1
+	adr	x0, l_mvfr1_32
+	bl	puts
+	mov	x0, x21
+	bl	putx64
+	bl	putnl
+
 	adr	x0, str_done
 	bl	puts
 
@@ -236,5 +377,24 @@ l_ctr:		.asciz	"CTR="
 l_clidr:	.asciz	"CLIDR="
 l_ccsidr:	.asciz	"CCSIDR="
 l_aidr:		.asciz	"AIDR="
+l_gmid:		.asciz	"GMID="
+l_cntfrq:	.asciz	"CNTFRQ="
+l_pfr0_32:	.asciz	"ID_PFR0="
+l_pfr1_32:	.asciz	"ID_PFR1="
+l_dfr0_32:	.asciz	"ID_DFR0="
+l_isar0_32:	.asciz	"ID_ISAR0="
+l_isar1_32:	.asciz	"ID_ISAR1="
+l_isar2_32:	.asciz	"ID_ISAR2="
+l_isar3_32:	.asciz	"ID_ISAR3="
+l_isar4_32:	.asciz	"ID_ISAR4="
+l_isar5_32:	.asciz	"ID_ISAR5="
+l_mmfr0_32:	.asciz	"ID_MMFR0="
+l_mmfr1_32:	.asciz	"ID_MMFR1="
+l_mmfr2_32:	.asciz	"ID_MMFR2="
+l_mmfr3_32:	.asciz	"ID_MMFR3="
+l_mmfr4_32:	.asciz	"ID_MMFR4="
+l_mmfr5_32:	.asciz	"ID_MMFR5="
+l_mvfr0_32:	.asciz	"ID_MVFR0="
+l_mvfr1_32:	.asciz	"ID_MVFR1="
 
 _image_end:

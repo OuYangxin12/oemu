@@ -281,12 +281,21 @@ TEST_F(SysregTest, CsSElrIsWriteIgnored) {
 
 TEST_F(SysregTest, ReadOnlyRegistersRejectWrites) {
   const uint32_t sel_rows[] = {
-      OEMU_SYSREG_TPIDRRO_EL0, OEMU_SYSREG_CTR_EL0,    OEMU_SYSREG_DCZID_EL0,
-      OEMU_SYSREG_CLIDR_EL1,   OEMU_SYSREG_CCSIDR_EL1, OEMU_SYSREG_CURRENT_EL,
+      OEMU_SYSREG_CTR_EL0,    OEMU_SYSREG_DCZID_EL0,  OEMU_SYSREG_CLIDR_EL1,
+      OEMU_SYSREG_CCSIDR_EL1, OEMU_SYSREG_CURRENT_EL,
   };
   for (const uint32_t sel : sel_rows) {
     EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_sysreg_write(&sr_, sel, 1)) << oemu_sysreg_name(sel);
   }
+}
+
+// TPIDRRO_EL0 is "EL0 read-only", not read-only: EL1 owns it and the kernel's
+// __switch_to clears it on every context switch, so a write from EL1 must land.
+TEST_F(SysregTest, TpidrroEl0IsWritableFromEl1) {
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_TPIDRRO_EL0, 0x1234));
+  uint64_t value = 0;
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_TPIDRRO_EL0, &value));
+  EXPECT_EQ(0x1234u, value);
 }
 
 // --- exception-level gating ---------------------------------------------------------

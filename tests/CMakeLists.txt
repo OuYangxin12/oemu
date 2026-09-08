@@ -356,6 +356,27 @@ oemu_add_test(test_pl011_check
   LABELS "unit;death"
 )
 
+# The GICv2 interrupt controller, driven through the bus as irq-gic drives it.
+oemu_add_test(test_gicv2
+  SOURCES unit/test_gicv2.cpp
+  LABELS unit
+)
+
+# The GICv2 priority scan: the pure decision table behind the device.
+oemu_add_test(test_gicv2_internal
+  SOURCES unit/test_gicv2_internal.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
+# The PSCI/SMCCC conduit: function IDs from the guest's own contract, and the
+# rule that a PSCI-shaped or SMCCC-standard call is always consumed --
+# bouncing one back as an exception is what oopsed the kernel at boot.
+oemu_add_test(test_psci
+  SOURCES unit/test_psci.cpp
+  LABELS unit
+)
+
 # M3b parity: every served answer against the bypassed walk -- the cache
 # may only be faster. It needs the internal bypass and the peek, so it is
 # a whitebox target; the suite names carry "Tlb" for -R Tlb.

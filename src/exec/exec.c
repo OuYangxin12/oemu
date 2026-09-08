@@ -561,7 +561,22 @@ static oemu_status do_bitfield(oemu_cpu *cpu, const oemu_insn *in) {
    * walk in the wrong slot. */
   const unsigned len = (msb < lsb) ? (bits - lsb + msb + 1U) : (msb - lsb + 1U);
   uint64_t rot;
-  if (lsb == 0U) {
+  if (msb < lsb) {
+    /* Wrapped range (immR > immS): this is the shift-alias form, where UBFM
+     * spells `lsl #s` (immR=regsize-s, immS=regsize-1-s) and SBFM the
+     * sign-extending flavour. A wrapped UBFM is a LEFT SHIFT by
+     * (regsize - immR), NOT a rotate: the ARM field spans bits immS:0 and
+     * regsize-1:immR, and when extracted right-aligned those two pieces sit
+     * contiguously at the top with the vacated low `immR` bits forced to zero.
+     * A rotate instead folds the source's top (regsize-immR) bits back into
+     * those low positions. That is not cosmetic: `lsl x,x,#12` (UBFM #52,#51)
+     * is the very instruction Linux's `allocate_slab` uses to form a slab
+     * object address, and leaving the wrapped bits in returns `...fff` where
+     * the address must end `...000` -- every object one cacheline-short, the
+     * freelist links land misaligned, and the first vmap-tree walk dies on a
+     * garbage rb_right. */
+    rot = (src << (bits - lsb)) & width_mask;
+  } else if (lsb == 0U) {
     rot = src;
   } else {
     rot = (src >> lsb) | (src << (bits - lsb));
@@ -583,6 +598,25 @@ static oemu_status do_bitfield(oemu_cpu *cpu, const oemu_insn *in) {
   }
   write_g(cpu, in->rd, false, in->width, field);
   return OEMU_OK;
+}
+
+uint32_t oemu_exec_internal_crc32(uint32_t crc_in, uint64_t data, unsigned bytes) {
+  /* The architecture's CRC() pseudocode verbatim: XOR the running sum's MSB
+   * with the incoming data LSB, shift the sum left, feed the data right, and
+   * fold in the polynomial where they differ. LSB-first => the reflected
+   * CRC-32 the guest's crc32() returns. */
+  const uint32_t poly = 0x04C11DB7U;
+  uint32_t crc = crc_in;
+  const unsigned nbits = bytes * 8U;
+  for (unsigned j = 0U; j < nbits; ++j) {
+    const uint32_t topbit = ((crc >> 31) ^ (uint32_t)(data & UINT64_C(1))) & UINT32_C(1);
+    crc <<= 1;
+    data >>= 1;
+    if (topbit != 0U) {
+      crc ^= poly;
+    }
+  }
+  return crc;
 }
 
 static oemu_status do_csel(oemu_cpu *cpu, const oemu_insn *in) {
@@ -1164,6 +1198,16 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       break;
     }
 
+    case OEMU_OP_CRC32: {
+      /* Reflected CRC-32 (poly 0x04C11DB7). The data operand is Rm: its low
+       * `in->uimm` bytes (all 8 for CRC32X, read from the full 64-bit
+       * register); the seed is Rn's low 32 bits; the result is 32-bit. */
+      const uint32_t seed = (uint32_t)read_g(cpu, in->rn, false, OEMU_REG_W32);
+      const uint64_t data = read_g(cpu, in->rm, false, OEMU_REG_W64);
+      write_g(cpu, in->rd, false, OEMU_REG_W32,
+              oemu_exec_internal_crc32(seed, data, (unsigned)in->uimm));
+      break;
+    }
     case OEMU_OP_RBIT:
       write_g(cpu, in->rd, false, in->width,
               oemu_exec_internal_rbit(read_g(cpu, in->rn, false, in->width), in->width));

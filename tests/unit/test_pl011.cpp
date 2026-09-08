@@ -105,22 +105,38 @@ TEST_F(Pl011, UnimplementedOffsetReadsZeroAndSwallowsWrites) {
   /* A faulting probe would have aborted the write path; the bus stayed calm. */
 }
 
-// --- TX: unconditional pass-through, ring drain, overflow --------------------
+// --- TX: immediate pass-through with the FIFO off; ring with it on -----------
 
 TEST_F(Pl011, TxByteIsEmittedEvenWithTheUartDisabled) {
   /* Measured (probe DROP1|A): a DR write escapes to the sink even while CR
-   * says the UART is off, and with no loopback there is no RX mirror. */
+   * says the UART is off -- and with the FIFO off (CR.FEN=0) it escapes in
+   * the WRITE ITSELF, before any pump. There is no loopback here, so there
+   * is no RX mirror. */
   wr(PL011_REG_CR, 0U); /* clear TXE|LBE: transmitter nominally off */
   wr(PL011_REG_DR, 'A');
-  EXPECT_EQ(1U, oemu_pl011_pump(&uart_));
-  ASSERT_EQ(1U, g_sink.size());
+  ASSERT_EQ(1U, g_sink.size()); /* no pump needed: pass-through */
   EXPECT_EQ((unsigned char)'A', g_sink[0]);
+  EXPECT_EQ(0U, oemu_pl011_pump(&uart_)); /* nothing ever queued */
   EXPECT_EQ(1ULL, uart_.tx_emitted);
   EXPECT_EQ(0ULL, uart_.tx_dropped);
 }
 
-TEST_F(Pl011, TxRingDrainsInByteOrder) {
+TEST_F(Pl011, PassThroughLeavesTransmitterFlaggedEmpty) {
+  /* The console driver's transmit spin polls FR.TXFE between characters.
+   * With the FIFO off, a byte is gone the moment it is written, so a guest
+   * that just wrote must read TXFE set again -- this is exactly what the
+   * deferred ring got wrong, and what truncated Linux's panic printout. */
   enable_no_loopback();
+  wr(PL011_REG_DR, 'x');
+  const uint32_t fr = rd(PL011_REG_FR);
+  EXPECT_NE(0U, fr & PL011_FR_TXFE);
+  EXPECT_EQ(0U, fr & PL011_FR_TXFF);
+  EXPECT_EQ(0U, fr & PL011_FR_BUSY);
+}
+
+TEST_F(Pl011, TxRingDrainsInByteOrder) {
+  /* Only the FIFO mode queues, so only FIFO mode needs a pump. */
+  wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE | PL011_CR_FEN);
   wr(PL011_REG_DR, 'o');
   wr(PL011_REG_DR, 'k');
   wr(PL011_REG_DR, '!');
@@ -131,9 +147,10 @@ TEST_F(Pl011, TxRingDrainsInByteOrder) {
 }
 
 TEST_F(Pl011, TxRingDropsOldestWhenOverflowed) {
-  /* Nobody pumped, so the ring fills; the model must keep the newest bytes
-   * and count, not hide, the loss -- TX is never allowed to block the vCPU. */
-  enable_no_loopback();
+  /* FIFO mode, nobody pumped: the ring fills; the model must keep the newest
+   * bytes and count, not hide, the loss -- TX is never allowed to block the
+   * vCPU. */
+  wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE | PL011_CR_FEN);
   for (unsigned i = 0U; i < 70U; i++) {
     wr(PL011_REG_DR, 'A' + (i % 26U));
   }
@@ -142,7 +159,7 @@ TEST_F(Pl011, TxRingDropsOldestWhenOverflowed) {
 }
 
 TEST_F(Pl011, FlagsShowBusyWhileTxQueuedThenEmptyAfterPump) {
-  enable_no_loopback();
+  wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE | PL011_CR_FEN);
   wr(PL011_REG_DR, 'x');
   const uint32_t busy = rd(PL011_REG_FR);
   EXPECT_NE(0U, busy & PL011_FR_BUSY);
@@ -274,11 +291,12 @@ TEST_F(Pl011, SinklessPumpStillDrainsAndCounts) {
   oemu_pl011 bare;
   oemu_pl011_init(&bare, nullptr, nullptr);
   /* loopback is set at reset with no receiver, so the RX mirror is refused
-   * and counted as a drop; the TX byte itself still queues. */
+   * and counted as a drop; use FIFO mode so the TX byte actually queues --
+   * with the FIFO off there would be nothing to pump. */
   ASSERT_EQ(OEMU_OK,
             oemu_aspace_attach_device(&machine_.aspace, 0x0A000000ULL, kUartSize, &bare.ops));
   ASSERT_EQ(OEMU_OK, oemu_aspace_write(&machine_.aspace, 0x0A000000ULL + PL011_REG_CR,
-                                       OEMU_MEM_WORD, 0U));
+                                       OEMU_MEM_WORD, PL011_CR_FEN));
   ASSERT_EQ(OEMU_OK, oemu_aspace_write(&machine_.aspace, 0x0A000000ULL + PL011_REG_DR,
                                        OEMU_MEM_WORD, 'z'));
   EXPECT_EQ(1U, oemu_pl011_pump(&bare));

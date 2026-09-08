@@ -958,8 +958,20 @@ static oemu_status decode_dp_2source(uint32_t word, oemu_insn *insn) {
     case 0x0B:
       insn->op = OEMU_OP_RORV;
       return OEMU_OK;
+    case 0x10: /* CRC32B */
+    case 0x11: /* CRC32H */
+    case 0x12: /* CRC32W */
+    case 0x13: /* CRC32X */
+      /* Cortex-A53 implements the CRC extension (ID_AA64ISAR0_EL1.CRC = 1),
+       * so the guest's CRC library uses these instructions; advertising the
+       * feature without running them would take an oops the oracle never
+       * does. The data width is 1 << (opcode & 3) bytes. */
+      insn->op = OEMU_OP_CRC32;
+      insn->uimm = UINT64_C(1) << (opcode & 0x3U);
+      insn->width = OEMU_REG_W32; /* the CRC result is always 32-bit */
+      return OEMU_OK;
     default:
-      /* CRC32 and the pointer-authentication variants live here. */
+      /* The pointer-authentication variants live here. */
       if (opcode >= 0x10U && opcode <= 0x17U) {
         return OEMU_ERR_UNSUPPORTED;
       }
@@ -1444,6 +1456,8 @@ const char *oemu_opcode_name(oemu_opcode op) {
       return "asrv";
     case OEMU_OP_RORV:
       return "rorv";
+    case OEMU_OP_CRC32:
+      return "crc32";
     case OEMU_OP_RBIT:
       return "rbit";
     case OEMU_OP_REV16:

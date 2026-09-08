@@ -18,7 +18,7 @@
  * guest should reach. Measured facts this guest encodes: the QEMU oracle
  * hands x0 = ram_base + ram_size/2 = 0x48000000; -machine virt says method
  * "hvc"; the PSCI model answers NOT_SUPPORTED until PSCI_VERSION has been
- * asked, so the guest negotiates before SYSTEM_OFF (id 0x84000002) exactly
+ * asked, so the guest negotiates before SYSTEM_OFF (id 0x84000008, FN(8)) exactly
  * like Linux does. No shared definitions with src/; magic and layout per the
  * FDT specification and Documentation/arch/arm64/booting.rst.
  */
@@ -64,8 +64,8 @@ _start:
 	movz	x0, #0x0
 	movk	x0, #0x8400, lsl #16     /* 0x84000000 PSCI_VERSION */
 	smc	#0
-	movz	x0, #0x2
-	movk	x0, #0x8400, lsl #16     /* 0x84000002 SYSTEM_OFF (spec id) */
+	movz	x0, #0x8
+	movk	x0, #0x8400, lsl #16     /* 0x84000008 SYSTEM_OFF: FN(8), uapi/linux/psci.h */
 	smc	#0
 	b	park
 use_hvc:
@@ -74,8 +74,8 @@ use_hvc:
 	movz	x0, #0x0
 	movk	x0, #0x8400, lsl #16     /* 0x84000000 PSCI_VERSION */
 	hvc	#0
-	movz	x0, #0x2
-	movk	x0, #0x8400, lsl #16     /* 0x84000002 SYSTEM_OFF (spec id) */
+	movz	x0, #0x8
+	movk	x0, #0x8400, lsl #16     /* 0x84000008 SYSTEM_OFF: FN(8), uapi/linux/psci.h */
 	hvc	#0
 	/* Diagnose the return: a handled PSCI call must take the machine
 	 * down; landing here means the conduit call came back. */

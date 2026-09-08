@@ -300,12 +300,14 @@ std::vector<uint32_t> uart_enable() {
   return {boot_words::movz(0U, 0x300U), 0xF9003020U};  // str x0, [x1, #0x18]
 }
 
-// PSCI SYSTEM_OFF (fnid 0x84000002) through the SMC conduit: the M4a exit
+// PSCI SYSTEM_OFF (fnid 0x84000008) through the SMC conduit: the M4a exit
 // protocol. The fnid is assembled MOVK-style -- movz loads the low halfword
-// (#2), movk deposits the high one (#0x8400) -- both encodings harvested
-// from clang's own disassembly of that exact pair, not hand-derived.
+// (#8), movk deposits the high one (#0x8400). The id is SYSTEM_OFF = FN(8)
+// from the guest's own uapi/linux/psci.h: an earlier draft carried
+// 0x84000002, which is CPU_OFF, and only our own matching-wrong test passed
+// with it -- the real kernel's panic-reboot exposed the mistake.
 std::vector<uint32_t> psci_off() {
-  return {0xD2800040U, 0xF2B08000U, 0xD4000003U};
+  return {0xD2800100U, 0xF2B08000U, 0xD4000003U};
 }
 
 // A sparse file of exactly `size` bytes: ftruncate leaves holes that read
@@ -400,7 +402,7 @@ class CliBootTest : public CliTest {
 };
 
 TEST_F(CliBootTest, BootPsciSystemOffExitsCleanly) {
-  // The M4a exit protocol: SMC #0 with fnid 0x84000002 (SYSTEM_OFF) is
+  // The M4a exit protocol: SMC #0 with fnid 0x84000008 (SYSTEM_OFF) is
   // answered by the PSCI conduit, powers the machine down, and oemu exits 0.
   std::vector<uint32_t> words = psci_off();
   words.push_back(boot_words::kBrk0);
