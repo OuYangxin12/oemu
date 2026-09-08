@@ -292,3 +292,36 @@ x1=phys=0、x2=virt=0x40000000000001，一个 phys=0 的假 fixmap 槽，可存�
 定位需一条对 QEMU 的**总线写日志差分**（oemu 侧记录 setup_log_buf 前后对
 printk_rb 那几十字节的每次写，比对是哪个 width/指令丢的高位），属更深的
 写路径保真度排查，下一轮继续。
+
+### L3 续：找到并修复真正的拦路石——UMADDL 加数宽度
+
+真内核引导此前"卡死"的根因终于定位并修复（commit `43c27ec`）：
+
+**根因**：`{S,U}MADDL/MSUBL` 的加数（第三源操作数 Ra）是**完整 64 位**，
+不是 32 位字。oemu 把 Ra 按 W32 读，再符号/零扩展——于是 64 位加数的高 32 位
+被静默丢弃。只有当加数是真正的 64 位值时才会暴露，而内核最常见的惯用法
+"按元素大小缩放索引再累加一个基址指针"正好如此。
+
+**为什么这条杀死引导**：printk 环的 `to_desc()` = `umaddl x0,w2,w1,x0`，
+以环指针（`0xffffffc0802d88b0`）作加数。加数高位被截 → 描述符地址塌成低半
+`0x802d88b0` → `prb_reserve` 解引用野低地址 → level-1 翻译故障 → oops →
+panic，横幅永远印不出来。修复加数宽度后 `prb_reserve` 通过，内核一路跑到
+init/idle 阶段（实测致命 prb 故障已消失，只剩一个 create_pgd brk）。
+
+**补了回归测试**：现有加宽测试的加数都很小（<2^32），所以一直没照出这个洞；
+新增用例把 `0xffffffc0..` 级 64 位加数灌进 smaddl/umsubl。
+
+**修正对旧现象的判读**：`create_pgd_mapping+0x104` 的那个 brk **不是可存活
+的 WARN，而是致命 BUG**——brk 处理器 → `die()` → `panic()` → 在 pid-0 idle
+任务上 `make_task_dead`，故打印 "Attempted to kill the idle task!"。因为它死在
+`paging_init` 的线性映射阶段、**早于 console_init**，所以内核从始至终没碰过
+PL011（实测设备 0 次访问）——之前"跑到 idle"其实是 die→panic 的表象。
+
+**下一轮拦路石（精确）**：致命的 `__create_pgd_mapping_locked`（mmu.c:393
+`WARN_ON((phys^virt)&~PAGE_MASK)`）在 `paging_init` 线性映射时被以
+`x1=phys=0, x2=virt=0x40000000000001, x3(size)=0xfffffffdfdffe000,
+x4(prot)=0xfffffffdffdfe000` 调用——这组参数明显错乱（size/prot 是 fixmap
+高地址、virt 还带着诡异的 bit0）。像是某个 oemu 指令截断/污染了 caller 的参数
+寄存器（与 UMADDL 同类的"窄读"问题，可能藏在 fixmap/线性映射的早期地址算术里，
+如 `fix_to_virt` / `__phys_to_virt` 路径，或某条 add/adrp/mov 的宽度）。下一步
+沿 create_pgd 调用者帧链上溯，定位是哪条指令把 virt 变成 0x40000000000001。
