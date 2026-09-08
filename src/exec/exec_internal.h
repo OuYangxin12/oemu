@@ -119,7 +119,8 @@ typedef enum oemu_exec_sys_action {
   OEMU_EXEC_SYS_TRAP = 0,   /* Undefined, with the encoding as ISS */
   OEMU_EXEC_SYS_NOP = 1,    /* execute as a no-op, advance the PC */
   OEMU_EXEC_SYS_DC_ZVA = 2, /* zero one cache line at [Rt] */
-  OEMU_EXEC_SYS_TLBI = 3    /* invalidation request: flush the whole TLB */
+  OEMU_EXEC_SYS_TLBI = 3,   /* invalidation request: flush the whole TLB */
+  OEMU_EXEC_SYS_AT = 4      /* address translate (stage-1): publish PAR_EL1 */
 } oemu_exec_sys_action;
 
 /* The policy decision for one SYS selector; exhaustively testable. */

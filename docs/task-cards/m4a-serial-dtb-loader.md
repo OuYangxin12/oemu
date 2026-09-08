@@ -213,3 +213,225 @@ guest 探测 /psci method → PL011 打出 PSCI-OK/PSCI-SMC → SMC VERSION 协�
 - [x] 未实现 MMIO 偏移行为成文：读返 0、写忽略、绝不 Data Abort（pl011_read/write default 分支 + 注释）。
 - [x] loader 拒绝路径全部 `oemu_status`，半加载前返回（parse 先于任何 bus 写）。
 - [x] boot 全路径 `goto done` 统一 fclose/free/dispose，无泄漏（clang-analyzer 的 `serial!=stdout` 守卫为误报）。
+
+### L3 真内核引导进展（本轮，linux-6.6.156 tinyconfig Image）
+
+目标：真内核 earlycon 打 "Booting Linux"。oracle（QEMU virt 同一
+Image+DTB）确认能出横幅并跑到 "No working init"（无 initrd，预期）。
+
+本轮为把 oemu 推到"真能在自己 MMU 下建页表、读 ID/调试寄存器、跑通用
+定时器、进 earlycon"而落地的**正确且必要**的修复：
+
+- `src/mmu/mmu.c`：walk 分派改为**按层级**——type 0b11 在 level 0..2
+  是表、在 level 3 是 4KiB **页**（旧实现把 0b11 一律当表，于是内核
+  每一条真实 L3 PTE 都被判成坏表 → fixmap/vmalloc 全崩）。配套把
+  `MmuTest.TableDescriptorBelowThePageLevelFaults` 更正为
+  `LastLevelTableBitsResolveAsAPage`（末级 0b11=页，spec 正解）。
+- AT（地址翻译）：`OEMU_EXEC_SYS_AT`（stage-1 S1E*，op1==0）执行真
+  走表并写 `PAR_EL1`（`.get` 行，sel 0x03a0）；stage-2 S12E*(op1==4)
+  仍诚实 Undefined。`VcpuTest` 的 AT 用例由"Trap Undefined"更正为
+  "publishes PAR_EL1"。内核 `at s1e1r; mrs par; tbnz par,#0` 探测路
+  由此打通。
+- `src/dev/pl011*`：寄存器面按 TRM/驱动更正（FR.TXFE=0x80、TXFF=0x20，
+  删幻影 INTMASKSET/CLR）——早期 earlycon 轮询 FR 的两条 while 需要
+  正确 TXFE/TXFF 才不死锁。
+- 通用定时器（M4b 的最小子集，boot 必需）：CNTFRQ/CNTPCT/CNTVCT/
+  CNTVOFF/CNTP_CTL/CVAL/TVAL/CNTKCTL sysreg 行 + `oemu_sysregs.cntvct`
+  随步进的计数器（`src/vcpu/vcpu.c`）。没有 CNTVCT，内核
+  `__delay_cycles`/calibrate 的忙等会因未定义而**无限自旋**卡死早期引导。
+- ID/调试寄存器：ID_AA64PFR1/2、ZFR0、SMFR0、DFR1/2、AFR0、ISAR2..5、
+  MMFR2/3 与 MDSCR_EL1 以 F_WI（读 0/忽略写）入表，内核启动探测不再 trap。
+- `src/kernel/image.c`+`image_internal.h`：Image 头按 booting.rst 重写
+  （接受 BTI 头式 0xd503201f；endian bit0 + pages 字段 [2:1]；16K/64K
+  诚实 UNSUPPORTED）。`tests/support/image_builder.h`/`test_image.cpp`
+  随此 spec 更正（LE 16K/64K 现期望 UNSUPPORTED；镜像 flag 镜像用例改写）。
+- `src/decode`+`src/exec`：`MSR #imm`（SPSel/DAIF，`OEMU_OP_MSR_IMM`
+  +`do_msr_immediate`）与 PRFM/字面量 load 的 HINT no-op 化。内核早期
+  `msr daifset/daifclr` 必需。
+
+门禁：`make test`/`make asan` 100%（811）；`make format-check` 我的文件
+全绿（唯 bench/corpus/k_addsub.c 本机 clang-format 版本漂移，属既有，不动
+语料）；`make tidy` exit 0。
+
+**L3 门仍未闭合**（诚实记录）：内核已在 oemu 下深跑到 printk/panic
+路径，但**未打出横幅**。当前卡点是内核自身早期页表构造里的一处 oops
+级联——首个异常是 `__create_pgd_mapping` 处一条 `WARN_ON((phys^virt)
+& ~PAGE_MASK)`（可存活），随后内核在 `prb_reserve`（printk 环形缓冲
+预约）处踩 **level-1 translation fault**（FAR=0x802d88b0，随迭代递增）：
+printk 的 log buffer 指针处在一个未被任何页表覆盖的低位 VA，于是每次
+printk 自陷 → oops 再陷 → 最终停在 `panic()` 的忙等（tx_emitted=0）。
+根因指向 oemu 对内核早期自身结构的仿真保真度仍有缺口（怀疑与线性映射
+/ 内核写回读一致、或早期映射被上述 WARN 跳过的组合有关），属 M4b 量级
+（GIC/timer-IRQ/更忠实 paging）的工作，非单点可修，故本轮如实记录为未完。
+
+### L3 续：ID 保真度（oracle 校准到 Cortex-A53）
+
+关键发现：内核 panic 前算出的线性映射是错的、prb_reserve 取到野指针。
+用新探测 guest `tests/guest/id_probe.S`（QEMU `-cpu cortex-a53`）实测 oracle
+的 ID 集，纠正了 oemu 谎报的 CPU 身份：
+
+- oracle 横幅行本身印 `Booting Linux ... [0x410fd034]` —— 即 Cortex-**A53**。
+  oemu 之前谎报 A76（MIDR 0x411FD080）+ 拼凑的 ID_AA64* 集。
+- `ID_AA64MMFR0_EL1` 旧值 0x0FF00021（VA_BITS=36）是错的；oracle =
+  **0x1122**（VA_BITS=**42**、PA_BITS=42）。VA_BITS 决定内核 TCR/线性映射
+  布局，错一位就整片线性映射错位 → prb_reserve 野指针 → panic。
+- 一并校准：MIDR 0x410FD034、REVIDR 0x100、PFR0 0x22、ISAR0 0x11120、
+  DFR0 0x10305106、CTR_EL0 0x84448004、CLIDR 0x0A200023。
+- VA_BITS 变 42 后 walk 起始层级变 0，内核跑进早期 `__cpu_setup`，它写
+  TCR2/PIR*/DISR/OSL*/PMUSERENR/AMUSERENR——oemu 缺这些 → MSR/MRS trap
+  Undefined 卡死。按 RAZ/WI 补齐（对应 FEAT 均已在 ID 里报"无"）。
+
+结果：引导推进过 `__cpu_setup`，抵达 `create_pgd_mapping`。
+
+**仍未出横幅**（诚实）：`create_pgd_mapping` 处 BRK WARN（x0=pgdir=0、
+x1=phys=0、x2=virt=0x40000000000001，一个 phys=0 的假 fixmap 槽，可存活）；
+随后 `prb_reserve+0x17c` 解引用 `x0=0x802d88b0`。而 `printk_rb` 静态结构本身在
+合法高 VA（`x19=0xffffffc080280850`）。`0x802d88b0` 恰是合法内核 VA
+`0xffffffc0802d88b0`（= phys 0x402d88b0 的线性映射）**砍掉高 32 位**的结果——
+即某处把运行时 64 位指针截断成 32 位（截断的 store / 或 32 位宽的地址算术）。
+定位需一条对 QEMU 的**总线写日志差分**（oemu 侧记录 setup_log_buf 前后对
+printk_rb 那几十字节的每次写，比对是哪个 width/指令丢的高位），属更深的
+写路径保真度排查，下一轮继续。
+
+### L3 续：找到并修复真正的拦路石——UMADDL 加数宽度
+
+真内核引导此前"卡死"的根因终于定位并修复（commit `43c27ec`）：
+
+**根因**：`{S,U}MADDL/MSUBL` 的加数（第三源操作数 Ra）是**完整 64 位**，
+不是 32 位字。oemu 把 Ra 按 W32 读，再符号/零扩展——于是 64 位加数的高 32 位
+被静默丢弃。只有当加数是真正的 64 位值时才会暴露，而内核最常见的惯用法
+"按元素大小缩放索引再累加一个基址指针"正好如此。
+
+**为什么这条杀死引导**：printk 环的 `to_desc()` = `umaddl x0,w2,w1,x0`，
+以环指针（`0xffffffc0802d88b0`）作加数。加数高位被截 → 描述符地址塌成低半
+`0x802d88b0` → `prb_reserve` 解引用野低地址 → level-1 翻译故障 → oops →
+panic，横幅永远印不出来。修复加数宽度后 `prb_reserve` 通过，内核一路跑到
+init/idle 阶段（实测致命 prb 故障已消失，只剩一个 create_pgd brk）。
+
+**补了回归测试**：现有加宽测试的加数都很小（<2^32），所以一直没照出这个洞；
+新增用例把 `0xffffffc0..` 级 64 位加数灌进 smaddl/umsubl。
+
+**修正对旧现象的判读**：`create_pgd_mapping+0x104` 的那个 brk **不是可存活
+的 WARN，而是致命 BUG**——brk 处理器 → `die()` → `panic()` → 在 pid-0 idle
+任务上 `make_task_dead`，故打印 "Attempted to kill the idle task!"。因为它死在
+`paging_init` 的线性映射阶段、**早于 console_init**，所以内核从始至终没碰过
+PL011（实测设备 0 次访问）——之前"跑到 idle"其实是 die→panic 的表象。
+
+**下一轮拦路石（精确）**：致命的 `__create_pgd_mapping_locked`（mmu.c:393
+`WARN_ON((phys^virt)&~PAGE_MASK)`）在 `paging_init` 线性映射时被以
+`x1=phys=0, x2=virt=0x40000000000001, x3(size)=0xfffffffdfdffe000,
+x4(prot)=0xfffffffdffdfe000` 调用——这组参数明显错乱（size/prot 是 fixmap
+高地址、virt 还带着诡异的 bit0）。像是某个 oemu 指令截断/污染了 caller 的参数
+寄存器（与 UMADDL 同类的"窄读"问题，可能藏在 fixmap/线性映射的早期地址算术里，
+如 `fix_to_virt` / `__phys_to_virt` 路径，或某条 add/adrp/mov 的宽度）。下一步
+沿 create_pgd 调用者帧链上溯，定位是哪条指令把 virt 变成 0x40000000000001。
+
+### L3 续：create_pgd 致命 brk 已定位为 fixmap 路径的指令执行 bug
+
+沿 `__primary_switched` 帧链上溯，致命 brk 的调用者是
+`early_fdt_map → fixmap_remap_fdt → create_mapping_noalloc →
+__create_pgd_mapping_locked`（内核早期把 FDT 映射进 fixmap）。
+
+已用一次性探针**逐一排除**了引导 ABI / DTB 本身的问题：
+- 入口实测 `x0 = 0x48000000`，`read@x0 = 0xd00dfeed`（合法 FDT magic），
+  booting.rst 确认 **x0=DTB phys 是正确约定**（不是 x1）。
+- `early_fdt_map` 入口实测 `x0 = x21 = 0x48000000`（FDT 物理地址**完好传到这里**）。
+
+即：DTB 地址一路正确送到 `early_fdt_map`。但在
+`fixmap_remap_fdt`→`create_mapping_noalloc`→`__create_pgd_mapping_locked` 内部，
+到 brk 时参数变成 `phys(x1)=0`（原 `0x48000000`）、`virt(x2)=0x40000000000001`
+（`__fix_to_virt(FIX_FDT)` 的错误值）。`create_pgd` 因此 `WARN_ON` → die → panic。
+
+结论：这是**又一条被 oemu 执行错的指令**，症状与 UMADDL 同类（把地址/指针算错），
+藏在 fixmap/`pgd_offset_pgd`/`__fix_to_virt` 的地址算术里。phys 由 `0x48000000`
+变 0、`__fix_to_virt` 返回 `0x40000000000001` 都是错乱迹象。
+
+**下一轮精确动作**：把指令级 trace 限定在 `fixmap_remap_fdt`(0x…8005?)、
+`create_mapping_noalloc`、`__create_pgd_mapping_locked`(0xffffffc08001c…)、
+`pgd_offset_pgd` 的地址上，逐条与 QEMU oracle（同 `-cpu cortex-a53`）对比，
+定位是哪条指令（疑 adrp/adr_l、`bfi/ubfm/sbfm` 宽度、或 `__fix_to_virt` 里
+对 fixaddr 基址的读取）算错了地址。修好它，`early_fdt_map` 成功，内核应能
+进入 `console_init` 并首次打印 earlycon 横幅。
+
+### L3 再续：更正前判 + 精确锁定（本轮实测，未改 src）
+
+**推翻前一轮的"参数被污染"假说**：那条 brk 的 `phys=0 / virt=0x40000000000001`
+是我早先在别的执行点抓的，误导了方向。本轮逐条单步实测：
+
+- 用**相同** Image+DTB 在 QEMU（`-cpu cortex-a53 -accel tcg`）实跑，能一路
+  印到横幅（`Booting Linux …` + `earlycon: pl11 at MMIO 0x9000000`），故当前
+  拦路石 100% 是 **oemu 侧**的 bug，不是 DTB/装载/ABI/内核配置。
+- fixmap noalloc 的 `__create_pgd_mapping` 入口参数**完全正确**
+  （`pgdir=0x…80341000 phys=0x48000000 virt=0xfffffffdfddfe000 size=0x1000`），
+  且其首个 PUD 迭代正常走"复用已建表"分支——**参数没有被污染**。
+- 致命 brk 实为 `alloc_init_pte` 里的 `BUG_ON(!pgtable_alloc)`：控制流是
+  `+0x36c`(c2cc `ldr x1,[x21]`; `and/cmp/b.eq` 未命中) → `c2ec cbnz x1` 未跳
+  （因 x1=0）→ `c30c cbz x0`（x0=`[sp,#152]`=pgtable_alloc=**NULL**）→ brk。
+  即 noalloc 变体在此处**需要新建一张 PTE 表却无分配器**。
+- 该处 `x21=0xfffffffdfdc3a770`；oemu 翻译读回 **0**（status=0，无故障）。手动
+  按总线下走同样的表链得到同一叶 PTE（`0xe8000040305703`→页落 `0x40305000`，
+  偏移处内容确为 0），`and …,#3=3` 亦正确。**读取无误**：这个 PMD 槽在物理内存
+  里就是 0，即 `early_fixmap_init` 没把整段 fixmap 的这张 PTE 表建全。
+
+**关键新事实**：`TCR_EL1.T1SZ = 25` → 内核实际以 **VA_BITS=39**（3 级：
+start_level=1，PGD/PMD/PTE）运行，**不是**我之前经 `ID_AA64MMFR0_EL1=0x1122`
+宣称的 42 位。A53 本就只支持 39 位 VA / 40 位 PA，该 ID 值可疑（待与 QEMU 对
+齐）。因此页表几何与 fixmap 自映射须在 39 位下被正确演练。
+
+**结论（当前精确拦路石）**：内核早期把整段 fixmap 预映射（`early_fixmap_init`
+给每个子区间填了 PTE 表），随后 `early_fdt_map` 的 `create_mapping_noalloc`
+理应"零分配"地复用这些表。但在 oemu 里，FDT 所在的这个 PMD 槽读回 0 →
+noalloc 无路可走 → `BUG_ON` → die → panic（早于 console_init，故仍无横幅）。
+下一步：判定是 `early_fixmap_init` 的一条 **store** 在 oemu 里落到了错的物理页
+（写入 `pmdp` 用的 fixmap 别名地址），还是 oemu 对**自映射 fixmap VA**（把页表
+自身再映射一次的 39 位 fixmap 别名）的**翻译**与 QEMU 不同。
+
+**可复现的取证通道（本轮验证）**：
+- gdb 单步 QEMU 需 `aarch64` 远程目标，本环境只有 x86 原生 gdb（拒 aarch64），
+  **不可用**；`-gdbstub` 需 `-accel tcg` 才开 TCP。
+- 可用通道：`-d exec`（每 TB 记 guest PC，已能确认 QEMU 跑过
+  `early_fixmap_init`/`fixmap_remap_fdt`/`__create_pgd_mapping` 全链）；
+  `-monitor tcp:…,server` 可用（`x/1gx <VA>` 走 QEMU 真 MMU，能验 `…dfe000`
+  读到 FDT magic `0xd00dfeed`，但 create_pgd 期那个瞬态 fixmap 别名已拆除）。
+- 建议：加一条 `-plugin`（TCG 指令级 trace）或找一份 aarch64 gdb 做逐条比对。
+
+### L3 达成：横幅已印出（两条指令级 bug 修复）
+
+**验收达成**：oemu 用 `guest/build/Image` + `guest/boot-virt.dtb` 真实引导，
+PL011 上打出
+
+```
+Booting Linux on physical CPU 0x0 [0x410fd034]
+Linux version 6.6.156 ...
+earlycon: pl11 at MMIO 0x0000000009000000 (options '')
+printk: bootconsole [pl11] enabled
+```
+
+并继续到 zones / nodes / `psci: PSCIv1.1 detected`，与 QEMU oracle 的前段输出一致。
+
+**两条被修复的执行错误**（各配回归测试，`make test`/`make asan` 816/816）：
+
+1. `exec: keep the full width of wrapping UBFM/SBFM (M4a)`（eea5e02）。
+   回绕型 UBFM/SBFM（`immR > immS`）的字段长度是
+   `len = regsize - immR + immS + 1`，oemu 少写了 `+1`，导致
+   `UBFIZ #3,#9`（= `lsl #3` 的位域拼法，内核用它把 PMD 索引换算成
+   页表内字节偏移）被截成 11 位：索引 `0x1EE` 变 `0xEE`，
+   `__create_pgd_mapping` 因此读的是**另一张表里的另一个槽**——先读回 0，
+   再撞上 `alloc_init_pte` 的 `BUG_ON(!pgtable_alloc)`。之前"参数被污染"
+   的判读是这条截断引起的连锁假象。
+2. `decode: execute non-temporal pairs LDNP/STNP as plain LDP/STP (M4a)`
+   （4853f9a）。form-0 的 pair 编码原先返回 UNSUPPORTED。内核在
+   `DCZID_EL0.DZP=1`（oemu 现值 0x10）时走 `__pi_clear_page` 的
+   `stnp` 清零路径——不支持它，内核在清第一页之前就会 die。
+   非临时提示只是 cache 建议，直接按 LDP/STP 无偏移形式执行即可。
+
+**取证记录**：本轮曾用 PL011 裸机探针在 QEMU 上读 `dczid_el0`：
+`-d in_asm` 证实镜像从 `0x40080000`（QEMU spin-table）起步、探针已执行，
+但串口零输出（EL3 下对 UART 的写不可见），探针路线暂缓；STNP 缺失本身
+就是内核可见差异，先修它。
+
+**下一块拦路石（假设，待验证）**：`psci:` 打印之后出现
+`Internal error: Oops - Undefined instruction`（ESR `0x02000003`），
+`swapper` 在 idle 入口——高度疑似 `wfi` 未被执行（M4a 任务卡早已点名
+"missing WFI semantics"）。串口在该次 oops 中途截断（"Hardwar"），
+PL011 TX FIFO 满时丢字也可能是 oemu 侧的串口保真缺口，一并排。

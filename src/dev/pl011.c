@@ -40,13 +40,20 @@ void oemu_pl011_init(oemu_pl011 *uart, oemu_pl011_sink sink, void *sink_user) {
 }
 
 void oemu_pl011_internal_update_flags(oemu_pl011 *uart) {
-  uint32_t fr = PL011_FR_TXFE; /* TX always accepts: our ring never blocks the vCPU */
+  /* An idle line is ready to transmit: TXFE (empty) set, TXFF (full) clear,
+   * BUSY clear. This is what the console write path spins for (earlycon
+   * waits on TXFE, the driver on TXFF/BUSY), so getting it wrong deadlocks the
+   * first earlycon character. */
+  uint32_t fr = PL011_FR_TXFE;
   if (uart->rx_count == 0U) {
     fr |= PL011_FR_RXFE | PL011_FR_DSR | PL011_FR_DCD | PL011_FR_CTS;
   }
   if (uart->tx_count != 0U) {
-    fr &= ~PL011_FR_TXFE; /* queue not drained yet: busy-ish semantics */
-    fr |= PL011_FR_BUSY;
+    /* Queue not drained: TX is neither empty nor free to fill. The ring only
+     * backs up because nobody pumped it; TX is never allowed to block the vCPU
+     * (oemu_pl011_pump empties it and reasserts TXFE). */
+    fr &= ~PL011_FR_TXFE;
+    fr |= PL011_FR_TXFF | PL011_FR_BUSY;
   }
   uart->fr = fr;
 }
@@ -107,8 +114,10 @@ static oemu_status pl011_read(void *ctx, uint64_t offset, oemu_mem_size size,
     case PL011_REG_FIFLS:
       v = uart->fifls;
       break;
+    case PL011_REG_RSR:
+      v = 0U; /* no framing/parity/overrun errors modelled */
+      break;
     case PL011_REG_INTIM:
-    case PL011_REG_INTMASKSET:
       v = uart->imsc;
       break;
     case PL011_REG_INTCLR:
@@ -168,6 +177,8 @@ static oemu_status pl011_write(void *ctx, uint64_t offset, oemu_mem_size size, u
         }
       }
       break;
+    case PL011_REG_RSR:
+      break; /* ECR write: we raise no error status, so nothing to clear */
     case PL011_REG_ILPR:
       break; /* purge request: nothing of ours is latched */
     case PL011_REG_IBRD:
@@ -190,12 +201,6 @@ static oemu_status pl011_write(void *ctx, uint64_t offset, oemu_mem_size size, u
       break;
     case PL011_REG_INTCLR:
       uart->ris &= ~v;
-      break;
-    case PL011_REG_INTMASKSET:
-      uart->imsc |= v;
-      break;
-    case PL011_REG_INTMASKCLR:
-      uart->imsc &= ~v;
       break;
     case PL011_REG_RIS:
     case PL011_REG_MIS:

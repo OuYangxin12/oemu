@@ -193,9 +193,11 @@ typedef enum oemu_opcode {
   OEMU_OP_BARRIER, /* DMB/DSB/ISB: ordering is trivially satisfied */
   OEMU_OP_MRS,
   OEMU_OP_MSR,
-  OEMU_OP_SYS /* SYS/SYSL (DC/IC/TLBI/AT...): insn.sysreg names the operation,
-               * decoded so the executor can distinguish it from Undefined
-               * encoding space; M3 wires the data-management ones */
+  OEMU_OP_MSR_IMM, /* MSR (immediate): SPSel/DAIF/PAN/DIT/SSBS/UAIR; insn.uimm
+                    * holds the op2 register select, insn.imm the 4-bit value */
+  OEMU_OP_SYS      /* SYS/SYSL (DC/IC/TLBI/AT...): insn.sysreg names the operation,
+                    * decoded so the executor can distinguish it from Undefined
+                    * encoding space; M3 wires the data-management ones */
 } oemu_opcode;
 
 /*

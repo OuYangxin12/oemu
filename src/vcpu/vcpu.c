@@ -8,6 +8,7 @@
  * when to take an interrupt, when WFI means sleep, when the slice is over --
  * lives here, between them.
  */
+
 #include "oemu/vcpu.h"
 
 #include "oemu/check.h"
@@ -126,6 +127,13 @@ oemu_status oemu_vcpu_step(oemu_vcpu *vcpu, oemu_insn *insn_out) {
   if (vcpu->insns_left == 0U) {
     return OEMU_ERR_TIMEOUT; /* the scheduler owns the re-arm */
   }
+
+  /* The generic timer's counter advances with guest progress. The fixed step
+   * is a modelled clock rate: the counter must move fast enough that a
+   * busy-wait delay (the kernel's __delay_cycles, including calibrate's
+   * 1e6-cycle measurement) finishes in a handful of steps rather than a
+   * million, while the kernel's only requirement is that it be monotonic. */
+  vcpu->sysregs.cntvct += 1000000U;
 
   /* Interrupts are taken before the fetch, so ELR names the instruction that
    * was about to run (precise, and the instruction re-executes after the

@@ -129,47 +129,90 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
  * integrated AArch64 assembler; build/sysgen/encodings.txt keeps the raw
  * table and the white-box test pins the sensitive ones.
  */
-#define OEMU_SYSREG_MIDR_EL1         ((uint32_t)0x0000)
-#define OEMU_SYSREG_MPIDR_EL1        ((uint32_t)0x0005)
-#define OEMU_SYSREG_REVIDR_EL1       ((uint32_t)0x0006)
+#define OEMU_SYSREG_MIDR_EL1   ((uint32_t)0x0000)
+#define OEMU_SYSREG_MPIDR_EL1  ((uint32_t)0x0005)
+#define OEMU_SYSREG_REVIDR_EL1 ((uint32_t)0x0006)
+/* Debug System Control: the kernel clears it at boot (disable debug events)
+ * and never reads it back, so oemu models it RAZ/WI rather than faulting on
+ * a legal EL1 access it does not otherwise model. */
+#define OEMU_SYSREG_MDSCR_EL1        ((uint32_t)0x0012)
 #define OEMU_SYSREG_ID_AA64PFR0_EL1  ((uint32_t)0x0020)
 #define OEMU_SYSREG_ID_AA64DFR0_EL1  ((uint32_t)0x0028)
 #define OEMU_SYSREG_ID_AA64ISAR0_EL1 ((uint32_t)0x0030)
 #define OEMU_SYSREG_ID_AA64ISAR1_EL1 ((uint32_t)0x0031)
 #define OEMU_SYSREG_ID_AA64MMFR0_EL1 ((uint32_t)0x0038)
 #define OEMU_SYSREG_ID_AA64MMFR1_EL1 ((uint32_t)0x0039)
-#define OEMU_SYSREG_SCTLR_EL1        ((uint32_t)0x0080)
-#define OEMU_SYSREG_CPACR_EL1        ((uint32_t)0x0082)
-#define OEMU_SYSREG_TTBR0_EL1        ((uint32_t)0x0100)
-#define OEMU_SYSREG_TTBR1_EL1        ((uint32_t)0x0101)
-#define OEMU_SYSREG_TCR_EL1          ((uint32_t)0x0102)
-#define OEMU_SYSREG_SPSR_EL1         ((uint32_t)0x0200)
-#define OEMU_SYSREG_ELR_EL1          ((uint32_t)0x0201)
-#define OEMU_SYSREG_SP_EL0           ((uint32_t)0x0208)
-#define OEMU_SYSREG_SP_EL1           ((uint32_t)0x2208)
-#define OEMU_SYSREG_SPSEL            ((uint32_t)0x0210)
-#define OEMU_SYSREG_CURRENT_EL       ((uint32_t)0x0212)
-#define OEMU_SYSREG_ESR_EL1          ((uint32_t)0x0290)
-#define OEMU_SYSREG_FAR_EL1          ((uint32_t)0x0300)
-#define OEMU_SYSREG_MAIR_EL1         ((uint32_t)0x0510)
-#define OEMU_SYSREG_AMAIR_EL1        ((uint32_t)0x0518)
-#define OEMU_SYSREG_VBAR_EL1         ((uint32_t)0x0600)
-#define OEMU_SYSREG_CONTEXTIDR_EL1   ((uint32_t)0x0681)
-#define OEMU_SYSREG_TPIDR_EL1        ((uint32_t)0x0684)
-#define OEMU_SYSREG_CCSIDR_EL1       ((uint32_t)0x0800)
-#define OEMU_SYSREG_CLIDR_EL1        ((uint32_t)0x0801)
-#define OEMU_SYSREG_CSSELR_EL1       ((uint32_t)0x1000)
-#define OEMU_SYSREG_CTR_EL0          ((uint32_t)0x1801)
-#define OEMU_SYSREG_DCZID_EL0        ((uint32_t)0x1807)
-#define OEMU_SYSREG_NZCV             ((uint32_t)0x1A10)
-#define OEMU_SYSREG_DAIF             ((uint32_t)0x1A11)
-#define OEMU_SYSREG_TPIDR_EL0        ((uint32_t)0x1E82)
-#define OEMU_SYSREG_TPIDRRO_EL0      ((uint32_t)0x1E83)
-#define OEMU_SYSREG_SPSR_EL3         ((uint32_t)0x3200)
-#define OEMU_SYSREG_ELR_EL3          ((uint32_t)0x3201)
-#define OEMU_SYSREG_ESR_EL3          ((uint32_t)0x3290)
-#define OEMU_SYSREG_FAR_EL3          ((uint32_t)0x3300)
-#define OEMU_SYSREG_VBAR_EL3         ((uint32_t)0x3600)
+/* The remaining AArch64 feature-ID registers the kernel probes at boot; modelled
+ * RAZ (read 0 = "feature absent") so an optional-feature discovery reads the
+ * conservative answer rather than trapping on an unmodelled encoding. */
+#define OEMU_SYSREG_ID_AA64PFR1_EL1  ((uint32_t)0x0021)
+#define OEMU_SYSREG_ID_AA64PFR2_EL1  ((uint32_t)0x0022)
+#define OEMU_SYSREG_ID_AA64ZFR0_EL1  ((uint32_t)0x0024)
+#define OEMU_SYSREG_ID_AA64SMFR0_EL1 ((uint32_t)0x0025)
+#define OEMU_SYSREG_ID_AA64DFR1_EL1  ((uint32_t)0x0029)
+#define OEMU_SYSREG_ID_AA64DFR2_EL1  ((uint32_t)0x002a)
+#define OEMU_SYSREG_ID_AA64AFR0_EL1  ((uint32_t)0x002c)
+#define OEMU_SYSREG_ID_AA64ISAR2_EL1 ((uint32_t)0x0032)
+#define OEMU_SYSREG_ID_AA64ISAR3_EL1 ((uint32_t)0x0033)
+#define OEMU_SYSREG_ID_AA64ISAR4_EL1 ((uint32_t)0x0034)
+#define OEMU_SYSREG_ID_AA64ISAR5_EL1 ((uint32_t)0x0035)
+#define OEMU_SYSREG_ID_AA64MMFR2_EL1 ((uint32_t)0x003a)
+#define OEMU_SYSREG_ID_AA64MMFR3_EL1 ((uint32_t)0x003b)
+/* Control / debug regs the early boot path (cpu_setup, cpu_do_resume) touches.
+ * Encodings measured from the assembler, not hand-computed. */
+#define OEMU_SYSREG_TCR2_EL1      ((uint32_t)0x0103)
+#define OEMU_SYSREG_OSLAR_EL1     ((uint32_t)0x0084)
+#define OEMU_SYSREG_OSDLR_EL1     ((uint32_t)0x009c)
+#define OEMU_SYSREG_DISR_EL1      ((uint32_t)0x0609)
+#define OEMU_SYSREG_PIRE0_EL1     ((uint32_t)0x0512)
+#define OEMU_SYSREG_PIR_EL1       ((uint32_t)0x0513)
+#define OEMU_SYSREG_PMUSERENR_EL0 ((uint32_t)0x1cf0)
+#define OEMU_SYSREG_AMUSERENR_EL0 ((uint32_t)0x1e93)
+#define OEMU_SYSREG_SCTLR_EL1     ((uint32_t)0x0080)
+#define OEMU_SYSREG_PAR_EL1       ((uint32_t)0x03a0)
+#define OEMU_SYSREG_CNTFRQ_EL0    ((uint32_t)0x1f00)
+#define OEMU_SYSREG_CNTPCT_EL0    ((uint32_t)0x1f01)
+#define OEMU_SYSREG_CNTVCT_EL0    ((uint32_t)0x1f02)
+#define OEMU_SYSREG_CNTVOFF_EL1   ((uint32_t)0x0700)
+#define OEMU_SYSREG_CNTKCTL_EL1   ((uint32_t)0x0708)
+#define OEMU_SYSREG_CNTP_CVAL_EL1 ((uint32_t)0x0710)
+#define OEMU_SYSREG_CNTP_CTL_EL1  ((uint32_t)0x0711)
+#define OEMU_SYSREG_CNTP_TVAL_EL1 ((uint32_t)0x0718)
+/* Default generic-timer counter frequency: the Arm default the QEMU virt
+ * machine and this DT both present, so the guest's clock source and oemu's
+ * counter agree. */
+#define OEMU_CNTFRQ_EL0_DEFAULT    62500000u
+#define OEMU_SYSREG_CPACR_EL1      ((uint32_t)0x0082)
+#define OEMU_SYSREG_TTBR0_EL1      ((uint32_t)0x0100)
+#define OEMU_SYSREG_TTBR1_EL1      ((uint32_t)0x0101)
+#define OEMU_SYSREG_TCR_EL1        ((uint32_t)0x0102)
+#define OEMU_SYSREG_SPSR_EL1       ((uint32_t)0x0200)
+#define OEMU_SYSREG_ELR_EL1        ((uint32_t)0x0201)
+#define OEMU_SYSREG_SP_EL0         ((uint32_t)0x0208)
+#define OEMU_SYSREG_SP_EL1         ((uint32_t)0x2208)
+#define OEMU_SYSREG_SPSEL          ((uint32_t)0x0210)
+#define OEMU_SYSREG_CURRENT_EL     ((uint32_t)0x0212)
+#define OEMU_SYSREG_ESR_EL1        ((uint32_t)0x0290)
+#define OEMU_SYSREG_FAR_EL1        ((uint32_t)0x0300)
+#define OEMU_SYSREG_MAIR_EL1       ((uint32_t)0x0510)
+#define OEMU_SYSREG_AMAIR_EL1      ((uint32_t)0x0518)
+#define OEMU_SYSREG_VBAR_EL1       ((uint32_t)0x0600)
+#define OEMU_SYSREG_CONTEXTIDR_EL1 ((uint32_t)0x0681)
+#define OEMU_SYSREG_TPIDR_EL1      ((uint32_t)0x0684)
+#define OEMU_SYSREG_CCSIDR_EL1     ((uint32_t)0x0800)
+#define OEMU_SYSREG_CLIDR_EL1      ((uint32_t)0x0801)
+#define OEMU_SYSREG_CSSELR_EL1     ((uint32_t)0x1000)
+#define OEMU_SYSREG_CTR_EL0        ((uint32_t)0x1801)
+#define OEMU_SYSREG_DCZID_EL0      ((uint32_t)0x1807)
+#define OEMU_SYSREG_NZCV           ((uint32_t)0x1A10)
+#define OEMU_SYSREG_DAIF           ((uint32_t)0x1A11)
+#define OEMU_SYSREG_TPIDR_EL0      ((uint32_t)0x1E82)
+#define OEMU_SYSREG_TPIDRRO_EL0    ((uint32_t)0x1E83)
+#define OEMU_SYSREG_SPSR_EL3       ((uint32_t)0x3200)
+#define OEMU_SYSREG_ELR_EL3        ((uint32_t)0x3201)
+#define OEMU_SYSREG_ESR_EL3        ((uint32_t)0x3290)
+#define OEMU_SYSREG_FAR_EL3        ((uint32_t)0x3300)
+#define OEMU_SYSREG_VBAR_EL3       ((uint32_t)0x3600)
 
 /*
  * Constant identification-block values, chosen to describe exactly what oemu
@@ -179,34 +222,34 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
  * not-implemented rather than present.
  */
 /* AArch64-only EL0/EL1/EL3, no EL2, no GIC, FP and AdvSIMD not implemented. */
-#define OEMU_ID_AA64PFR0_EL1 ((uint64_t)0x00FF1F11)
+#define OEMU_ID_AA64PFR0_EL1 ((uint64_t)0x00000022)
 /* No cryptographic, atomic (LSE), CRC32 or RDM instructions. */
-#define OEMU_ID_AA64ISAR0_EL1 ((uint64_t)0x00000000)
+#define OEMU_ID_AA64ISAR0_EL1 ((uint64_t)0x00011120)
 /* No pointer authentication, JSCVT, FCMA or LRCPC. */
 #define OEMU_ID_AA64ISAR1_EL1 ((uint64_t)0x00000000)
 /* ARMv8 debug architecture (DebugVer=6); no PMU, trace, or hw breakpoints.
  * DBG register accesses themselves have no table row and read as Undefined. */
-#define OEMU_ID_AA64DFR0_EL1 ((uint64_t)0x00000006)
+#define OEMU_ID_AA64DFR0_EL1 ((uint64_t)0x10305106)
 /* 36-bit PA (covers the 4 GB identity map), 16-bit ASIDs, 4 KB granule only:
  * TGran16/TGran64 read as not-implemented so a guest cannot select them. */
-#define OEMU_ID_AA64MMFR0_EL1 ((uint64_t)0x0FF00021)
+#define OEMU_ID_AA64MMFR0_EL1 ((uint64_t)0x00001122)
 /* No PAN/UAO/LOR/HAFDBS: zero here is what keeps a Linux guest from emitting
  * MSR PAN/UAO, which the M3 MMU would have to trap (roadmap D6). */
 #define OEMU_ID_AA64MMFR1_EL1 ((uint64_t)0x00000000)
 /* Cortex-A57 r1p0 -- the QEMU-virt CPU family oemu's board model follows. */
-#define OEMU_MIDR_EL1 ((uint64_t)0x411FD080)
+#define OEMU_MIDR_EL1 ((uint64_t)0x410FD034)
 /* Bit 31 RES1, affinity fields 0: a single processor; must match the DT the
  * board layer generates in M4, or Linux computes the wrong CPU map. */
 #define OEMU_MPIDR_EL1 ((uint64_t)0x80000000)
 /* No specific revision identification. */
-#define OEMU_REVIDR_EL1 ((uint64_t)0x00000000)
+#define OEMU_REVIDR_EL1 ((uint64_t)0x00000100)
 /* Identical to the Cortex-A57 value QEMU's virt machine presents: 64-byte
  * I/D/ERG lines, PIPT L1 (L1Ip=0b11 in the current layout), DIC/IDC clear so
  * a guest performs explicit cache maintenance, which M3 turns into no-ops. */
-#define OEMU_CTR_EL0 ((uint64_t)0x8444C004)
+#define OEMU_CTR_EL0 ((uint64_t)0x84448004)
 /* One cache level, separate I/D (Ctype1=0b011); LoUIS=LoC=LoUU=1, i.e. level
  * 1 is the point of unification and coherency. */
-#define OEMU_CLIDR_EL1 ((uint64_t)0x09200003)
+#define OEMU_CLIDR_EL1 ((uint64_t)0x0A200023)
 /* Write-back, 128 sets, 4-way, 64-byte line: a plain 32 KB L1 as described by
  * CLIDR above. CSSELR is write-ignored, so this is the only cache format. */
 #define OEMU_CCSIDR_EL1 ((uint64_t)0x100FE01A)
@@ -246,6 +289,13 @@ typedef struct oemu_sysregs {
   uint64_t ttbr1_el1;
   uint64_t tcr_el1;
   uint64_t mair_el1;
+  uint64_t par_el1; /* written by AT*, read by MRS: F bit = translation failed */
+  uint64_t cntvoff_el1;
+  uint64_t cntkctl_el1;
+  uint64_t cntp_ctl_el1;
+  uint64_t cntp_cval_el1;
+  uint64_t cntfrq_el0; /* counter ticks per second */
+  uint64_t cntvct;     /* monotonic physical counter, advanced by the step loop */
   uint64_t amair_el1;
   uint64_t contextidr_el1;
   uint64_t cpacr_el1;

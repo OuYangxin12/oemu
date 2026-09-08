@@ -231,15 +231,18 @@ TEST_F(MmuTest, ReservedDescriptorEncodingIsATranslationFault) {
   EXPECT_EQ(f.esr, EcBase(OEMU_EXC_EC_DABORT_SAME) | kIlBit | Trans(1));
 }
 
-TEST_F(MmuTest, TableDescriptorBelowThePageLevelFaults) {
+TEST_F(MmuTest, LastLevelTableBitsResolveAsAPage) {
+  /* Descriptor type 0b11 is a table pointer only at levels 0..2; at the last
+   * level (3, for the 4 KiB granule) it is a 4 KiB page -- the leaf. There is
+   * no lower level to descend to, so it must resolve, not fault. This is the
+   * entry shape every real guest's level-3 PTEs carry. */
   const uint64_t va = kRam + UINT64_C(0x2000);
   l1_table(kL1, va, kL2, 0U);
   l2_table(va, kL3);
-  write_desc(kL3 + idx3(va) * 8U, kTable | (kRam + 0x200000U)); /* table below pages */
+  write_desc(kL3 + idx3(va) * 8U, kTable | (kRam + 0x200000U) | kAf | kAttrNormal);
   uint64_t pa = 0U;
-  oemu_mmu_fault f{};
-  ASSERT_EQ(xlat(va, false, false, &pa, &f), OEMU_ERR_FAULT);
-  EXPECT_EQ(f.esr, EcBase(OEMU_EXC_EC_DABORT_SAME) | kIlBit | Trans(3));
+  ASSERT_EQ(xlat(va, false, false, &pa, nullptr), OEMU_OK);
+  EXPECT_EQ(pa, (kRam + 0x200000U) + (va & 0xFFFU));
 }
 
 TEST_F(MmuTest, BlockDescriptorAtLevel0IsRefused) {

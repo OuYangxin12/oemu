@@ -286,6 +286,34 @@ TEST_F(ExecTest, UbfmCoversUxtwAndUbfiz) {
   EXPECT_EQ(x(0), 0x6677U);
 }
 
+TEST_F(ExecTest, UbfizWrappingFormKeepsFullWidth) {
+  /* ubfiz x23,x23,#3,#9 -- the exact instruction Linux's __create_pgd_mapping
+   * uses to turn a PMD index into a byte offset. UBFIZ #lsb,#width encodes as
+   * the wrapping UBFM (N=0, immR=width-1, immS=63-lsb): the field is the low
+   * `width` bits rotated left by `lsb`. Truncating the mask to width-1 bits
+   * here drops the index's top bit and steers a page-table walk one 2K slot
+   * down -- one lost bit, a kernel that dies before its first console line. */
+  program({0xd37d22f7U});
+  set_x(23, UINT64_C(0x1EE)); /* pmd index 494: every bit of the 9-wide field set */
+  oemu_regs_set_pc(&cpu_.regs, kText);
+  step_ok(1);
+  EXPECT_EQ(x(23), UINT64_C(0xF70)); /* (0x1EE & 0x1FF) << 3 */
+}
+
+TEST_F(ExecTest, SbfizWrappingFormKeepsFullWidth) {
+  /* sbfiz x23,x23,#3,#9: same wrapping form, sign-extending flavour. */
+  program({0x937d22f7U});
+  set_x(23, UINT64_C(0x00E)); /* bit 8 clear: the 9-bit field is positive */
+  oemu_regs_set_pc(&cpu_.regs, kText);
+  step_ok(1);
+  EXPECT_EQ(x(23), UINT64_C(0x70));
+  program({0x937d22f7U});
+  set_x(23, UINT64_C(0x10E)); /* bit 8 set: the 9-bit field is negative */
+  oemu_regs_set_pc(&cpu_.regs, kText);
+  step_ok(1);
+  EXPECT_EQ(x(23), UINT64_C(0xFFFFFFFFFFFFF870)); /* (0x10E - 0x200) << 3 */
+}
+
 TEST_F(ExecTest, BfmInsertsOnlyItsOwnField) {
   program({0xb3485c20U}); /* bfxil x0,x1,#8,#16 -> BFM #8,#23 */
   set_x(0, UINT64_C(0xDEADBEEF00000000));
@@ -401,6 +429,28 @@ TEST_F(ExecTest, WideningMultiplyAddsAndSubtractsInSixtyFourBits) {
   set_x(3, 0U);
   step_ok(1);
   EXPECT_EQ(x(0), UINT64_C(0xFFFFFFFFFFFFFFFA)); /* 0 - 6 */
+}
+
+TEST_F(ExecTest, WideningAddendIsFullSixtyFourBits) {
+  // The third operand (Ra) of {S,U}MADDL/MSUBL is a full 64-bit addend, not a
+  // word: a regression that read it as W32 dropped its top half and silently
+  // corrupted the real kernel's ring-buffer arithmetic, which scales an index
+  // by an element size and adds a 64-bit base (`umaddl x0, w2, w1, x0`).
+  // Encodings mirror the ones verified in the test above (only the operands
+  // and the addend's width are what matters here).
+  program({0x9b220c20U, /* smaddl x0,w1,w2,x3 */ 0x9ba28c20U /* umsubl x0,w1,w2,x3 */});
+  // A 64-bit base plus a small scaled index: the top half must survive the add.
+  set_x(1, 2U);                           /* index 2 */
+  set_x(2, 24U);                          /* element size 24 -> +48 */
+  set_x(3, UINT64_C(0xffffffc0802d8850)); /* kernel-linear-map base pointer */
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0xffffffc0802d8880)); /* base + 48, high half intact */
+  // Umul with a zero product still has to pass the 64-bit addend straight through.
+  set_x(1, 0U);
+  set_x(2, 0U);
+  set_x(3, UINT64_C(0xffffffc0802d88b0));
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0xffffffc0802d88b0));
 }
 
 TEST_F(ExecTest, MulHighCoversTheTrickyCorners) {
@@ -662,6 +712,29 @@ TEST_F(ExecTest, PairsTransferTwoLocations) {
   step_ok(1);
   EXPECT_EQ(load64(kData), 1U);
   EXPECT_EQ(load64(kData + 8U), 2U);
+}
+
+TEST_F(ExecTest, NonTemporalPairStoresAndLoadsLikePlainOnes) {
+  /* stnp/ldnp (form-0 pair encodings) carry a cache hint and nothing else;
+   * Linux's __pi_clear_page stores zeros with them when DCZID_EL0.DZP=1, so
+   * they must transfer exactly like their temporal twins. */
+  program({0xa8010440U}); /* stnp x0,x1,[x2,#16] */
+  set_x(0, 0x10U);
+  set_x(1, 0x11U);
+  set_x(2, kData);
+  step_ok(1);
+  EXPECT_EQ(load64(kData + 16U), 0x10U);
+  EXPECT_EQ(load64(kData + 24U), 0x11U);
+  EXPECT_EQ(x(2), kData); /* the offset form never writes back */
+
+  program({0xa8410440U}); /* ldnp x0,x1,[x2,#16] */
+  set_x(0, 0U);
+  set_x(1, 0U);
+  set_x(2, kData);
+  oemu_regs_set_pc(&cpu_.regs, kText);
+  step_ok(1);
+  EXPECT_EQ(x(0), 0x10U);
+  EXPECT_EQ(x(1), 0x11U);
 }
 
 TEST_F(ExecTest, PairWritebackForms) {

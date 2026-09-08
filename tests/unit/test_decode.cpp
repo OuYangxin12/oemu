@@ -235,6 +235,10 @@ constexpr GoldenCase kGolden[] = {
     {0x69408440U, "ldpsw x0, x1, [x2, #4]"},
     {0xa8c17bfdU, "ldp x29, x30, [sp], #16"},
     {0xa9bf7bfdU, "stp x29, x30, [sp, #-16]!"},
+    {0xa8010440U, "stnp x0, x1, [x2, #16]"},
+    {0x28000440U, "stnp w0, w1, [x2]"},
+    {0xa8410440U, "ldnp x0, x1, [x2, #16]"},
+    {0xa802783dU, "stnp x29, x30, [x1, #32]"},
     {0xc85f7c20U, "ldxr x0, [x1]"},
     {0xc8027c20U, "stxr w2, x0, [x1]"},
     {0xc85ffc20U, "ldaxr x0, [x1]"},
@@ -810,6 +814,23 @@ TEST(DecodeLoadStore, PairPostIndexIsTheEpilogue) {
   EXPECT_EQ(OEMU_OP_LDP, insn.op);
   EXPECT_EQ(16, insn.imm);
   EXPECT_EQ(OEMU_INDEX_POST, insn.index_mode);
+}
+
+TEST(DecodeLoadStore, NonTemporalPairDecodesAsItsTemporalForm) {
+  // stnp x0, x1, [x2, #16]: the no-offset form, whose non-temporal flavour is
+  // a cache hint only. It must decode to a plain offset STP so Linux's
+  // __pi_clear_page (which uses it when DCZID.DZP=1) can clear pages.
+  const oemu_insn insn = DecodeOk(0xa8010440U);
+  EXPECT_EQ(OEMU_OP_STP, insn.op);
+  EXPECT_EQ(OEMU_INDEX_NONE, insn.index_mode);
+  EXPECT_EQ(16, insn.imm);
+  EXPECT_EQ(OEMU_MEM_DWORD, insn.mem_size);
+  EXPECT_EQ(0u, insn.rd);
+  EXPECT_EQ(1u, insn.rt2);
+  const oemu_insn lnp = DecodeOk(0xa8410440U);  // ldnp x0, x1, [x2, #16]
+  EXPECT_EQ(OEMU_OP_LDP, lnp.op);
+  EXPECT_EQ(OEMU_INDEX_NONE, lnp.index_mode);
+  EXPECT_EQ(16, lnp.imm);
 }
 
 TEST(DecodeLoadStore, ThirtyTwoBitPairScalesByFour) {

@@ -90,7 +90,6 @@ void oemu_exc_take(oemu_regs *regs, oemu_sysregs *sysregs, oemu_exc_kind kind, o
 
   const uint64_t old_pstate = sysregs->pstate;
   const oemu_el from = oemu_pstate_el(old_pstate);
-
   /* Compute the vector before clobbering anything: it depends only on state
    * the interrupted world still holds. */
   const uint64_t vector =
