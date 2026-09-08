@@ -9,9 +9,14 @@
  * escapes even while CR disables the UART), a 16-deep RX ring, RIS/IMSC
  * interrupt state, and the peripheral ID table the PL011 driver reads.
  *
- * TX is queued (a 16-byte ring, oldest dropped on overflow -- TX must
- * never block the vCPU) and drained by oemu_pl011_pump into a sink the
- * installer chose at init time. RX arrives through
+ * With the FIFO off (CR.FEN=0 -- the state the kernel's console driver
+ * leaves it in) pass-through is immediate: the DR write hands the byte to
+ * the sink before it returns and FR.TXFE is honest the moment the guest
+ * re-reads it. Deferring those bytes to a pump turned out to lie about TX
+ * while the ring held them, and Linux's earlycon spun on that lie until its
+ * panic printout was cut mid-word. Only FIFO mode (CR.FEN=1) queues, into
+ * a 64-byte ring drained by oemu_pl011_pump (oldest dropped on overflow --
+ * TX must never block the vCPU). RX arrives through
  * oemu_pl011_inject, which answers OEMU_ERR_FULL when the ring is full
  * and OEMU_ERR_STATE when the receiver is disabled: the caller owns the
  * drop policy, exactly as the host stdin pump will.

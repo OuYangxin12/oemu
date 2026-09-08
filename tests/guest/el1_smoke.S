@@ -84,15 +84,15 @@ _start:
 	bl	puts
 
 	/* Exit protocol (M4a): the PSCI conduit, not a UART sentinel. Negotiate
-	 * the version then issue SYSTEM_OFF (0x84000002) over SMC -- the same
+	 * the version then issue SYSTEM_OFF (0x84000008) over SMC -- the same
 	 * contract `oemu boot` answers and the kernel obeys. Under the QEMU
 	 * oracle the SMC is served by its own PSCI emulation and the machine
 	 * powers down there too; the BRK/park below is only a dead-man's switch. */
 	movz	x0, #0x0
 	movk	x0, #0x8400, lsl #16     /* 0x84000000 PSCI_VERSION */
 	smc	#0
-	movz	x0, #0x2
-	movk	x0, #0x8400, lsl #16     /* 0x84000002 SYSTEM_OFF */
+	movz	x0, #0x8
+	movk	x0, #0x8400, lsl #16     /* 0x84000008 SYSTEM_OFF: FN(8), uapi/linux/psci.h */
 	smc	#0
 
 	brk	#0

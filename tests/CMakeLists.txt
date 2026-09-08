@@ -356,6 +356,14 @@ oemu_add_test(test_pl011_check
   LABELS "unit;death"
 )
 
+# The PSCI/SMCCC conduit: function IDs from the guest's own contract, and the
+# rule that a PSCI-shaped or SMCCC-standard call is always consumed --
+# bouncing one back as an exception is what oopsed the kernel at boot.
+oemu_add_test(test_psci
+  SOURCES unit/test_psci.cpp
+  LABELS unit
+)
+
 # M3b parity: every served answer against the bypassed walk -- the cache
 # may only be faster. It needs the internal bypass and the peek, so it is
 # a whitebox target; the suite names carry "Tlb" for -R Tlb.

@@ -221,8 +221,17 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
  * fault somewhere confusing, so anything oemu does not implement reads as
  * not-implemented rather than present.
  */
-/* AArch64-only EL0/EL1/EL3, no EL2, no GIC, FP and AdvSIMD not implemented. */
-#define OEMU_ID_AA64PFR0_EL1 ((uint64_t)0x00000022)
+/* AArch64-only at every implemented level: EL0 field 0b0000 (no AArch32),
+ * EL1 field 0b0001 (AArch64 at EL1). This DELIBERATELY differs from the
+ * cortex-a53 oracle, which returns 0x22 (AArch32 at EL0): oemu has no
+ * AArch32 decoder at all, so copying a53's value was a lie that Linux
+ * caught -- the guest's cpuinfo gate (id_aa64pfr0_32bit_el0) trusted the
+ * advertisement, read the whole AArch32 ID group (ID_DFR0_EL1 first), and
+ * took a synchronous Undefined on the idle task at smp_prepare_boot_cpu.
+ * Per this file's rule, a guest must never be told a feature exists that it
+ * can exercise into a fault; advertising AArch64-only makes the kernel skip
+ * the AArch32 path it cannot run here. */
+#define OEMU_ID_AA64PFR0_EL1 ((uint64_t)0x00000010)
 /* No cryptographic, atomic (LSE), CRC32 or RDM instructions. */
 #define OEMU_ID_AA64ISAR0_EL1 ((uint64_t)0x00011120)
 /* No pointer authentication, JSCVT, FCMA or LRCPC. */

@@ -78,3 +78,57 @@ make test && make asan
   照此实现，`psci_off.S` 已按该协议验证（exit 0）。
 - FID 构造半字纪律：SYSTEM_OFF=0x84000008 → `movz #0x8; movk #0x8400,
   lsl #16`（低 16 位必须进 movz 半字）。
+
+## 第 1 轮落地：PSCI/SMCCC conduit 修正 + PL011 直通 + ID 诚实化（本提交）
+
+> 背景：PR#24（M4a）合入 master 后，遗留问题是 post-PSCI banner 的
+> oops 与被截断的 oops 打印。目标：把内核从"banner 后 oops"推进到
+> 深度早期 init。
+
+已实现并全门通过（`make test`/`make asan` 828/828，`tidy` exit 0
+新增告警 0，`format-check` 仅 `bench/corpus/k_addsub.c` 预存漂移）：
+
+- **PSCI/SMCCC conduit 重写**（`src/fw/psci.c`、`include/oemu/psci.h`）：
+  - FID 常量此前是**猜测值**（旧 SYSTEM_OFF=0x84000002 其实是 CPU_OFF；
+    旧 SYSTEM_RESET=0x84000003 是 CPU_ON）。现按客户机自带契约
+    `uapi/linux/psci.h` 纠正：VERSION=0x84000000、SYSTEM_OFF=FN(8)、
+    SYSTEM_RESET=FN(9)、CPU_SUSPEND/CPU_ON/AFFINITY/FEATURES 齐备。
+  - 关键不变量：PSCI/SMCCC-标准/fast 服务空间内的调用**一律被消费**
+    （不认识的答 NOT_SUPPORTED），绝不反弹成异常——旧代码把
+    FEATURES/fast-0x80000000 弹回 guest，内核 `setup_arch` 即 oops。
+  - SMCCC FEATURES(0x80000000/0xC0000000)→v1.0(0x00010000，取自
+    oracle dmesg "SMC Calling Convention v1.0")；ARM-Standard owner
+    0x47→NOT_SUPPORTED。owner 位域拆成 bits[31:24] class 与
+    bits[23:16] owner 两个字节（旧实现把两者混为一谈，误吞
+    0x8442xxxx 之类 HyperV owner）。
+  - 服务测试 `tests/unit/test_psci.cpp`（11 例）钉住以上全部。
+  - 同错还潜伏在测试侧：`test_cli.cpp`/`psci_off.S`/`el1_smoke.S`
+    都用错 SYSTEM_OFF 0x84000002（只有"自产自销"的同错测试才过）；
+    真内核的 panic-reboot 才暴露。已全部纠正为 0x84000008。
+- **PL011 FEN=0 直通**（`src/dev/pl011.c`、`pl011_internal.h`、
+  `test_pl011.cpp`）：CR.FEN=0（内核 console driver 从不置 FEN）时
+  DR 写**立即**进 sink，FR.TXFE 当场诚实——旧的 64B 环延迟到 slice
+  边界才泵，earlycon 在 TXFE 上自旋时环永不排空，panic 打印被截断
+  （"Hardwar…"）。FIFO 模式(FEN=1)仍走环，测试按 FEN 分流。
+- **ID 诚实化**（`include/oemu/sysreg.h`、`tests/guest/id_probe.S`）：
+  `ID_AA64PFR0_EL1` 0x22→**0x10**（EL0=无 AArch32）。oemu 无 AArch32
+  解码，旧值 0x22 是谎报，内核据此去读整组 AArch32 ID 寄存器并在
+  `smp_prepare_boot_cpu` 的 swapper 上触发同步 Undefined。诚实宣传
+  AArch64-only 后内核直接跳过该路径。id_probe.S 扩测 AA32 组，记录
+  这处**有意**偏离 oracle（oracle=a53 有 AArch32）。
+
+内核轨迹对比（`boot -kernel guest/build/Image`，同 DTB）：
+- 修复前：`Booting Linux` banner → `psci: ...v0.2 function IDs` →
+  `Internal error: Oops - Undefined instruction: 2000003`（SMC 弹回）→
+  `Kernel panic - not syncing: Attempted to kill the idle task!`，
+  console 截断在 "Hardwar"。
+- 本提交：一路到 `SLUB: HWalign=64, ...`（含 PSCI 探测全过、
+  `Detected VIPT I-cache`、`CPU features`、内存布局、mem auto-init、
+  software IO TLB、Memory:、SLUB）。无 oops、无截断。
+
+**下一个墙**（非本提交范围）：SLUB 之后内核在 `free_vmap_area`
+红黑树遍历处反复取数据异常（FAR=0x1000027、ESR=0x96000005、
+ELR=`free_vmap_area_rb_augment_cb_propagate+0x24`，`ldr x2,[x2,#40]`
+命中野指针），且被 printk rate-limit 吞掉、无 oops 外漏。这是一处
+**更靠前的执行/MMU 一致性 bug**（破坏了 vmap 堆结构），需要指令级
+trace 工具单独立项排查——非 conduit/ID/串口问题。
