@@ -134,6 +134,20 @@ timer 一接上 jiffies 走动、内核越过该点——但随即在 `FAR=0x28`
   语义/标志位有差），非取数 bug、非 timer、非 initramfs。dentry 处 d_flags 亦见
   RCU/PARALLEL 位，像一份被留在负态的 dentry。
 
+### 第 5 轮：create 其实执行了 → 缩小到"建后即被清零/野 file"
+
+- 把 PC 环放大到 6000、在首异常处 dump 全环并符号化：崩溃前的窗口里出现
+  `new_inode`、`d_alloc`/`__d_alloc`/`d_alloc_parallel`、`d_add`/`__d_add`、
+  `inode_init_owner`——即 `filp_open(O_CREAT)` 的 create **确实跑了**（`d_add` 会把
+  d_inode 置成新建 inode），可崩溃时 `d_inode` 却为 0。⇒ **不是"跳过 create"**，而是
+  **建好后 d_inode 又被清成 0**（或 `filp_open` 返回的 `struct file` 是野值，其
+  f_path.dentry 指向另一份负 dentry）。头号嫌疑改为：`struct file`/`struct dentry`
+  从 slab 取到的对象未正确清零（`__d_alloc` 的 kzalloc 区、或 `alloc_file`）→ oemu 的
+  memset/页清零某条指令（`DC ZVA`/`STP` 归零 / `UBFM` 变址）与真机有差；或 dentry 发布
+  原子（`hlist_bl` 位锁 = LL/SC）被误判致 `d_add` 未真正落盘。
+- 判别小结：dir-only 干净；任意 regular file（含 0 字节 / 改名 foo / 加 `dir .`）即崩；
+  关 timer 仍崩；QEMU oracle 同 Image+同 cpio 正常。四门不受影响（本会话未改可执行代码）。
+
 ### 待办（后续轮）
 
 - **root cause（已缩小到 filp_open(O_CREAT) 的 create 路径）**：做一次单步 oracle
