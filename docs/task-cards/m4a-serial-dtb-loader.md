@@ -394,3 +394,44 @@ noalloc 无路可走 → `BUG_ON` → die → panic（早于 console_init，故�
   `-monitor tcp:…,server` 可用（`x/1gx <VA>` 走 QEMU 真 MMU，能验 `…dfe000`
   读到 FDT magic `0xd00dfeed`，但 create_pgd 期那个瞬态 fixmap 别名已拆除）。
 - 建议：加一条 `-plugin`（TCG 指令级 trace）或找一份 aarch64 gdb 做逐条比对。
+
+### L3 达成：横幅已印出（两条指令级 bug 修复）
+
+**验收达成**：oemu 用 `guest/build/Image` + `guest/boot-virt.dtb` 真实引导，
+PL011 上打出
+
+```
+Booting Linux on physical CPU 0x0 [0x410fd034]
+Linux version 6.6.156 ...
+earlycon: pl11 at MMIO 0x0000000009000000 (options '')
+printk: bootconsole [pl11] enabled
+```
+
+并继续到 zones / nodes / `psci: PSCIv1.1 detected`，与 QEMU oracle 的前段输出一致。
+
+**两条被修复的执行错误**（各配回归测试，`make test`/`make asan` 816/816）：
+
+1. `exec: keep the full width of wrapping UBFM/SBFM (M4a)`（eea5e02）。
+   回绕型 UBFM/SBFM（`immR > immS`）的字段长度是
+   `len = regsize - immR + immS + 1`，oemu 少写了 `+1`，导致
+   `UBFIZ #3,#9`（= `lsl #3` 的位域拼法，内核用它把 PMD 索引换算成
+   页表内字节偏移）被截成 11 位：索引 `0x1EE` 变 `0xEE`，
+   `__create_pgd_mapping` 因此读的是**另一张表里的另一个槽**——先读回 0，
+   再撞上 `alloc_init_pte` 的 `BUG_ON(!pgtable_alloc)`。之前"参数被污染"
+   的判读是这条截断引起的连锁假象。
+2. `decode: execute non-temporal pairs LDNP/STNP as plain LDP/STP (M4a)`
+   （4853f9a）。form-0 的 pair 编码原先返回 UNSUPPORTED。内核在
+   `DCZID_EL0.DZP=1`（oemu 现值 0x10）时走 `__pi_clear_page` 的
+   `stnp` 清零路径——不支持它，内核在清第一页之前就会 die。
+   非临时提示只是 cache 建议，直接按 LDP/STP 无偏移形式执行即可。
+
+**取证记录**：本轮曾用 PL011 裸机探针在 QEMU 上读 `dczid_el0`：
+`-d in_asm` 证实镜像从 `0x40080000`（QEMU spin-table）起步、探针已执行，
+但串口零输出（EL3 下对 UART 的写不可见），探针路线暂缓；STNP 缺失本身
+就是内核可见差异，先修它。
+
+**下一块拦路石（假设，待验证）**：`psci:` 打印之后出现
+`Internal error: Oops - Undefined instruction`（ESR `0x02000003`），
+`swapper` 在 idle 入口——高度疑似 `wfi` 未被执行（M4a 任务卡早已点名
+"missing WFI semantics"）。串口在该次 oops 中途截断（"Hardwar"），
+PL011 TX FIFO 满时丢字也可能是 oemu 侧的串口保真缺口，一并排。
