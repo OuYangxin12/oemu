@@ -561,7 +561,22 @@ static oemu_status do_bitfield(oemu_cpu *cpu, const oemu_insn *in) {
    * walk in the wrong slot. */
   const unsigned len = (msb < lsb) ? (bits - lsb + msb + 1U) : (msb - lsb + 1U);
   uint64_t rot;
-  if (lsb == 0U) {
+  if (msb < lsb) {
+    /* Wrapped range (immR > immS): this is the shift-alias form, where UBFM
+     * spells `lsl #s` (immR=regsize-s, immS=regsize-1-s) and SBFM the
+     * sign-extending flavour. A wrapped UBFM is a LEFT SHIFT by
+     * (regsize - immR), NOT a rotate: the ARM field spans bits immS:0 and
+     * regsize-1:immR, and when extracted right-aligned those two pieces sit
+     * contiguously at the top with the vacated low `immR` bits forced to zero.
+     * A rotate instead folds the source's top (regsize-immR) bits back into
+     * those low positions. That is not cosmetic: `lsl x,x,#12` (UBFM #52,#51)
+     * is the very instruction Linux's `allocate_slab` uses to form a slab
+     * object address, and leaving the wrapped bits in returns `...fff` where
+     * the address must end `...000` -- every object one cacheline-short, the
+     * freelist links land misaligned, and the first vmap-tree walk dies on a
+     * garbage rb_right. */
+    rot = (src << (bits - lsb)) & width_mask;
+  } else if (lsb == 0U) {
     rot = src;
   } else {
     rot = (src >> lsb) | (src << (bits - lsb));

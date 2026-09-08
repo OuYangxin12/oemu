@@ -132,3 +132,35 @@ ELR=`free_vmap_area_rb_augment_cb_propagate+0x24`，`ldr x2,[x2,#40]`
 命中野指针），且被 printk rate-limit 吞掉、无 oops 外漏。这是一处
 **更靠前的执行/MMU 一致性 bug**（破坏了 vmap 堆结构），需要指令级
 trace 工具单独立项排查——非 conduit/ID/串口问题。
+
+## 第 2 轮落地：UBFM 回绕即左移修复（本提交）
+
+第 1 轮把内核推到 SLUB 后卡死：`free_vmap_area` 红黑树遍历取到野指针
+（FAR=0x1000027、ESR=0x96000005），反复取异常、无 oops 外漏。根因不是
+conduit/串口/MMU，而是一条 CPU 指令译码/执行错：
+
+- **`do_bitfield` 把回绕 UBFM（immR>immS）执行成"循环右移"**，正确语义是
+  "左移 (regsize-immR) 位、低位移入位强制为 0"。回绕 UBFM 正是 `lsl #n`
+  的编码（`lsl #12` = UBFM #52,#51）。旧实现把源的高 n 位旋转回到低 n 位，
+  于是 Linux `allocate_slab+0xc8` 的 `lsl x20,x20,#12` 得到 `...fff` 而非
+  `...000`——SLUB 对象基址每个都偏 1 字节，freelist 链接指针写歪，第一个
+  vmap_area 红黑树遍历就炸。
+- 用指令级取证定位：watchpoint 抓到 `allocate_slab` 的 freelist 存指令
+  `str x22,[x20,x0]` 落在 `0x..1f/0x..67`（奇数、非 8 对齐）；反汇编 + 寄存器
+  trace 精确定位到 `lsl x20,x20,#12` 结果低 12 位应为 0 却是 0xfff。
+- 修复只改回绕分支（immS<immR）：`rot = (src << (bits - lsb))`，其后 mask 与
+  符号扩展逻辑不变。现有 UBFM/SBFM 回绕测试（len<bits）结果不变（结果掩码
+  同样丢弃回绕位），新增 `UbfmWrappedIsShiftNotRotate` 钉住 len==bits 情形。
+
+内核轨迹：修复后一路到 `init_IRQ`（第 35 行 `Root IRQ handler: gic_handle_irq`），
+在 `gic_of_init` 的 `readl_relaxed` 处取异常 → oops（这次能完整打印）→
+`Kernel panic - not syncing: Attempted to kill the idle task!`。
+
+**下一个墙**：内核走到 `init_IRQ → irqchip_init → gic_of_init`，读 GIC
+distributor 寄存器（VA 0xffffffc080360004，oemu 该处无设备）触发数据异常。
+这已是 M4b 明确列出的 **GICv2** 子系统范围（`src/dev/gicv2.c`），非 CPU 保真度
+问题。下一步实现最小 GICv2（distributor 让 gic_of_init 读到合理 ID、支持
+初始化期寄存器读写），使内核越过 init_IRQ 逼近 timer/ init 阶段。
+
+门：make test 829/829、make asan 829/829、make tidy exit 0、format-check 仅
+`bench/corpus/k_addsub.c` 预存漂移。

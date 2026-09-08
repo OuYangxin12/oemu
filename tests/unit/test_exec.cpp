@@ -286,6 +286,25 @@ TEST_F(ExecTest, UbfmCoversUxtwAndUbfiz) {
   EXPECT_EQ(x(0), 0x6677U);
 }
 
+TEST_F(ExecTest, UbfmWrappedIsShiftNotRotate) {
+  /* lsl x,x,#n == UBFM x,x,#(64-n),#(63-n), a WRAPPED range (immR > immS).
+   * The ARM field spans bits immS:0 and 63:immR, so extracted right-aligned it
+   * is exactly a LEFT shift by (64-immR): the vacated low n bits are forced to
+   * ZERO. A wrapped UBFM executed as a *rotate* folds the source's top n bits
+   * into those low positions instead. That leaked `lsl #12` (UBFM #52,#51) in
+   * Linux's allocate_slab returned `...fff` where the slab object address must
+   * end `...000`, misaligning every object and killing the first vmap walk. */
+  program({0xd374cc20U}); /* lsl x0,x1,#12 */
+  set_x(1, UINT64_C(0xFEDCBA9876543210));
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0xCBA9876543210000)); /* low 12 bits zero, not 0xF */
+  program({0xd3503c20U});                        /* lsl x0,x1,#48 */
+  set_x(1, UINT64_C(0x123456789ABCDEF0));
+  oemu_regs_set_pc(&cpu_.regs, kText);
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0xDEF0000000000000));
+}
+
 TEST_F(ExecTest, UbfizWrappingFormKeepsFullWidth) {
   /* ubfiz x23,x23,#3,#9 -- the exact instruction Linux's __create_pgd_mapping
    * uses to turn a PMD index into a byte offset. UBFIZ #lsb,#width encodes as
