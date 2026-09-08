@@ -90,6 +90,26 @@ guest/build/Image`（**不给 -dtb**）用生成树一路到 `No working init fo
 这根接线。下一轮：stdin→inject 泵 + guest initramfs/`/init`/getty，跑通
 `Run /init`+三标记+poweroff→exit 0。
 
+### 第 3 轮：`-serial stdio`(stdin→RX) + initramfs 配方 + generic timer（本提交）
+
+- `boot_run` 加 stdin 泵：`-serial stdio` 时把 fd0 设非阻塞 raw，每片
+  `read(0)`→`oemu_pl011_inject`（环满即丢，与 QEMU 早到字节丢弃一致）。默认
+  不泵（现有 stdout/--serial=file 行为不变）。
+- guest 侧：`tests/guest/init.c`（libc-free、~1.4 KB、原始 syscall 的极简
+  PID1，能复现 oracle 喂的两行 `echo SHELL_ALIVE`/`poweroff -f`）+
+  `scripts/build-linux-initramfs.sh`（cross gcc `-nostdlib` 编 + kernel
+  `gen_init_cpio` 打包 `/init`/`/dev/console`）。产物 `guest/build/initramfs.cpio`
+  gitignore，配方入库。glibc 静态 init 太大（600 KB）会拖死解释器，故手写极简版。
+- generic timer：`include/oemu/gtimer.h`/`src/dev/gtimer.c` 纯谓词
+  `oemu_gtimer_pending(counter,ctl,cval)`（counter 作参注入 = 可测缝，非墙钟）；
+  `boot_run` 每片按虚拟 timer 比较器刷 GIC PPI 30 的 pending。`test_gtimer`(5) 钉
+  禁用/屏蔽/到点/越点/回绕。
+
+效果 + 下一个障碍：initrd 路径此前卡死在 `Unpacking initramfs…`（jiffies 冻结），
+timer 一接上 jiffies 走动、内核越过该点——但随即在 `FAR=0x28` 数据异常处死循环
+（scheduler 跑起来后的一个空指针，属**下一个**保真 bug，非回退：无 initrd 路径
+仍干净 panic、冒烟与四门全绿 882/882）。
+
 ### 待办（后续轮）
 
 - 中断接线：virtual timer PPI(27) 经可注入 clock 触发 + PL011 SPI(33) RX 中断

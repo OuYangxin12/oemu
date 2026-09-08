@@ -42,6 +42,7 @@
 #include "oemu/elf.h"
 #include "oemu/exec.h"
 #include "oemu/fdt.h"
+#include "oemu/gtimer.h"
 #include "oemu/image.h"
 #include "oemu/machine.h"
 #include "oemu/memory.h"
@@ -63,6 +64,10 @@
 #include "boot_dtb.h" /* generated: the fixture blob as bytes */
 #include "oemu/gicv2.h"
 #include "oemu/pl011.h"
+
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
 
 /*
  * Stack policy. A freestanding guest's crt0 only needs a 16-byte-aligned SP --
@@ -113,10 +118,16 @@
 #define BOOT_GIC_CPU_SIZE  ((uint64_t)0x00010000ULL)
 #define BOOT_GIC_LINES     64U /* two groups: NR_IRQS 64, as the oracle */
 /* The PL011's single line: /interrupts = <0 1 4> -> SPI, offset 1 -> id 33. */
-#define BOOT_UART_SPI     33U
-#define BOOT_DTB_MAX      ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
-#define BOOT_CMDLINE_MAX  (256U)           /* writable boot line width */
-#define BOOT_BOOTLINE_LEN (257U)           /* the fixture property: pad + NUL */
+#define BOOT_UART_SPI 33U
+/* The generic timer's PPIs, from the DT's /timer interrupts in binding order
+ * [NS-phys, NS-virt, ...]: <1 13> -> 16+13 = 29, <1 14> -> 16+14 = 30. The
+ * clockevent uses one; both are driven level-wise and the unregistered line
+ * stays quiet because the distributor never enables it. */
+#define BOOT_TIMER_PHYS_PPI 29U
+#define BOOT_TIMER_VIRT_PPI 30U
+#define BOOT_DTB_MAX        ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
+#define BOOT_CMDLINE_MAX    (256U)           /* writable boot line width */
+#define BOOT_BOOTLINE_LEN   (257U)           /* the fixture property: pad + NUL */
 /* The initrd sits at the three-quarter mark of RAM -- clear of kernel text at
  * the base, clear of the DTB at the half mark, and clear of the boot stack at
  * the very top by BOOT_INITRD_MARGIN. A tree that advertises the initrd must
@@ -525,7 +536,7 @@ static void boot_hang_report(const oemu_vcpu *vcpu, const char *why, uint64_t in
 }
 
 static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oemu_gicv2 *gic,
-                    uint64_t max_insns) {
+                    bool pump_stdin, uint64_t max_insns) {
   uint64_t budget = max_insns;
   for (;;) {
     const uint64_t slice = (budget < BOOT_QUANTUM) ? budget : BOOT_QUANTUM;
@@ -533,12 +544,31 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
     const oemu_status st = oemu_vcpu_run(vcpu, slice, &done);
     budget -= done;
     (void)oemu_pl011_pump(uart); /* the console drains on every slice boundary */
+    /* Interactive console: drain whatever the host typed into the UART RX ring.
+     * A byte the ring cannot hold is dropped, exactly as QEMU drops an early
+     * byte before the driver enables the receiver. */
+    if (pump_stdin) {
+      unsigned char c = 0U;
+      while (read(STDIN_FILENO, &c, 1U) == 1) {
+        if (oemu_pl011_inject(uart, c) != OEMU_OK) {
+          break;
+        }
+      }
+    }
     /* The PL011 is a level source on GIC SPI 33 (the DT's /interrupts). Refresh
      * the distributor's pending bit from the UART's live level each slice, so a
      * received byte reaches the driver as interrupt 33 -- not a flat pin whose
      * GICC_IAR the driver would read back as spurious. The vCPU's IRQ is then
      * the GIC's word alone. */
     oemu_gicv2_set_pending(gic, BOOT_UART_SPI, oemu_pl011_irq_level(uart) != 0);
+    /* The generic timer's clockevent comparator is level-high once the counter
+     * passes it, so refresh the DT-declared PPIs from the live comparator each
+     * slice. Without this the counter moves but jiffies never tick and an idle
+     * guest soft-locks waiting for a timer IRQ that never arrives. */
+    const oemu_sysregs *sr = &vcpu->sysregs;
+    oemu_gicv2_set_pending(gic, BOOT_TIMER_VIRT_PPI,
+                           oemu_gtimer_pending(sr->cntvct - sr->cntvoff_el1, sr->cntv_ctl_el1,
+                                               sr->cntv_cval_el1) != 0);
     oemu_vcpu_set_irq(vcpu, oemu_gicv2_irq_level(gic) != 0);
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
@@ -576,10 +606,33 @@ typedef struct boot_opts {
   uint64_t ram_mib;        /* -m:      MiB, defaulting to the fixture's 1 GiB */
   uint64_t entry;          /* --entry: 0 -> the Image header's own entry */
   uint64_t max_insns;      /* --max-insns */
+  bool stdio;              /* -serial stdio: console is interactive (RX wired) */
 } boot_opts;
-/* Where the initrd goes: the three-quarter mark of RAM. Returns 0 (a signal
- * the caller turns into an error) when the ramdisk, plus a margin for the boot
- * stack and kernel heap, would not fit between that mark and the top of RAM. */
+/* For `-serial stdio`: put stdin in non-blocking raw mode so the run loop can
+ * drain typed bytes into the UART RX ring between slices without ever blocking
+ * the vCPU. Best-effort -- a redirected or closed stdin just yields EOF. */
+static void boot_arm_stdin(void) {
+  const int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+  if (flags >= 0) {
+    (void)fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+  }
+  struct termios t;
+  if (tcgetattr(STDIN_FILENO, &t) == 0) {
+    /* Raw by hand -- cfmakeraw needs GNU extensions the -std=c11 build hides.
+     * No canonical buffering, no host echo, no flow control: every typed byte
+     * reaches the run loop's read() as-is. */
+    t.c_iflag &= (tcflag_t) ~(BRKINT | ICRNL | INLCR | INPCK | ISTRIP | IXON | IXOFF);
+    t.c_oflag &= (tcflag_t)~OPOST;
+    t.c_lflag &= (tcflag_t) ~(ECHO | ECHOE | ECHONL | ICANON | IEXTEN);
+    t.c_cc[VMIN] = 0;
+    t.c_cc[VTIME] = 0;
+    (void)tcsetattr(STDIN_FILENO, TCSANOW, &t);
+  }
+}
+
+/* Where the initrd goes: the three-quarter mark of RAM. Returns 0 (a signal * the caller turns
+ * into an error) when the ramdisk, plus a margin for the boot stack and kernel heap, would not
+ * fit between that mark and the top of RAM. */
 static uint64_t boot_initrd_addr(uint64_t ram, uint64_t len) {
   const uint64_t base = BOOT_RAM_BASE + (ram / 4U) * 3U;
   if ((base + len + BOOT_INITRD_MARGIN) > (BOOT_RAM_BASE + ram)) {
@@ -809,7 +862,10 @@ static int boot(const boot_opts *opts) {
   }
   /* The boot protocol: x0 carries the DTB's physical address. */
   oemu_regs_write(&vcpu.cpu.regs, 0U, OEMU_REG_W64, dtb_pa);
-  result = boot_run(&vcpu, &machine, &uart, &gic, opts->max_insns);
+  if (opts->stdio) {
+    boot_arm_stdin();
+  }
+  result = boot_run(&vcpu, &machine, &uart, &gic, opts->stdio, opts->max_insns);
   (void)oemu_pl011_pump(&uart); /* whatever the guest queued before it died */
 
 done:
@@ -926,8 +982,14 @@ int main(int argc, char **argv) {
           return EXIT_USAGE;
         }
         i++;
-      } else if (strcmp(a, "--serial") == 0) {
-        if (v == NULL || parse_serial(v, &opts.serial_path) != 0) {
+      } else if (strcmp(a, "--serial") == 0 || strcmp(a, "-serial") == 0) {
+        if (v == NULL) {
+          print_usage(stderr);
+          return EXIT_USAGE;
+        }
+        if (strcmp(v, "stdio") == 0) {
+          opts.stdio = true; /* console to stdout, and stdin feeds the RX ring */
+        } else if (parse_serial(v, &opts.serial_path) != 0) {
           print_usage(stderr);
           return EXIT_USAGE;
         }
