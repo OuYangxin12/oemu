@@ -51,6 +51,10 @@ retest: build ## Re-run only the tests that failed last time
 list-tests: build ## List every registered test case
 	$(CTEST) --test-dir $(BUILD) -N
 
+.PHONY: boot-linux
+boot-linux: build ## Boot Linux under oemu and assert the M5 markers (docs/booting-linux.md)
+	@scripts/boot-linux-gate.sh $(GATE_ARGS)
+
 .PHONY: asan
 asan: ## Run the suite under ASan + UBSan
 	$(MAKE) test PRESET=asan
