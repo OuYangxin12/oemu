@@ -586,12 +586,35 @@ static oemu_status do_bitfield(oemu_cpu *cpu, const oemu_insn *in) {
   uint64_t field = rot & mask;
 
   if (in->op == OEMU_OP_BFM) {
-    /* BFM with a wrapped range is the reserved encoding: behave as a no-op. */
-    if (msb < lsb) {
-      return OEMU_OK;
-    }
+    /*
+     * BFM is UBFM's extracted value *merged into* the destination instead of
+     * overwriting it, and it lands where that value already sits -- not at
+     * `immR`. A non-wrapped range right-aligns the extract, so the field is
+     * [len-1:0]; that is BFXIL Xd,Xn,#lsb,#width, whose definition (Xd<width-1:
+     * 0> = Xn<lsb+width-1:lsb>) is exactly this rule. A wrapped range has been
+     * shifted up by regsize-immR, so the field is [len-1:regsize-immR], clipped
+     * to the register by construction because a wrapped range has len <=
+     * regsize. Either way: mask the field, leave every other destination bit
+     * alone.
+     *
+     * The old code refused to play at all. It took a wrapped BFM -- the
+     * spelling every real `bfi` uses, since BFI Xd,Xn,#lsb,#width encodes as
+     * immR=regsize-lsb, immS=width-1 -- for the reserved no-op it superficially
+     * resembles, and inserted at `immR` in the non-wrapped case. That is issue
+     * #26: `bfi x2, x0, #32, #32` is the splice inside lib/lockref.c's
+     * lockref_get, so the instruction vanished, __cmpxchg_case_64 stored the
+     * OLD packed word back, the dentry's refcount never went 1 -> 2, the very
+     * next dput killed and RCU-freed a dentry the open struct still pointed at,
+     * and Linux read d_inode == 0 out of the freed object and died in
+     * chown_common+0x48 with FAR=0x28. Only regular files trip it: they are the
+     * only initramfs entries whose populate path takes that dget/dput pair.
+     */
+    const unsigned bottom = (msb < lsb) ? (bits - lsb) : 0U;
+    const unsigned fbits = len - bottom; /* wrapped: msb + 1; non-wrapped: len */
+    const uint64_t dm =
+        (fbits == bits) ? width_mask : (((UINT64_C(1) << fbits) - UINT64_C(1)) << bottom);
     const uint64_t old = read_g(cpu, in->rd, false, in->width);
-    field = (old & ~((mask << lsb) & width_mask)) | ((field << lsb) & width_mask);
+    field = (old & ~dm) | (field & dm);
   } else if ((in->op == OEMU_OP_SBFM) && (((field >> (len - 1U)) & UINT64_C(1)) != 0U)) {
     /* Sign-extend inside the register width, then let write_g truncate. */
     field |= width_mask & ~mask;

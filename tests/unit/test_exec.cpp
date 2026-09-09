@@ -333,12 +333,94 @@ TEST_F(ExecTest, SbfizWrappingFormKeepsFullWidth) {
   EXPECT_EQ(x(23), UINT64_C(0xFFFFFFFFFFFFF870)); /* (0x10E - 0x200) << 3 */
 }
 
+/*
+ * The bitfield family, pinned to values measured under the oracle
+ * (qemu-system-aarch64, `-machine virt -cpu cortex-a53`) rather than computed
+ * here: a freestanding guest executed each encoding with hand-picked operands
+ * and printed the result over the PL011, and every case below is one where the
+ * readings a host might guess -- extract-at-immR, low-`width` bits, rotate,
+ * no-op on a wrapped range -- disagree. The rule they all agree on:
+ *
+ *   len   = (immS < immR) ? regsize - immR + immS + 1 : immS - immR + 1
+ *   value = UBFM's answer: wrapped, the source shifted left by regsize-immR;
+ *           otherwise the field extracted at immR, right-aligned
+ *   BFM   = merge that value into the destination where it already sits --
+ *           field [len-1:0] unwrapped, [len-1:regsize-immR] wrapped
+ *   UBFM / SBFM = overwrite the whole destination with it.
+ *
+ * So BFM is BFXIL, and the wrapping spelling is what every real `bfi` compiles
+ * to: BFI Xd,Xn,#lsb,#width encodes as immR=regsize-lsb, immS=width-1.
+ */
 TEST_F(ExecTest, BfmInsertsOnlyItsOwnField) {
   program({0xb3485c20U}); /* bfxil x0,x1,#8,#16 -> BFM #8,#23 */
   set_x(0, UINT64_C(0xDEADBEEF00000000));
   set_x(1, UINT64_C(0x1122334455667788));
   step_ok(1);
-  EXPECT_EQ(x(0), UINT64_C(0xDEADBEEF00667700));
+  /* x1<23:8> = 0x6677 lands in x0<15:0>, not at immR: BFXIL's contract is
+   * Xd<width-1:0>. This expectation used to read 0xDEADBEEF00667700, which is
+   * what inserting at immR gives -- the oracle says otherwise, and that reading
+   * is half of what broke issue #26. */
+  EXPECT_EQ(x(0), UINT64_C(0xDEADBEEF00006677));
+  program({0xb3485c20U});
+  set_x(0, UINT64_C(0xFFFFFFFFFFFFFFFF));
+  set_x(1, UINT64_C(0x0000000000123400));
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0xFFFFFFFFFFFF1234));
+}
+
+TEST_F(ExecTest, BfiWrappedRangeIsNotANoOp) {
+  /* bfi x2,x0,#32,#32 -> BFM #32,#31, the wrapping spelling. This is the
+   * high-32 splice in lib/lockref.c's lockref_get: executing it as a no-op made
+   * __cmpxchg_case_64 store the OLD packed word back, so a dget left a dentry's
+   * refcount at 1, the matching dput killed and RCU-freed that dentry under the
+   * open file, and the guest died in chown_common+0x48 with FAR=0x28. That is
+   * issue #26 -- a zero-byte regular file in the initramfs killed the boot
+   * while a directory of the same name did not. */
+  program({0xb3607c02U});
+  set_x(0, UINT64_C(0x0000000000000002));
+  set_x(2, UINT64_C(0x0000000100000000));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x0000000200000000));
+  program({0xb3607c02U}); /* source bits above the field are dropped */
+  set_x(0, UINT64_C(0x0000000100000002));
+  set_x(2, UINT64_C(0x0000000100000000));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x0000000200000000));
+  program({0xb3607c02U}); /* the destination's other half survives */
+  set_x(0, UINT64_C(0xDEADBEEF12345678));
+  set_x(2, UINT64_C(0x1111111122222222));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x1234567822222222));
+  program({0xb3607c20U}); /* same splice, Rd = x0: what C emits */
+  set_x(1, UINT64_C(0x0000000012345678));
+  set_x(0, UINT64_C(0xAAAAAAAA55555555));
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0x1234567855555555));
+}
+
+TEST_F(ExecTest, BfiWrappedRangeAtAnyLsb) {
+  program({0xb3783c02U}); /* bfi x2,x0,#8,#16 -> BFM #56,#15: field [23:8] */
+  set_x(0, UINT64_C(0xDEADBEEF12345678));
+  set_x(2, UINT64_C(0x1111111122222222));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x1111111122567822));
+  program({0xb37ff802U}); /* bfi x2,x0,#1,#63 -> BFM #63,#62: only bit 0 keeps */
+  set_x(0, UINT64_C(0xDEADBEEF12345678));
+  set_x(2, UINT64_C(0x1111111122222222));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0xBD5B7DDE2468ACF0));
+  program({0xb3709c02U}); /* bfi x2,x0,#16,#40 -> BFM #48,#39: field [55:16],
+                           * so the top byte stays the destination's own -- the
+                           * field is clipped at the register, not at len. */
+  set_x(0, UINT64_C(0xDEADBEEF12345678));
+  set_x(2, UINT64_C(0x1111111122222222));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x11EF123456782222));
+  program({0x33101c02U}); /* bfi w2,w0,#16,#8 -> BFM #16,#7, 32-bit width */
+  set_x(0, UINT64_C(0x00000000AABBCCDD));
+  set_x(2, UINT64_C(0x11111111));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x0000000011DD1111));
 }
 
 TEST_F(ExecTest, ExtrConcatenatesThenRotates) {
