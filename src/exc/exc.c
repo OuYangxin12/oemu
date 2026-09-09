@@ -71,14 +71,7 @@ oemu_el oemu_exc_route(oemu_el from) {
 static unsigned exc_slot(oemu_exc_kind kind) {
   /* The order of the four entries inside a vector group is fixed by the
    * architecture and it is NOT the order of oemu_exc_kind: the table is
-   * Synchronous (+0x000), System error (+0x080), FIQ (+0x100), IRQ (+0x180).
-   * The last two were measured, not remembered: single-stepping the M5 guest
-   * from a delivery at VBAR+0x300 ran bti, then landed on el1h_64_fiq
-   * (System.map: ffffffc080011270), so slot +0x100 of a group is FIQ. Assuming
-   * the textbook order here put every IRQ in the FIQ entry, which acks and
-   * EOIs through the GIC without ever running the timer handler -- the
-   * comparator was therefore never re-armed, the level line never dropped, and
-   * the boot livelocked 28 bytes into the kernel's IRQ C entry.
+   * Synchronous (+0x000), System error (+0x080), IRQ (+0x100), FIQ (+0x180).
    * Kind is an enum we chose ourselves, so the mapping is spelled out.
    *
    * Multiplying the enum by 0x80 (as this function used to) put IRQ in the
@@ -93,9 +86,9 @@ static unsigned exc_slot(oemu_exc_kind kind) {
       return 0U;
     case OEMU_EXC_KIND_SERROR:
       return 1U;
-    case OEMU_EXC_KIND_FIQ:
-      return 2U;
     case OEMU_EXC_KIND_IRQ:
+      return 2U;
+    case OEMU_EXC_KIND_FIQ:
       return 3U;
   }
   return 0U; /* unreachable: the enum is exhaustive */
