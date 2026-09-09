@@ -1261,8 +1261,11 @@ TEST_F(ExecTest, MemcpyOverlapDecisionIsAnUnsignedCompare) {
     uint64_t lo;
     uint64_t hs;
   } cases[] = {
-      {16U, 32U, 1U, 0U}, {32U, 16U, 0U, 1U}, {0U, 0U, 0U, 1U},
-      {UINT64_MAX, 16U, 0U, 1U}, {UINT64_C(0x8000000000000000), 1U, 0U, 1U},
+      {16U, 32U, 1U, 0U},
+      {32U, 16U, 0U, 1U},
+      {0U, 0U, 0U, 1U},
+      {UINT64_MAX, 16U, 0U, 1U},
+      {UINT64_C(0x8000000000000000), 1U, 0U, 1U},
       {UINT64_C(0x8000000000000000), UINT64_C(0x8000000000000001), 1U, 0U},
   };
   for (const auto &c : cases) {

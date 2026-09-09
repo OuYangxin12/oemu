@@ -179,7 +179,8 @@ TEST_F(SysregTest, SpselAndDaifRoundTrip) {
   EXPECT_EQ(1u, value);
 
   /* MRS/MSR DAIF use the PSTATE positions (bits [9:6]), like NZCV at [31:28]. */
-  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_DAIF, 0b1010U << OEMU_PSTATE_DAIF_SHIFT));
+  EXPECT_EQ(OEMU_OK,
+            oemu_sysreg_write(&sr_, OEMU_SYSREG_DAIF, 0b1010U << OEMU_PSTATE_DAIF_SHIFT));
   value = 0;
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_DAIF, &value));
   EXPECT_EQ(0b1010U << OEMU_PSTATE_DAIF_SHIFT, value);

@@ -3,16 +3,16 @@
  * oemu/sysreg.h for the state layout and the trap-vs-status contract.
  */
 #include "oemu/sysreg.h"
-#include "oemu/gtimer.h"
-#include <stdio.h>
-#include <stdlib.h>
 
 #include "oemu/check.h"
+#include "oemu/gtimer.h"
 #include "oemu/macros.h"
 #include "oemu/regs.h"
 #include "oemu/status.h"
 
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sysreg_internal.h"
