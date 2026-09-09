@@ -23,6 +23,130 @@
 
 #include "exec_internal.h"
 
+/* --- TEMPORARY: issue #28 hunt, env-gated bus tracer. REMOVE BEFORE MERGE ---
+ *
+ * OEMU_TRACE_FILE  path of the binary trace (records only while latched on)
+ * OEMU_TRACE_ENTER hex PC whose first execution latches tracing on
+ * OEMU_TRACE_EXIT  hex PC whose first execution (while on) latches tracing off
+ * OEMU_TRACE_HIT   hex PC reported to stderr on every execution
+ * OEMU_TRACE_VA    hex VA: watch this window from the first instruction (no PC latch)
+ * OEMU_TRACE_VA_SIZE  window size (default 0x1000)
+ * OEMU_TRACE_W     "w" restricts the watch to stores
+ * OEMU_TRACE_MAX   stop recording after this many records (default 400000)
+ *
+ * Record: count, pc, va, value, size, kind (kind 1 = load, 2 = store).
+ */
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+  uint64_t count;
+  uint64_t pc;
+  uint64_t va;
+  uint64_t value;
+  uint32_t size;
+  uint32_t kind;
+} oemu_tr_record;
+
+static struct {
+  FILE *file;
+  uint64_t count;
+  uint64_t enter_pc;
+  uint64_t exit_pc;
+  uint64_t hit_pc;
+  uint64_t va_lo;
+  uint64_t va_hi;
+  uint64_t max;
+  uint64_t entered;
+  bool stores_only;
+  bool watch_reported;
+  bool on;
+  bool inited;
+} g_tr = {NULL, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, false, false, false, false};
+
+static void oemu_tr_init(void) {
+  const char *path = getenv("OEMU_TRACE_FILE");
+  const char *enter = getenv("OEMU_TRACE_ENTER");
+  const char *exitp = getenv("OEMU_TRACE_EXIT");
+  const char *hit = getenv("OEMU_TRACE_HIT");
+  if (enter != NULL) {
+    g_tr.enter_pc = strtoull(enter, NULL, 0);
+  }
+  if (exitp != NULL) {
+    g_tr.exit_pc = strtoull(exitp, NULL, 0);
+  }
+  if (hit != NULL) {
+    g_tr.hit_pc = strtoull(hit, NULL, 0);
+  }
+  {
+    const char *va = getenv("OEMU_TRACE_VA");
+    const char *vasize = getenv("OEMU_TRACE_VA_SIZE");
+    const char *wonly = getenv("OEMU_TRACE_W");
+    const char *max = getenv("OEMU_TRACE_MAX");
+    if (va != NULL) {
+      g_tr.va_lo = strtoull(va, NULL, 0);
+      g_tr.va_hi =
+          g_tr.va_lo + ((vasize != NULL) ? strtoull(vasize, NULL, 0) : 0x1000ULL);
+      g_tr.on = true; /* a VA watch is armed from the very first instruction */
+    }
+    if ((wonly != NULL) && (wonly[0] == 'w')) {
+      g_tr.stores_only = true;
+    }
+    g_tr.max = (max != NULL) ? strtoull(max, NULL, 0) : 400000ULL;
+  }
+  if (path != NULL) {
+    g_tr.file = fopen(path, "wb");
+    if (g_tr.file == NULL) {
+      perror("g_tr: OEMU_TRACE_FILE");
+    }
+  }
+}
+
+static void oemu_tr_step(uint64_t pc) {
+  if (!g_tr.inited) {
+    g_tr.inited = true;
+    oemu_tr_init();
+  }
+  g_tr.count++;
+  if ((g_tr.hit_pc != 0U) && (pc == g_tr.hit_pc)) {
+    fprintf(stderr, "[tr] hit pc=0x%llx count=%llu\n", (unsigned long long)pc,
+            (unsigned long long)g_tr.count);
+  }
+  if (!g_tr.on && (g_tr.enter_pc != 0U) && (pc == g_tr.enter_pc)) {
+    g_tr.on = true;
+    fprintf(stderr, "[tr] ON count=%llu\n", (unsigned long long)g_tr.count);
+    return;
+  }
+  if (g_tr.on && (g_tr.exit_pc != 0U) && (pc == g_tr.exit_pc)) {
+    g_tr.on = false;
+    fprintf(stderr, "[tr] OFF count=%llu\n", (unsigned long long)g_tr.count);
+    if (g_tr.file != NULL) {
+      fflush(g_tr.file);
+    }
+  }
+}
+
+static void oemu_tr_rec(uint32_t kind, uint64_t pc, uint64_t va, uint32_t size,
+                        uint64_t value) {
+  if (!g_tr.on || (g_tr.file == NULL)) {
+    return;
+  }
+  if ((g_tr.va_lo != 0ULL) && ((va < g_tr.va_lo) || (va >= g_tr.va_hi))) {
+    return; /* VA watch: only the window, whoever touches it */
+  }
+  if (g_tr.stores_only && (kind != 2U)) {
+    return;
+  }
+  if (g_tr.entered >= g_tr.max) {
+    return;
+  }
+  g_tr.entered++;
+  const oemu_tr_record r = {g_tr.count, pc, va, value, size, kind};
+  (void)fwrite(&r, sizeof r, 1U, g_tr.file);
+}
+
+/* --- end temporary tracer ------------------------------------------------------- */
+
 /* --- sysreg encoding constants ----------------------------------------------- */
 
 /*
@@ -472,10 +596,14 @@ static oemu_status do_pair(oemu_cpu *cpu, const oemu_memops *mem, const oemu_ins
     v2 = read_g(cpu, in->rt2, false, in->width);
     access_or_panic(mem->write(mem->ctx, addr, in->mem_size, v1));
     access_or_panic(mem->write(mem->ctx, addr2, in->mem_size, v2));
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr, 1U << (unsigned)in->mem_size, v1);
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr2, 1U << (unsigned)in->mem_size, v2);
     note_store(cpu, addr, transfer * 2U);
   } else {
     access_or_panic(mem->read(mem->ctx, addr, in->mem_size, in->is_signed_load, &v1));
     access_or_panic(mem->read(mem->ctx, addr2, in->mem_size, in->is_signed_load, &v2));
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr, 1U << (unsigned)in->mem_size, v1);
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr2, 1U << (unsigned)in->mem_size, v2);
     write_g(cpu, in->rd, false, in->width, v1);
     write_g(cpu, in->rt2, false, in->width, v2);
   }
@@ -526,10 +654,18 @@ static oemu_status do_pair_vector(oemu_cpu *cpu, const oemu_memops *mem, const o
       if (pieces == 2U) {
         access_or_panic(mem->write(mem->ctx, a + 8U, OEMU_MEM_DWORD, hi));
       }
+      oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), a, (uint32_t)bytes, lo);
+      if (pieces == 2U) {
+        oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), a + 8U, 8U, hi);
+      }
     } else {
       access_or_panic(mem->read(mem->ctx, a, piece, false, &lo));
       if (pieces == 2U) {
         access_or_panic(mem->read(mem->ctx, a + 8U, OEMU_MEM_DWORD, false, &hi));
+      }
+      oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), a, (uint32_t)bytes, lo);
+      if (pieces == 2U) {
+        oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), a + 8U, 8U, hi);
       }
       cpu->v[reg][0] = lo; /* a sub-128-bit transfer zeroes the rest */
       cpu->v[reg][1] = hi;
@@ -569,9 +705,11 @@ static oemu_status do_single_mem(oemu_cpu *cpu, const oemu_memops *mem, const oe
   if (is_store) {
     value = read_g(cpu, in->rd, false, in->width);
     access_or_panic(mem->write(mem->ctx, addr, size, value));
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr, (uint32_t)nbytes, value);
     note_store(cpu, addr, nbytes);
   } else {
     access_or_panic(mem->read(mem->ctx, addr, size, in->is_signed_load, &value));
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr, (uint32_t)nbytes, value);
     write_g(cpu, in->rd, false, in->width, value);
   }
   if (has_writeback) {
@@ -594,6 +732,7 @@ static oemu_status do_exclusive(oemu_cpu *cpu, const oemu_memops *mem, const oem
   if (is_load) {
     uint64_t value = 0U;
     access_or_panic(mem->read(mem->ctx, addr, in->mem_size, false, &value));
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr, (uint32_t)nbytes, value);
     write_g(cpu, in->rd, false, in->width, value);
     cpu->monitor_addr = addr;
     cpu->monitor_size = nbytes;
@@ -609,6 +748,7 @@ static oemu_status do_exclusive(oemu_cpu *cpu, const oemu_memops *mem, const oem
   if (success) {
     const uint64_t value = read_g(cpu, in->rd, false, in->width);
     access_or_panic(mem->write(mem->ctx, addr, in->mem_size, value));
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr, (uint32_t)nbytes, value);
   }
   write_g(cpu, in->rm, false, OEMU_REG_W32, success ? UINT64_C(0) : UINT64_C(1));
   return OEMU_OK;
@@ -992,6 +1132,7 @@ static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *me
     /* Validated above; a validated access cannot fail (no provider re-shapes
      * between calls), so a refusal here is a bug, not a guest event. */
     access_or_panic(mem->write(mem->ctx, line + off, OEMU_MEM_DWORD, 0U));
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), line + (uint64_t)off, 8U, 0U);
   }
   return OEMU_OK;
 }
@@ -1132,6 +1273,7 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       (mem->validate == NULL)) {
     return OEMU_ERR_INVALID_ARG;
   }
+  oemu_tr_step(oemu_regs_pc(&cpu->regs)); /* TEMP issue #28 tracer */
 
   oemu_status st = OEMU_OK;
   bool take_branch = false;
