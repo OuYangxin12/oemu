@@ -25,6 +25,9 @@ OEMU_BEGIN_DECLS
 /* CNTP_CTL / CNTV_CTL bit positions (ARMv8.4, same layout for both). */
 #define OEMU_GTIMER_CTL_ENABLE 0x1U
 #define OEMU_GTIMER_CTL_IMASK  0x2U
+/* Read-only: set while the timer condition holds and the interrupt is not
+ * masked. Linux's arch timer handler gates its re-arm on this bit. */
+#define OEMU_GTIMER_CTL_ISTAT  0x4U
 
 /*
  * Does a timer output assert, given the counter it compares against, its

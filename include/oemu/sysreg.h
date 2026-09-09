@@ -198,6 +198,7 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
  * the selector mask discards), so CNTV_CTL_EL0 / CNTV_CVAL_EL0 are the names
  * that appear in the guest; the counter it reads is CNTVCT_EL0 (0x1f02). */
 #define OEMU_SYSREG_CNTV_CVAL_EL0 ((uint32_t)0x1f1a)
+#define OEMU_SYSREG_CNTV_TVAL_EL0 ((uint32_t)0x1f1b)
 #define OEMU_SYSREG_CNTV_CTL_EL0  ((uint32_t)0x1f19)
 /* Default generic-timer counter frequency: the Arm default the QEMU virt
  * machine and this DT both present, so the guest's clock source and oemu's

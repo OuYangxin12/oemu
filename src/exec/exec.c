@@ -902,8 +902,10 @@ static oemu_status do_msr_immediate(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_
       if (oemu_sysreg_read(sr, OEMU_SYSREG_DAIF, &daif) != OEMU_OK) {
         return OEMU_ERR_FAULT;
       }
-      const uint64_t next =
-          (op2 == MSR_IMM_DAIFSET) ? (daif | (uint64_t)imm) : (daif & (uint64_t)(~imm & 0xfU));
+      /* The immediate forms carry a compact 4-bit field (D=bit3 .. F=bit0)
+       * while the DAIF register itself uses the PSTATE positions, so shift. */
+      const uint64_t mask = ((uint64_t)imm & 0xfU) << OEMU_PSTATE_DAIF_SHIFT;
+      const uint64_t next = (op2 == MSR_IMM_DAIFSET) ? (daif | mask) : (daif & ~mask);
       st = oemu_sysreg_write(sr, OEMU_SYSREG_DAIF, next);
       break;
     }

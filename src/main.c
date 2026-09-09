@@ -149,6 +149,13 @@
  * latency bound between machine-event polls; 1M keeps a stuck guest inside
  * the 60 s test budget while keeping syscall-free slices cheap. */
 #define BOOT_QUANTUM UINT64_C(1000000)
+/* How often the level-driven interrupt inputs are re-sampled. The pins are the
+ * GIC's word, and the GIC only knows what main.c last pushed into it, so the
+ * sampling period is the staleness of every level line: a comparator the guest
+ * has re-armed into the future keeps its PPI pending until the next sample, and
+ * the guest re-enters the handler every time it unmasks. At the boot slice of
+ * 1e6 that nesting ran the stack down into the page tables. */
+#define BOOT_LEVEL_QUANTUM UINT64_C(64)
 
 /* Round `v` up to a multiple of the power-of-two `align`. */
 static uint64_t align_up(uint64_t v, uint64_t align) {
@@ -557,13 +564,60 @@ static void boot_console_warn(const oemu_pl011 *uart) {
   }
 }
 
+/* Sample every level-driven interrupt input and hand the GIC's verdict to the
+ * vCPU. Called between sub-slices, because the pending bits are only as fresh
+ * as the last call: a PPI whose comparator the guest has already re-armed must
+ * stop being pending before the guest unmasks again, or it re-enters the
+ * handler and walks the stack down. */
+static void boot_refresh_levels(oemu_vcpu *vcpu, oemu_gicv2 *gic, oemu_pl011 *uart) {
+  /* The PL011 is a level source on GIC SPI 33 (the DT's /interrupts). Refresh
+   * the distributor's pending bit from the UART's live level each slice, so a
+   * received byte reaches the driver as interrupt 33 -- not a flat pin whose
+   * GICC_IAR the driver would read back as spurious. The vCPU's IRQ is then
+   * the GIC's word alone. */
+  oemu_gicv2_set_pending(gic, BOOT_UART_SPI, oemu_pl011_irq_level(uart) != 0);
+  /* The generic timer's clockevent comparator is level-high once the counter
+   * passes it, so refresh the DT-declared PPIs from the live comparator each
+   * slice. Without this the counter moves but jiffies never tick and an idle
+   * guest soft-locks waiting for a timer IRQ that never arrives. */
+  const oemu_sysregs *sr = &vcpu->sysregs;
+  /* /timer's interrupts are <1,13>,<1,14>,<1,11>,<1,10> = PPIs 29, 30, 27, 26,
+   * and the generic arch timer picks its event PPI from that order: a guest
+   * that came up at EL2 (which is what our firmware hands over) programs the
+   * *virtual* comparator and takes PPI 26, while a guest that believes it owns
+   * the physical timer programs CNTP_* and takes PPI 30. Both banks therefore
+   * drive their own PPI -- conflating them is what kept this guest tickless:
+   * the virtual comparator was wired to 30, whose handler is the physical
+   * timer's, so the counter ran, no handler ever ran, jiffies froze at 2, no
+   * async probe ran, /dev/console never opened, and pid 1 spun in a write()
+   * retry loop forever. */
+  oemu_gicv2_set_pending(gic, BOOT_TIMER_VIRT_PPI,
+               oemu_gtimer_pending(sr->cntvct - sr->cntvoff_el1, sr->cntv_ctl_el1,
+                         sr->cntv_cval_el1) != 0);
+  oemu_gicv2_set_pending(
+    gic, BOOT_TIMER_PHYS_PPI,
+    oemu_gtimer_pending(sr->cntvct, sr->cntp_ctl_el1, sr->cntp_cval_el1) != 0);
+  oemu_vcpu_set_irq(vcpu, oemu_gicv2_irq_level(gic) != 0);
+}
+
 static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oemu_gicv2 *gic,
                     bool pump_stdin, uint64_t max_insns) {
   uint64_t budget = max_insns;
   for (;;) {
     const uint64_t slice = (budget < BOOT_QUANTUM) ? budget : BOOT_QUANTUM;
     uint64_t done = 0U;
-    const oemu_status st = oemu_vcpu_run(vcpu, slice, &done);
+    oemu_status st = OEMU_OK;
+    while ((done < slice) && ((st == OEMU_OK) || (st == OEMU_ERR_TIMEOUT))) {
+      const uint64_t remaining = slice - done;
+      const uint64_t chunk = (remaining < BOOT_LEVEL_QUANTUM) ? remaining : BOOT_LEVEL_QUANTUM;
+      uint64_t stepped = 0U;
+      st = oemu_vcpu_run(vcpu, chunk, &stepped);
+      done += stepped;
+      boot_refresh_levels(vcpu, gic, uart);
+      if (stepped == 0U) {
+        break; /* halted: the refresh above decides whether the next slice wakes it */
+      }
+    }
     budget -= done;
     (void)oemu_pl011_pump(uart); /* the console drains on every slice boundary */
     /* Interactive console: drain whatever the host typed into the UART RX ring.
@@ -577,34 +631,6 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
         }
       }
     }
-    /* The PL011 is a level source on GIC SPI 33 (the DT's /interrupts). Refresh
-     * the distributor's pending bit from the UART's live level each slice, so a
-     * received byte reaches the driver as interrupt 33 -- not a flat pin whose
-     * GICC_IAR the driver would read back as spurious. The vCPU's IRQ is then
-     * the GIC's word alone. */
-    oemu_gicv2_set_pending(gic, BOOT_UART_SPI, oemu_pl011_irq_level(uart) != 0);
-    /* The generic timer's clockevent comparator is level-high once the counter
-     * passes it, so refresh the DT-declared PPIs from the live comparator each
-     * slice. Without this the counter moves but jiffies never tick and an idle
-     * guest soft-locks waiting for a timer IRQ that never arrives. */
-    const oemu_sysregs *sr = &vcpu->sysregs;
-    /* /timer's interrupts are <1,13>,<1,14>,<1,11>,<1,10> = PPIs 29, 30, 27, 26,
-     * and the generic arch timer picks its event PPI from that order: a guest
-     * that came up at EL2 (which is what our firmware hands over) programs the
-     * *virtual* comparator and takes PPI 26, while a guest that believes it owns
-     * the physical timer programs CNTP_* and takes PPI 30. Both banks therefore
-     * drive their own PPI -- conflating them is what kept this guest tickless:
-     * the virtual comparator was wired to 30, whose handler is the physical
-     * timer's, so the counter ran, no handler ever ran, jiffies froze at 2, no
-     * async probe ran, /dev/console never opened, and pid 1 spun in a write()
-     * retry loop forever. */
-    oemu_gicv2_set_pending(gic, BOOT_TIMER_VIRT_PPI,
-                           oemu_gtimer_pending(sr->cntvct - sr->cntvoff_el1, sr->cntv_ctl_el1,
-                                               sr->cntv_cval_el1) != 0);
-    oemu_gicv2_set_pending(
-        gic, BOOT_TIMER_PHYS_PPI,
-        oemu_gtimer_pending(sr->cntvct, sr->cntp_ctl_el1, sr->cntp_cval_el1) != 0);
-    oemu_vcpu_set_irq(vcpu, oemu_gicv2_irq_level(gic) != 0);
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
       boot_console_warn(uart);

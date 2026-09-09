@@ -178,10 +178,11 @@ TEST_F(SysregTest, SpselAndDaifRoundTrip) {
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_SPSEL, &value));
   EXPECT_EQ(1u, value);
 
-  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_DAIF, 0b1010));
+  /* MRS/MSR DAIF use the PSTATE positions (bits [9:6]), like NZCV at [31:28]. */
+  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_DAIF, 0b1010U << OEMU_PSTATE_DAIF_SHIFT));
   value = 0;
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_DAIF, &value));
-  EXPECT_EQ(0b1010u, value);
+  EXPECT_EQ(0b1010U << OEMU_PSTATE_DAIF_SHIFT, value);
 
   // Junk above the 4-bit field must not leak into neighbouring PSTATE bits:
   // mark IL/SS first, then a max-width DAIF write, then verify both survive.
@@ -190,7 +191,55 @@ TEST_F(SysregTest, SpselAndDaifRoundTrip) {
   EXPECT_EQ(OEMU_PSTATE_IL | OEMU_PSTATE_SS, sr_.pstate & (OEMU_PSTATE_IL | OEMU_PSTATE_SS))
       << "DAIF write clobbered IL/SS";
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_DAIF, &value));
-  EXPECT_EQ(0xFu, value);
+  EXPECT_EQ(OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT, value);
+}
+
+TEST_F(SysregTest, MsrDaifRegisterFormMasksTheInterruptItNames) {
+  /* The value the guest hands MSR DAIF, Xt is the mask at the PSTATE positions;
+   * Linux's IRQ entry writes 0xc0 (I|F) there. */
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_DAIF, 0xC0U));
+  EXPECT_EQ(0xC0U, sr_.pstate & 0xC0U) << "I and F must be masked";
+  EXPECT_EQ(0U, sr_.pstate & (0xCU << OEMU_PSTATE_DAIF_SHIFT)) << "D and A must be clear";
+  EXPECT_EQ(3U, oemu_pstate_daif(sr_.pstate));
+  uint64_t value = 0;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_DAIF, &value));
+  EXPECT_EQ(0xC0U, value);
+}
+
+TEST_F(SysregTest, TimerControlReportsIstatFromTheLiveComparator) {
+  /* CNTV_CTL bit 2 is read-only ISTAT: set while the timer is enabled, unmasked
+   * and expired. Linux's arch timer handler gates its re-arm on this bit, so a
+   * hardwired zero made it answer IRQ_NONE forever and the PPI stayed pending. */
+  sr_.cntvct = 1000U;
+  sr_.cntvoff_el1 = 0U;
+  sr_.cntv_cval_el1 = 2000U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, 0x1U));
+  uint64_t value = 0;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, &value));
+  EXPECT_EQ(0x1U, value) << "not expired yet: ISTAT clear";
+  sr_.cntvct = 2000U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, &value));
+  EXPECT_EQ(0x5U, value) << "expired: ISTAT set (bit 2)";
+  /* ISTAT is read-only: writing it back must not stick, and masking the
+   * interrupt clears the reported status without touching the enable bit. */
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, 0x7U));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, &value));
+  EXPECT_EQ(0x3U, value) << "enable+imask stored; ISTAT recomputed to 0";
+}
+
+TEST_F(SysregTest, TimerTvalIsADeltaOnTheLiveCounter) {
+  /* Linux's clockevent reprograms the timer through TVAL on every tick; the
+   * hardware turns the delta into an absolute comparator against the counter. */
+  sr_.cntvct = 5000U;
+  sr_.cntvoff_el1 = 1000U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_CNTV_TVAL_EL0, 250U));
+  EXPECT_EQ(4250U, sr_.cntv_cval_el1) << "cval = (cntvct - cntvoff) + tval";
+  uint64_t value = 0;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_CNTV_TVAL_EL0, &value));
+  EXPECT_EQ(250U, value);
+  sr_.cntvct = 4000U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_CNTP_TVAL_EL1, 100U));
+  EXPECT_EQ(4100U, sr_.cntp_cval_el1) << "the physical bank has no virtual offset";
 }
 
 TEST_F(SysregTest, CurrentElReportsTheBootLevel) {

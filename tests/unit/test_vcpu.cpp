@@ -35,7 +35,10 @@ constexpr uint32_t kSev = 0xD503209FU;         // sev
 constexpr uint32_t kYield = 0xD503203FU;       // yield (advances harmlessly)
 constexpr uint32_t kDcZvaX0 = 0xD50B7420U;     // dc    zva, x0
 constexpr uint32_t kStrX0X1 = 0xF9000020U;     // str   x0, [x1]
-constexpr uint32_t kLdrX2X3 = 0xF9400062U;     // ldr   x2, [x3]
+constexpr uint32_t kLdrX2X3 = 0xF9400062U;
+constexpr uint32_t kMsrDaifX2 = 0xD51B4222U;     // msr   daif, x2 (Linux IRQ entry)
+constexpr uint32_t kMsrDaifSet2 = 0xD50342DFU;   // msr   daifset, #0x2
+constexpr uint32_t kMsrDaifClr2 = 0xD50342FFU;   // msr   daifclr, #0x2     // ldr   x2, [x3]
 
 constexpr uint64_t kIlBit = UINT64_C(1) << 25;
 constexpr uint32_t EcBase(oemu_exc_ec ec) {
@@ -523,6 +526,34 @@ TEST_F(VcpuTest, PendingButMaskedInterruptStillWakesWfi) {
    * guest's own `msr daif`. */
   EXPECT_EQ(step(), OEMU_OK);
   EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText + OEMU_INSN_SIZE);
+}
+
+/* Linux's el1_interrupt opens with `mov x2, #0xc0; msr daif, x2` so the IRQ
+ * handler runs with IRQ and FIQ masked. 0xc0 is I|F where those bits sit in
+ * PSTATE (bits [9:6]), the way MRS Xt, NZCV uses [31:28]. Treating the operand
+ * as a compact 4-bit field reads 0xc0 as 0, which unmasks the interrupt the
+ * guest just masked: the handler is re-entered at the very next instruction
+ * (el1_interrupt+0x1c), the stack descends 0x170 per entry, and the boot dies
+ * inside its own entry path. */
+TEST_F(VcpuTest, MsrDaifRegisterFormMasksWherePstateKeepsTheField) {
+  program({kMsrDaifX2});
+  oemu_regs_write(&vcpu_.cpu.regs, 2U, OEMU_REG_W64, 0xC0U);
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(0xC0U, vcpu_.sysregs.pstate & 0xC0U) << "I and F must stay masked";
+  oemu_vcpu_set_irq(&vcpu_, true);
+  EXPECT_FALSE(oemu_vcpu_take_pending(&vcpu_)) << "a masked guest must not be interrupted";
+}
+
+/* The immediate forms are the other convention on purpose: their imm4 is the
+ * compact field (D=bit3 .. F=bit0), so daifset #2 sets I. */
+TEST_F(VcpuTest, DaifSetAndClrUseTheCompactImmediateField) {
+  program({kMsrDaifClr2, kMsrDaifSet2});
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(0U, vcpu_.sysregs.pstate & 0x80U) << "daifclr #2 clears I";
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(0x80U, vcpu_.sysregs.pstate & 0x80U) << "daifset #2 sets I";
+  oemu_vcpu_set_irq(&vcpu_, true);
+  EXPECT_FALSE(oemu_vcpu_take_pending(&vcpu_));
 }
 
 TEST_F(VcpuTest, DeliveryChargesTheQuantum) {
