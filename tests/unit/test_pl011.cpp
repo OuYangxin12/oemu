@@ -304,4 +304,27 @@ TEST_F(Pl011, SinklessPumpStillDrainsAndCounts) {
   EXPECT_TRUE(g_sink.empty());
 }
 
+TEST_F(Pl011, TxDroppedCountsExactlyTheBytesLostToAFullRing) {
+  /* TX must never block the vCPU, so a byte arriving at a full ring drops the
+   * oldest and the loss is counted rather than hidden. The counter is the only
+   * way a caller can tell a short log from a quiet guest -- scripts/boot-linux-gate.sh
+   * refuses a run that reports any loss, so the meaning of the number has to be
+   * pinned: exactly one per dropped byte, and none at all while the ring drains. */
+  wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_FEN);
+  for (unsigned i = 0U; i < OEMU_PL011_TX_RING + 2U; ++i) {
+    wr(PL011_REG_DR, static_cast<unsigned char>('a' + (i % 26U)));
+  }
+  EXPECT_EQ(2U, oemu_pl011_tx_dropped(&uart_));
+  EXPECT_EQ(OEMU_PL011_TX_RING, uart_.tx_count);
+}
+
+TEST_F(Pl011, TxDroppedStaysZeroWhileSomebodyPumps) {
+  wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_FEN);
+  for (unsigned i = 0U; i < OEMU_PL011_TX_RING * 3U; ++i) {
+    wr(PL011_REG_DR, static_cast<unsigned char>('a' + (i % 26U)));
+    (void)oemu_pl011_pump(&uart_);
+  }
+  EXPECT_EQ(0U, oemu_pl011_tx_dropped(&uart_));
+}
+
 }  // namespace

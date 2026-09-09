@@ -231,6 +231,11 @@ static oemu_status pl011_write(void *ctx, uint64_t offset, oemu_mem_size size, u
 
 /* --- public service -------------------------------------------------------- */
 
+uint64_t oemu_pl011_tx_dropped(const oemu_pl011 *uart) {
+  OEMU_REQUIRE(uart != NULL, "NULL oemu_pl011 in oemu_pl011_tx_dropped");
+  return uart->tx_dropped;
+}
+
 size_t oemu_pl011_pump(oemu_pl011 *uart) {
   OEMU_REQUIRE(uart != NULL, "NULL oemu_pl011");
   size_t emitted = 0U;

@@ -84,6 +84,12 @@ void oemu_pl011_init(oemu_pl011 *uart, oemu_pl011_sink sink, void *sink_user);
  * of bytes emitted. */
 size_t oemu_pl011_pump(oemu_pl011 *uart);
 
+/* Bytes lost to a full TX ring since init. A console sink that greps the log
+ * for markers must ask this before concluding the guest never printed them:
+ * TX never blocks the vCPU, so a byte that finds the ring full is dropped, and
+ * the drop is counted rather than hidden. */
+uint64_t oemu_pl011_tx_dropped(const oemu_pl011 *uart);
+
 /*
  * Deliver one host-side byte to the RX ring. OEMU_ERR_STATE when the
  * receiver is disabled (UARTEN or RXE clear), OEMU_ERR_FULL when the ring

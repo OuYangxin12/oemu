@@ -28,6 +28,7 @@
 # Exit codes (same shape as qemu-oracle.sh, so CI can treat them alike):
 #   0  every marker seen and the exit contract held
 #   1  a marker is missing or the exit code mismatched (log kept, path printed)
+#   2  our own console dropped bytes: the log is truncated, so no marker verdict is valid
 #   2  usage error / missing inputs
 #   3  skipped: the guest is known-blocked and --allow-blocked was given
 set -u
@@ -92,6 +93,7 @@ fi
 
 workdir=$(mktemp -d) || die "mktemp -d failed"
 [ -n "$log" ] || log=$workdir/serial.log
+errlog=$workdir/model.err
 fifo=$workdir/stdin.fifo
 mkfifo "$fifo"
 
@@ -117,16 +119,26 @@ run_with_stdin() {
       sleep 5
       printf 'poweroff -f\n'
     ) > "$fifo" &
-    timeout "$timeout_sec" "$bin" "${args[@]}" -serial stdio < "$fifo" > "$log" 2>&1
+    timeout "$timeout_sec" "$bin" "${args[@]}" -serial stdio < "$fifo" > "$log" 2> "$errlog"
   else
     : > "$fifo" &
-    timeout "$timeout_sec" "$bin" "${args[@]}" -serial file:"$log" >/dev/null 2>&1
+    timeout "$timeout_sec" "$bin" "${args[@]}" -serial file:"$log" >/dev/null 2> "$errlog"
   fi
 }
 
 echo "boot-linux-gate: $bin (${mib} MiB, -smp $smp, markers: ${markers[*]})"
 run_with_stdin
 rc=$?
+
+# A dropped byte means our own console lost output, so the log can no longer be
+# read as evidence about the guest: refusing here is what keeps a truncated log
+# from ever being reported as "the guest never printed the marker".
+if [ -f "$errlog" ] && grep -q 'console dropped' "$errlog"; then
+  echo "boot-linux-gate: CONSOLE LOSS: $(grep -m1 'console dropped' "$errlog")" >&2
+  echo "boot-linux-gate: the captured log is truncated, so a missing marker proves nothing" >&2
+  echo "boot-linux-gate: log kept at $log (model stderr at $errlog)" >&2
+  exit 2
+fi
 
 failed=0
 for m in "${markers[@]}"; do

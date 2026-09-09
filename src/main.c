@@ -546,6 +546,17 @@ static void boot_hang_report(const oemu_vcpu *vcpu, const char *why, uint64_t in
                 esr, far, elr, spsr);
 }
 
+/* One line to stderr if the console dropped anything: a boot gate decides on
+ * the log it captured, and a truncated log must never be read as "the guest
+ * never printed it". */
+static void boot_console_warn(const oemu_pl011 *uart) {
+  const uint64_t lost = oemu_pl011_tx_dropped(uart);
+  if (lost != 0U) {
+    (void)fprintf(stderr, "oemu: console dropped %" PRIu64 " TX bytes (log is truncated)\n",
+                  lost);
+  }
+}
+
 static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oemu_gicv2 *gic,
                     bool pump_stdin, uint64_t max_insns) {
   uint64_t budget = max_insns;
@@ -596,6 +607,7 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
     oemu_vcpu_set_irq(vcpu, oemu_gicv2_irq_level(gic) != 0);
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
+      boot_console_warn(uart);
       return machine->exit_code & 0xFF; /* the code travels as a shell sees it */
     }
     if (ev == OEMU_MACHINE_EVENT_RESET) {
@@ -614,6 +626,7 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
     }
     if (budget == 0U) {
       boot_hang_report(vcpu, "timeout", max_insns);
+      boot_console_warn(uart);
       return EXIT_TIMEOUT;
     }
     oemu_vcpu_rearm(vcpu);
