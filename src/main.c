@@ -119,12 +119,23 @@
 #define BOOT_GIC_LINES     64U /* two groups: NR_IRQS 64, as the oracle */
 /* The PL011's single line: /interrupts = <0 1 4> -> SPI, offset 1 -> id 33. */
 #define BOOT_UART_SPI 33U
-/* The generic timer's PPIs, from the DT's /timer interrupts in binding order
- * [NS-phys, NS-virt, ...]: <1 13> -> 16+13 = 29, <1 14> -> 16+14 = 30. The
- * clockevent uses one; both are driven level-wise and the unregistered line
- * stays quiet because the distributor never enables it. */
-#define BOOT_TIMER_PHYS_PPI 29U
-#define BOOT_TIMER_VIRT_PPI 30U
+/* The generic timer's PPIs, read off the DT's /timer interrupts in binding
+ * order <1,13> <1,14> <1,11> <1,10>, which the arm,armv8-timer binding reads as
+ * [secure phys, non-secure phys, virtual, hyp] = [29, 30, 27, 26]. Those ids are
+ * the architecture's, not a choice: PPI 26 is the EL2 physical timer, 27 the
+ * non-secure EL1 *virtual* one, 30 the non-secure physical, 29 the secure. Our
+ * guest therefore clocks itself on the virtual comparator -- it writes
+ * CNTV_CTL/CNTV_CVAL and unmasks INTID 27, both measured off QEMU-booted guest
+ * behaviour -- and the earlier wiring here (virtual comparator on 26, the hyp
+ * timer's line) meant its comparator expired against a line the guest never
+ * enabled: no tick, jiffies frozen, the async device probe never ran,
+ * /dev/console never opened, and pid 1 spun in a write() retry loop forever.
+ * So: virtual comparator -> 27, non-secure physical comparator -> 30. The 29
+ * (secure) and 26 (EL2 physical) lines stay undriven because oemu models
+ * neither a secure world nor an EL2 timer, and the distributor keeps a line the
+ * guest never enabled quiet anyway. */
+#define BOOT_TIMER_PHYS_PPI 30U
+#define BOOT_TIMER_VIRT_PPI 27U
 #define BOOT_DTB_MAX        ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
 #define BOOT_CMDLINE_MAX    (256U)           /* writable boot line width */
 #define BOOT_BOOTLINE_LEN   (257U)           /* the fixture property: pad + NUL */
@@ -566,9 +577,22 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
      * slice. Without this the counter moves but jiffies never tick and an idle
      * guest soft-locks waiting for a timer IRQ that never arrives. */
     const oemu_sysregs *sr = &vcpu->sysregs;
+    /* /timer's interrupts are <1,13>,<1,14>,<1,11>,<1,10> = PPIs 29, 30, 27, 26,
+     * and the generic arch timer picks its event PPI from that order: a guest
+     * that came up at EL2 (which is what our firmware hands over) programs the
+     * *virtual* comparator and takes PPI 26, while a guest that believes it owns
+     * the physical timer programs CNTP_* and takes PPI 30. Both banks therefore
+     * drive their own PPI -- conflating them is what kept this guest tickless:
+     * the virtual comparator was wired to 30, whose handler is the physical
+     * timer's, so the counter ran, no handler ever ran, jiffies froze at 2, no
+     * async probe ran, /dev/console never opened, and pid 1 spun in a write()
+     * retry loop forever. */
     oemu_gicv2_set_pending(gic, BOOT_TIMER_VIRT_PPI,
                            oemu_gtimer_pending(sr->cntvct - sr->cntvoff_el1, sr->cntv_ctl_el1,
                                                sr->cntv_cval_el1) != 0);
+    oemu_gicv2_set_pending(
+        gic, BOOT_TIMER_PHYS_PPI,
+        oemu_gtimer_pending(sr->cntvct, sr->cntp_ctl_el1, sr->cntp_cval_el1) != 0);
     oemu_vcpu_set_irq(vcpu, oemu_gicv2_irq_level(gic) != 0);
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
