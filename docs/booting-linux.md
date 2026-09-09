@@ -55,18 +55,31 @@ CPU: All CPU(s) started at EL1
 之后停住，`Run /init` 再也不出现，`BOOT OK` 因此拿不到。指令预算耗尽时模型报告
 
 ```
-PC=0xffffffc080010a04 EL=4 ESR_EL1=0x96000045 FAR_EL1=0xffffff761217b420 ELR_EL1=0xffffffc0800111a0 SPSR_EL1=0x1003c5
+[abrt1] esr=0x96000005 far=0xffffffc080226260 pc=0xffffffc0801a66c4 sp=0xffffff8000226fc0
+[del1..N] kind=1 daif=0 pc=0xffffffc0801a6484 (= el1_interrupt + 0x1c) ttbr1=0x4022e000
 ```
 
-即 guest 在自己的同步入口（`VBAR_EL1=0xffffffc080010800` 的 `+0x200`，`ELR_EL1` 即 `el1h_64_sync`）
-里，对 `0xffffff761217b420` 做一次**写**（`ISS` 的 WnR=1）时撞上 level-1 translation fault，
-异常因此层层嵌套。这条记录本身就是进度证据：修掉两处向量槽错序之前，它是
-`ESR=0x86000005`（同 EL 取指中止，`FAR=ELR=0xffffffc0800111a0`，即连向量存根都取不出来），
-`EC` 由 `0x20` 变 `0x25`、`FAR` 由向量页变成一个越界指针，说明中断已经能投到正确入口，剩下的
-是另一类缺陷——一个越界指针导致的嵌套数据中止（`VA_BITS=39` 下内核的三个映射窗口都不含
-`0xffffff76...`，所以那是我们交给 guest 的一个看似有效的坏值）。
+即 guest 在自己的 EL1h IRQ 入口存根里（`el1h_64_irq_handler + 0xc`，正在 `kernel_entry` 建栈帧）对
+`_text + 0x226260` 做一次**读**时撞上 level-1 translation fault；此后中断风暴恢复原状（投递点恒为
+`el1_interrupt + 0x1c`、每次 SP 递降 `0x170`，说明栈帧只推一半、处理器从未跑完，电平拉高的定时器线约
+40 条指令后再次被取）。决定性的一条是：**每次投递时 `TTBR1_EL1` 都是 `swapper_pg_dir`
+（`0x4022e000`），从第一次投递到第一万次都是**，而日志走到 `CPU: All CPU(s) started at EL1` 时
+Linux 的活页表必然是 `init_pg_dir`（`0x40341000`；`paging_init` 在 `setup_arch`，打印该行的 `smp_init`
+在晚得多的 `rest_init`）。这两条互斥，其一必被读错；且曾见过 `0x40341000` 被写入两次、其后又写入
+`reserved`/`swapper`，而 `TTBR0/TTBR1_EL1` 的表行是朴素的（`offset` + 全 `write_mask`，无 CCI 屏蔽），
+所以掩码类缺陷不成立。下一记判据：写 `TTBR1_EL1` 后立刻读回比对——若 `0x40341000` 的写读回不是它自己，
+就是一个可脱离 guest 单测的 sysreg 缺陷，并能一句话解释风暴。
 
-已经用实测排除的方向（不要再走一遍）：Image 装载地址与入口（与 booting.rst 和 oracle 逐字节一致）、
+注意本条曾被写错两次：一次记成 `ESR=0x86000005`（取指中止），一次记成 `ESR=0x96000045` 且 `FAR`
+越界——**后一条是我自己引入的向量回归（`296b7c7`、`042aec1`，已由 `5e901ec`、`cfa1de0` 撤销）造成的
+伪象**，不是 guest 的行为。教训是：改了异常投递的实现之后，旧二进制/旧签名都会把回归伪装成 guest 缺陷，
+所以重测前必须删掉 trace 二进制重建。
+
+已经用实测排除的方向（不要再走一遍）：镜像装载与入口、陈旧 TLB、`stp` 前索引缩放、`task_struct->stack`
+被写坏、`ICC_*` 系统寄存器、银行化 `SP_EL1` 陈旧、入口 DAIF 不生效（单测钉住）、**向投递屏蔽中的
+guest 投递**（前 400 次投递 DAIF 均可为 0，无一例在 I 置位时投递）、**WFI 唤醒打断上下文恢复**
+（`TTBR1` 恒为 swapper，非瞬时状态）、GIC ACTIVE 抑制、DT/GIC 探测失败、嵌套同步数据中止、
+向量槽次序（原实现 `kind << 7` 一直是对的，我错改两次并已撤销）、`TTBR0/1_EL1` 的 `write_mask`/CCI 屏蔽。原列出的：Image 装载地址与入口（与 booting.rst 和 oracle 逐字节一致）、
 页表索引与描述符解码（`swapper_pg_dir`/`init_pg_dir` 位置由 `nm` 定标）、TLBI 与 `TTBR` 写入的失效
 路径（我们是整体失效，保守正确）、`stp` 的偏移定标与写回、`SPSel`/DAIF 是否漏实现、以及
 **generic timer 计数速率**（每指令 1e6 个计数比对外宣告的 62.5 MHz 快 1600 万倍，已在 `606e245`
