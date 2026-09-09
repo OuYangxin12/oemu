@@ -351,7 +351,7 @@ TEST_F(ExcTest, TakingAnInterruptAtEl1hStoresTheFrameOnTheLiveStack) {
   oemu_regs_set_sp(&regs_, 0x41000000ULL);
   sr_.sp_el[OEMU_EL1] = 0x4ffffff0ULL;
   oemu_exc_take(&regs_, &sr_, OEMU_EXC_KIND_IRQ, OEMU_EL1, 0U, 0U, false);
-  EXPECT_EQ(0x8300U, regs_.pc);  // IRQ slot of the same-EL group, not System error
+  EXPECT_EQ(0x8280U, regs_.pc);  // IRQ slot of the EL1h group: base 0x200 + 0x80
   EXPECT_EQ(0x41000000ULL, oemu_regs_sp(&regs_));
   EXPECT_EQ(0x1000U, sr_.elr_el[OEMU_EL1]);
   // Crossing into another bank and back deposits the live value, so the slot is
