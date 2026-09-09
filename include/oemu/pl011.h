@@ -15,7 +15,7 @@
  * re-reads it. Deferring those bytes to a pump turned out to lie about TX
  * while the ring held them, and Linux's earlycon spun on that lie until its
  * panic printout was cut mid-word. Only FIFO mode (CR.FEN=1) queues, into
- * a 64-byte ring drained by oemu_pl011_pump (oldest dropped on overflow --
+ * a 64 KiB ring drained by oemu_pl011_pump (oldest dropped on overflow --
  * TX must never block the vCPU). RX arrives through
  * oemu_pl011_inject, which answers OEMU_ERR_FULL when the ring is full
  * and OEMU_ERR_STATE when the receiver is disabled: the caller owns the
@@ -36,11 +36,13 @@ OEMU_BEGIN_DECLS
 
 /* Ring depths: fixed, embedded. The RX ring matches the real FIFO. The TX
  * ring is deliberately deeper than the 32-entry hardware: the model drains
- * TX at run-loop slice boundaries, not at a baud rate, so a burst longer
- * than the slice would silently lose the oldest byte. A guest banner
- * ("PSCI-OK\nPSCI-SMC\n") is one such burst; 64 keeps every polled byte and
- * the drop path stays only as the last-resort overflow signal it is. */
-#define OEMU_PL011_TX_RING 64U
+ * TX at run-loop slice boundaries (BOOT_QUANTUM = 1e6 instructions), not at a
+ * baud rate, so a burst longer than the slice silently loses the oldest byte.
+ * 64 bytes covered a banner; a booting Linux emits tens of kilobytes of
+ * printk inside one slice, which is how the M5 gate's log came back truncated
+ * with the interesting lines missing. 64 KiB holds a slice's burst; the drop
+ * path stays as the last-resort overflow signal the gate refuses to ignore. */
+#define OEMU_PL011_TX_RING 65536U
 #define OEMU_PL011_RX_RING 16U
 
 /* One output byte, handed to the installer's sink by oemu_pl011_pump. */
@@ -69,7 +71,8 @@ typedef struct oemu_pl011 {
   unsigned rx_count;
   /* Counters, so tests and the boot path can watch the device work. */
   uint64_t tx_emitted; /* bytes handed to the sink */
-  uint64_t tx_dropped; /* bytes lost to a full TX ring */
+  uint64_t tx_dropped; /* bytes lost to a full TX ring (console loss, gate-visible) */
+  uint64_t rx_dropped; /* loopback bytes the receiver had no room for (RX loss) */
   oemu_pl011_sink sink;
   void *sink_user;
 } oemu_pl011;

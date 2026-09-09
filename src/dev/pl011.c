@@ -186,11 +186,15 @@ static oemu_status pl011_write(void *ctx, uint64_t offset, oemu_mem_size size, u
         pl011_tx_push(uart, (unsigned char)v);
       }
       uart->ris |= PL011_INT_TIEM;
-      if ((uart->cr & PL011_CR_LBE) != 0U) {
-        /* Loopback mirrors the byte into RX; a full ring drops it -- the
-         * counter tells the story a silent (void) never would. */
+      if (((uart->cr & PL011_CR_LBE) != 0U) && ((uart->cr & PL011_CR_RXE) != 0U)) {
+        /* Loopback mirrors the byte into the receiver, and only when there is a
+         * receiver: RXE is the same gate the host-injection path honours. The
+         * reset CR is TXE|LBE with RXE clear, so charging these to tx_dropped
+         * turned every earlycon byte into a phantom "console lost data" and the
+         * boot gate refused a log that was complete. A full RX ring is an RX
+         * loss and is counted as one. */
         if (oemu_pl011_inject(uart, (unsigned char)v) != OEMU_OK) {
-          uart->tx_dropped++;
+          uart->rx_dropped++;
         }
       }
       break;

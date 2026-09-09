@@ -151,11 +151,11 @@ TEST_F(Pl011, TxRingDropsOldestWhenOverflowed) {
    * bytes and count, not hide, the loss -- TX is never allowed to block the
    * vCPU. */
   wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE | PL011_CR_FEN);
-  for (unsigned i = 0U; i < 70U; i++) {
+  for (unsigned i = 0U; i < OEMU_PL011_TX_RING + 6U; i++) {
     wr(PL011_REG_DR, 'A' + (i % 26U));
   }
-  EXPECT_EQ(OEMU_PL011_TX_RING, uart_.tx_count); /* 64 kept */
-  EXPECT_EQ(6ULL, uart_.tx_dropped);             /* 70 - 64 lost */
+  EXPECT_EQ(OEMU_PL011_TX_RING, uart_.tx_count); /* the ring holds all it can */
+  EXPECT_EQ(6ULL, uart_.tx_dropped);             /* exactly the overflow */
 }
 
 TEST_F(Pl011, FlagsShowBusyWhileTxQueuedThenEmptyAfterPump) {
@@ -249,6 +249,28 @@ TEST_F(Pl011, InjectWithNullDeviceIsAnArgumentError) {
 }
 
 // --- loopback ---------------------------------------------------------------
+
+/* The reset CR is TXE|LBE with the receiver off (measured off QEMU). Writing
+ * the console then must not look like lost output: with RXE clear there is no
+ * receiver to mirror into, and charging those bytes to tx_dropped made the M5
+ * boot gate refuse a log that was complete (2939 phantom drops). */
+TEST_F(Pl011, ResetLoopbackWithoutReceiverIsNotConsoleLoss) {
+  EXPECT_EQ(PL011_CR_TXE | PL011_CR_LBE, rd(PL011_REG_CR));
+  for (unsigned i = 0U; i < 200U; i++) {
+    wr(PL011_REG_DR, 'x');
+  }
+  EXPECT_EQ(0ULL, uart_.tx_dropped) << "no TX byte was lost";
+  EXPECT_EQ(0ULL, uart_.rx_dropped) << "no receiver was enabled, so nothing to lose";
+}
+
+TEST_F(Pl011, LoopbackOverflowCountsAsRxLossOnly) {
+  wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE | PL011_CR_LBE);
+  for (unsigned i = 0U; i < OEMU_PL011_RX_RING + 4U; i++) {
+    wr(PL011_REG_DR, 'y');
+  }
+  EXPECT_EQ(0ULL, uart_.tx_dropped) << "TX never lost a byte";
+  EXPECT_EQ(4ULL, uart_.rx_dropped) << "the receiver had no room for the tail";
+}
 
 TEST_F(Pl011, LoopbackMirrorsTxIntoRx) {
   /* With the receiver live and loopback set, a DR write lands in RX as well
