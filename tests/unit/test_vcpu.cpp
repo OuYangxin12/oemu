@@ -556,4 +556,23 @@ TEST_F(VcpuTest, CounterStepsAtTheRateTheGuestIsTold) {
       << "one instruction may not retire a whole guest tick";
 }
 
+TEST_F(VcpuTest, DeliveredIrqLeavesTheGuestMaskedSoItCannotNestImmediately) {
+  /* The M5 boot livelocked on nested IRQs taken inside the kernel's
+   * el1_interrupt prologue, seven instructions into the handler and before it
+   * ever reached gic_read_iar -- which is only possible if the mask the entry
+   * writes is not in force. This pins the invariant the whole handler design
+   * rests on: once oemu_vcpu_take_pending() has delivered, the DAIF field says
+   * masked and a second call cannot deliver again until the guest unmasks. */
+  program({kMsrDaifXzr});
+  ASSERT_EQ(step(), OEMU_OK); /* unmask, so a pending line is deliverable */
+  oemu_vcpu_set_irq(&vcpu_, true);
+  ASSERT_TRUE(oemu_vcpu_take_pending(&vcpu_));
+  EXPECT_EQ(0xFU, oemu_pstate_daif(vcpu_.sysregs.pstate));
+  EXPECT_FALSE(oemu_vcpu_take_pending(&vcpu_)); /* still asserted, still masked */
+  /* The guest unmasks; only then may the still-asserted line deliver again. */
+  program({kMsrDaifXzr});
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_TRUE(oemu_vcpu_take_pending(&vcpu_));
+}
+
 }  // namespace
