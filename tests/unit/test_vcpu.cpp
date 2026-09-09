@@ -537,4 +537,23 @@ TEST_F(VcpuTest, DeliveryChargesTheQuantum) {
   EXPECT_EQ(oemu_vcpu_step(&small, nullptr), OEMU_ERR_TIMEOUT);
 }
 
+TEST_F(VcpuTest, CounterStepsAtTheRateTheGuestIsTold) {
+  program({kYield, kYield, kYield});
+  const uint64_t before = vcpu_.sysregs.cntvct;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(step(), OEMU_OK);
+  }
+  /* One count per retired instruction: the modelled core runs at exactly the
+   * frequency CNTFRQ_EL0 reports, so a count delta means the same interval to
+   * the guest as it means to us. Any other step is a clock the guest cannot
+   * use: a Linux HZ=100 tick arms CNTV_CVAL 625000 counts past `now`, and if a
+   * single instruction can cross that delta the tick fires the moment it is
+   * armed -- the timer wheel, RCU and every mdelay() in the kernel then run on
+   * a clock that does not exist, and an interrupt is pending on every
+   * instruction the guest retires. */
+  EXPECT_EQ(vcpu_.sysregs.cntvct - before, 3ULL * OEMU_TIMER_COUNTS_PER_INSN);
+  EXPECT_LT(OEMU_TIMER_COUNTS_PER_INSN, OEMU_CNTFRQ_EL0_DEFAULT / 100U)
+      << "one instruction may not retire a whole guest tick";
+}
+
 }  // namespace

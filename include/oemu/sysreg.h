@@ -202,7 +202,12 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
 /* Default generic-timer counter frequency: the Arm default the QEMU virt
  * machine and this DT both present, so the guest's clock source and oemu's
  * counter agree. */
-#define OEMU_CNTFRQ_EL0_DEFAULT    62500000u
+#define OEMU_CNTFRQ_EL0_DEFAULT 62500000u
+
+/* Counts the generic timer advances per retired instruction. One, so that the
+ * counter's rate equals the frequency advertised through CNTFRQ_EL0 above: the
+ * guest's clock-frequency and the emulator's clock cannot then disagree. */
+#define OEMU_TIMER_COUNTS_PER_INSN 1U
 #define OEMU_SYSREG_CPACR_EL1      ((uint32_t)0x0082)
 #define OEMU_SYSREG_TTBR0_EL1      ((uint32_t)0x0100)
 #define OEMU_SYSREG_TTBR1_EL1      ((uint32_t)0x0101)
