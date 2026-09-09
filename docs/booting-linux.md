@@ -55,11 +55,16 @@ CPU: All CPU(s) started at EL1
 之后停住，`Run /init` 再也不出现，`BOOT OK` 因此拿不到。指令预算耗尽时模型报告
 
 ```
-PC=0xffffffc080010a00 ESR_EL1=0x86000005 FAR_EL1=ELR_EL1=0xffffffc0800111a0 SPSR_EL1=0x1003c5
+PC=0xffffffc080010a04 EL=4 ESR_EL1=0x96000045 FAR_EL1=0xffffff761217b420 ELR_EL1=0xffffffc0800111a0 SPSR_EL1=0x1003c5
 ```
 
-即 PC 正落在 guest 自己的向量入口（`VBAR_EL1=0xffffffc080010800` 的 `+0x200`），却对
-`_stext+0x11a0` 的取指发生 level-1 translation fault —— 反复自陷。
+即 guest 在自己的同步入口（`VBAR_EL1=0xffffffc080010800` 的 `+0x200`，`ELR_EL1` 即 `el1h_64_sync`）
+里，对 `0xffffff761217b420` 做一次**写**（`ISS` 的 WnR=1）时撞上 level-1 translation fault，
+异常因此层层嵌套。这条记录本身就是进度证据：修掉两处向量槽错序之前，它是
+`ESR=0x86000005`（同 EL 取指中止，`FAR=ELR=0xffffffc0800111a0`，即连向量存根都取不出来），
+`EC` 由 `0x20` 变 `0x25`、`FAR` 由向量页变成一个越界指针，说明中断已经能投到正确入口，剩下的
+是另一类缺陷——一个越界指针导致的嵌套数据中止（`VA_BITS=39` 下内核的三个映射窗口都不含
+`0xffffff76...`，所以那是我们交给 guest 的一个看似有效的坏值）。
 
 已经用实测排除的方向（不要再走一遍）：Image 装载地址与入口（与 booting.rst 和 oracle 逐字节一致）、
 页表索引与描述符解码（`swapper_pg_dir`/`init_pg_dir` 位置由 `nm` 定标）、TLBI 与 `TTBR` 写入的失效
