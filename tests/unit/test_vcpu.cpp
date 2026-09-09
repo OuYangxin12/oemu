@@ -36,9 +36,9 @@ constexpr uint32_t kYield = 0xD503203FU;       // yield (advances harmlessly)
 constexpr uint32_t kDcZvaX0 = 0xD50B7420U;     // dc    zva, x0
 constexpr uint32_t kStrX0X1 = 0xF9000020U;     // str   x0, [x1]
 constexpr uint32_t kLdrX2X3 = 0xF9400062U;
-constexpr uint32_t kMsrDaifX2 = 0xD51B4222U;     // msr   daif, x2 (Linux IRQ entry)
-constexpr uint32_t kMsrDaifSet2 = 0xD50342DFU;   // msr   daifset, #0x2
-constexpr uint32_t kMsrDaifClr2 = 0xD50342FFU;   // msr   daifclr, #0x2     // ldr   x2, [x3]
+constexpr uint32_t kMsrDaifX2 = 0xD51B4222U;    // msr   daif, x2 (Linux IRQ entry)
+constexpr uint32_t kMsrDaifSet2 = 0xD50342DFU;  // msr   daifset, #0x2
+constexpr uint32_t kMsrDaifClr2 = 0xD50342FFU;  // msr   daifclr, #0x2     // ldr   x2, [x3]
 
 constexpr uint64_t kIlBit = UINT64_C(1) << 25;
 constexpr uint32_t EcBase(oemu_exc_ec ec) {
