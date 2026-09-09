@@ -68,14 +68,40 @@ oemu_el oemu_exc_route(oemu_el from) {
   return (from == OEMU_EL3) ? OEMU_EL3 : OEMU_EL1;
 }
 
+static unsigned exc_slot(oemu_exc_kind kind) {
+  /* The order of the four entries inside a vector group is fixed by the
+   * architecture and it is NOT the order of oemu_exc_kind: the table is
+   * Synchronous (+0x000), System error (+0x080), IRQ (+0x100), FIQ (+0x180).
+   * Kind is an enum we chose ourselves, so the mapping is spelled out.
+   *
+   * Multiplying the enum by 0x80 (as this function used to) put IRQ in the
+   * System-error slot, FIQ in the IRQ slot and SError in the FIQ slot. On the
+   * M5 boot that meant every timer tick landed on arm64's do_serror() stub
+   * instead of the GIC demuxer: the comparator was never re-armed, the level
+   * line stayed asserted, and the guest re-took an interrupt every 40
+   * instructions -- which is what turned the boot into a stack-eating loop
+   * (issue #28). */
+  switch (kind) {
+    case OEMU_EXC_KIND_SYNC:
+      return 0U;
+    case OEMU_EXC_KIND_SERROR:
+      return 1U;
+    case OEMU_EXC_KIND_IRQ:
+      return 2U;
+    case OEMU_EXC_KIND_FIQ:
+      return 3U;
+  }
+  return 0U; /* unreachable: the enum is exhaustive */
+}
+
 uint64_t oemu_exc_vector_offset(bool same_el, bool sp_sel, oemu_exc_kind kind) {
-  /* Base group, then the 128-byte-per-kind stride. The AArch32 lower-EL
-   * group (0x600) never applies: oemu guests are AArch64. */
+  /* Base group, then the architectural slot. The AArch32 lower-EL group
+   * (0x600..) never applies: oemu guests are AArch64. */
   uint64_t group = 0x400U;
   if (same_el) {
     group = sp_sel ? 0x200U : 0x000U;
   }
-  return group + ((uint64_t)kind << 7);
+  return group + (exc_slot(kind) << 7U);
 }
 
 /* --- entry and return ---------------------------------------------------------- */

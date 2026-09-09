@@ -486,9 +486,9 @@ TEST_F(VcpuTest, UnmaskedIrqIsDeliveredBeforeTheFetchedInstruction) {
   program({kMsrDaifXzr, kYield});
   ASSERT_EQ(step(), OEMU_OK); /* msr daif, xzr: unmask */
   oemu_vcpu_set_irq(&vcpu_, true);
-  place(kVectors + 0x280U, {kEret});
+  place(kVectors + 0x300U, {kEret});
   ASSERT_EQ(step(), OEMU_OK); /* the step takes the IRQ, not the yield */
-  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x280U); /* IRQ group, same EL */
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x300U); /* IRQ slot, same EL */
   /* ELR names the instruction that never ran; the re-execution after the
    * ERET is the whole point of the precise contract. */
   EXPECT_EQ(vcpu_.sysregs.elr_el[OEMU_EL1], kText + OEMU_INSN_SIZE);
@@ -497,7 +497,7 @@ TEST_F(VcpuTest, UnmaskedIrqIsDeliveredBeforeTheFetchedInstruction) {
   /* Level-triggered: the pin is still high, so the next step re-fires at the
    * same instruction. */
   ASSERT_EQ(step(), OEMU_OK);
-  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x280U);
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x300U);
   oemu_vcpu_set_irq(&vcpu_, false);
   ASSERT_EQ(step(), OEMU_OK); /* handler eret */
   ASSERT_EQ(step(), OEMU_OK); /* the yield finally executes */
@@ -510,7 +510,7 @@ TEST_F(VcpuTest, FiqPreemptsIrq) {
   oemu_vcpu_set_irq(&vcpu_, true);
   oemu_vcpu_set_fiq(&vcpu_, true);
   ASSERT_TRUE(oemu_vcpu_take_pending(&vcpu_));
-  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x300U); /* FIQ group */
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x380U); /* FIQ slot */
   EXPECT_EQ(vcpu_.sysregs.elr_el[OEMU_EL1], kText + OEMU_INSN_SIZE);
 }
 
