@@ -274,6 +274,10 @@ ID register once implemented), EL2/VHE, a code-cache or TCG-style JIT
 | modelled (not executed) EL3 deviates from the architecture | documented in README; ID registers and DTB stay self-consistent so Linux cannot tell |
 | new SYS encodings blur DECODE-vs-UNSUPPORTED | corpus extension + the existing dichotomy tests keep asserting the split |
 | Linux config surface underestimated | benchmark the same defconfig under QEMU first: works there, fails here ⇒ oemu bug |
+| `ID_AA64ISAR0_EL1` advertises `Atomic=1` while the decoder implements no LSE `CAS`/`SWP`/`ST-` group | clear the bit or implement the group; a guest that trusts the field takes Undefined Instruction (found while rooting #26) |
+| `DCZID_EL0.DZP=1` yet `DC ZVA` is executed, where the oracle raises Undefined Instruction | either report `DZP=0` or raise the fault, in one commit, so the ID read and the decode cannot disagree |
+| the exclusive monitor survives exception entry and `ERET` | clear it at those boundaries (CLREX semantics) before any guest runs LL/SC in EL0 with signals |
+| `LDTR`/`STTR` (`form == 2`) decode as unsupported, so `load_elf_binary`'s `user_st64` dies (issue #27) | decode them as unscaled plain accesses -- the only thing between the guest and a shell |
 
 ## Assumptions
 

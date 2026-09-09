@@ -1,7 +1,8 @@
 # 任务卡：M5 — initrd + busybox shell（终点门）
 
-> 状态：设计就绪，为终点门预留。依据：`roadmap-linux-boot.md` M5 验收
-> 门 = 完整复现 `docs/linux-minimal-qemu.md` 的验收输出。
+> 状态：进行中——内核态已打通到 `Run /init`（issue #26 的 initramfs populate 崩溃已修，
+> `fa6fc54`）；用户态卡在 issue #27（LDTR/STTR 未实现）。依据：`roadmap-linux-boot.md`
+> M5 验收门 = 完整复现 `docs/linux-minimal-qemu.md` 的验收输出。
 
 ## 范围
 
@@ -33,6 +34,8 @@ make boot-linux LINUX=... INITRD=...
 | L3 门 | `tests/guest/boot-smoke.sh`（或 ctest 驱动脚本） | 三标记 + exit 0 断言；stdin 喂入时序与 QEMU 对齐（guest 起来后再喂） |
 | 黑盒 | `tests/unit/test_initrd.cpp` | initrd 加载地址、`/chosen` 字段（linux,initrd-start/end） |
 | 黑盒 | `tests/unit/test_serial_input.cpp` | stdin raw mode → RX 字节、流控/缓冲策略 |
+| 黑盒 | `tests/guest/bitfield_probe.S` | BFM/UBFM/SBFM（含 `BFI` 回绕拼法）逐条编码的 oracle 黄金值；oracle 与 oemu 下 24/24 逐位一致（#26 的证据与回归载体） |
+| 黑盒 | `tests/unit/test_exec.cpp` | `BfiWrappedRangeIsNotANoOp`、`BfiWrappedRangeAtAnyLsb`、`BfmInsertsOnlyItsOwnField`：期望值全部取自 oracle 实测 |
 
 ## Oracle 来源
 
@@ -148,13 +151,35 @@ timer 一接上 jiffies 走动、内核越过该点——但随即在 `FAR=0x28`
 - 判别小结：dir-only 干净；任意 regular file（含 0 字节 / 改名 foo / 加 `dir .`）即崩；
   关 timer 仍崩；QEMU oracle 同 Image+同 cpio 正常。四门不受影响（本会话未改可执行代码）。
 
-### 待办（后续轮）
+### 第 6 轮：根因 = `BFM`（`bfi`）语义错，initramfs 解包打通（本提交）
 
-- **root cause（已缩小到 filp_open(O_CREAT) 的 create 路径）**：做一次单步 oracle
-  diff：oemu 侧加 `--trace`（反汇编每步 PC，已有 PC-ring 雏形）+ 在 `shmem_create`/
-  `vfs_create`/`d_add` 边界断点；QEMU 侧 `qemu-system-aarch64 -singlestep
-  -d in_asm,int` 跑同段。对齐到第一条分歧指令。重点排查：dentry 发布相关原子
-  （`hlist_bl` 位锁 `test_and_set_bit`=LL/SC、`cmpxchg`）、`d_add`/`__d_add` 内联路径、
-  `do_exclusive` 的 monitor（现仅 STXR 清、不在同址 plain store 时失效——先证伪/证真）。
+- 临时探针（`OEMU_DIAG=<file>` 时 `oemu_vcpu_step` 记录每条访存并落盘 40B 记录；提交前已整体还原）
+  直指 `lockref_get+0x14/__cmpxchg_case_64`：对 `d_lockref`（dentry+0x58，计数在高 32 位）
+  读 `0x0000000100000000` 又**原样写回**，计数 1→1。紧接着同一 open 路径 unwind 的
+  `dput → __dentry_kill → dentry_unlink_inode → iput → dentry_free → call_rcu` 把该 dentry
+  **合法销毁**，`chown_common` 读已释放对象的 `d_inode = 0` → `ldr x0,[x20,#0x28]`，FAR=0x28。
+  ⇒ 既非"存储丢失"、非"被覆写回 0"、也非"两份 dentry"，而是**引用计数被丢**。
+- 单条指令 oracle：freestanding guest 用 `.inst` 逐条执行编码、经 PL011 打印，与
+  `qemu-system-aarch64` 对比 → 20 例 11 不符，**全在 BFM**（UBFM/SBFM/`lsl` 全对）。
+  `bfi x2,x0,#32,#32`(0xB3607C02)：oracle `0x200000000`，oemu `0x100000000`。
+- 规则（oracle 实测钉死）：`BFM` = 把 `UBFM` 的值**合并**进目的寄存器、落在该值所在位置
+  ——非回绕 `[len-1:0]`，回绕 `[len-1:regsize-immR]`（寄存器宽度自然截断）；而
+  `BFI Xd,Xn,#lsb,#width` 正是 `immR=regsize-lsb, immS=width-1` 的**回绕拼法**，
+  所以旧代码里内核每条 `bfi` 都被当 no-op。`BFM` 即 `BFXIL`。
+- 改动：`src/exec/exec.c:do_bitfield()`；`tests/unit/test_exec.cpp` 新增
+  `BfiWrappedRangeIsNotANoOp`、`BfiWrappedRangeAtAnyLsb`，并按 oracle 修正
+  `BfmInsertsOnlyItsOwnField` 的期望值 `0xDEADBEEF00667700 → 0xDEADBEEF00006677`
+  （旧值是 bug 的产物）。期望值全部来自 oracle 实测，不由 oemu 反推。
+- 门：`gcc-debug / release / asan-ubsan / clang-debug` 四配置 **884/884**；`clang-tidy` 干净；
+  改动文件 clang-format 干净（`bench/corpus/k_addsub.c` 的格式告警在 HEAD 上即存在，与本改动无关）。
+- 效果：`dotinit / nofile / only-init / zero / foo` 五发语料全部通过解包阶段，`chown_common`
+  崩溃消失，控制台走到 `Run /init`；`zero.cpio` 之后是 `ENOEXEC`（0 字节文件本就不是 ELF），
+  目录对照组依旧干净。24 例探针与 oracle **24/24 逐位一致**。
+
+### 待办（后续轮）
+- **修 `#27`（当前唯一阻塞点）**：`decode_ldst_imm_unscaled()` 的 `form == 2` 直接
+  `OEMU_ERR_UNSUPPORTED`，于是 `load_elf_binary` 的 `user_st64` = `sttr x3,[x6]`
+  (0xF80008C3) 以 Undefined instruction 炸掉 init。按普通无缩放访存解码即可；
+  绑定解码 + 执行单测，L3 以 `initramfs.cpio` 到 `BOOT OK`/`MINIMAL-BOOT-CHECK-PASSED` 为凭。
 - 修好后：喂 stdin（`-serial stdio`）取 `SHELL_ALIVE` + `poweroff`→exit 0。
 - L3 门 `scripts/boot-linux-gate.sh`（缺镜像即跳过）+ `make boot-linux` target。
