@@ -351,6 +351,27 @@ TEST_F(SysregTest, NameIsNeverNull) {
   EXPECT_NE(nullptr, oemu_sysreg_name(0x3FFF));
 }
 
+TEST_F(SysregTest, TtbrWritesLandWholeAndDoNotDisturbEachOther) {
+  /* The M5 boot investigation currently rests on one contradiction: the guest is
+   * caught running on swapper_pg_dir at every interrupt delivery although the log
+   * position implies init_pg_dir is live. A TTBR write that did not land, or that
+   * landed with bits eaten by a mask, would explain that outright -- so the
+   * round-trip is pinned here, at the three addresses the boot actually uses and
+   * at an ASID-tagged value whose high bits a masking bug would swallow. */
+  const uint64_t values[] = {0x4022c000ULL, 0x40341000ULL, 0x4022e000ULL,
+                             0x4022e000ULL | (0x123ULL << 48)};
+  for (unsigned i = 0U; i < (sizeof(values) / sizeof(values[0])); ++i) {
+    ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_TTBR0_EL1, values[i]));
+    ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_TTBR1_EL1, values[i]));
+    uint64_t low = 0U;
+    uint64_t high = 0U;
+    ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_TTBR0_EL1, &low));
+    ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_TTBR1_EL1, &high));
+    EXPECT_EQ(values[i], low) << "TTBR0 lost or narrowed the write";
+    EXPECT_EQ(values[i], high) << "TTBR1 lost or narrowed the write";
+  }
+}
+
 }  // namespace
 
 TEST_F(SysregTest, FpStatusRegistersAreModelledAndThirtyTwoBitsWide) {

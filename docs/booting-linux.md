@@ -79,7 +79,7 @@ Linux 的活页表必然是 `init_pg_dir`（`0x40341000`；`paging_init` 在 `se
 被写坏、`ICC_*` 系统寄存器、银行化 `SP_EL1` 陈旧、入口 DAIF 不生效（单测钉住）、**向投递屏蔽中的
 guest 投递**（前 400 次投递 DAIF 均可为 0，无一例在 I 置位时投递）、**WFI 唤醒打断上下文恢复**
 （`TTBR1` 恒为 swapper，非瞬时状态）、GIC ACTIVE 抑制、DT/GIC 探测失败、嵌套同步数据中止、
-向量槽次序（原实现 `kind << 7` 一直是对的，我错改两次并已撤销）、`TTBR0/1_EL1` 的 `write_mask`/CCI 屏蔽。原列出的：Image 装载地址与入口（与 booting.rst 和 oracle 逐字节一致）、
+向量槽次序（原实现 `kind << 7` 一直是对的，我错改两次并已撤销）、`TTBR0/1_EL1` 的 `write_mask`/CCI 屏蔽、**`TTBR0/TTBR1_EL1` 写不落地**（`SysregTest.TtbrWritesLandWholeAndDoNotDisturbEachOther` 用启动实际用到的三个地址外加一个带 ASID 高位的值钉住了往返）。原列出的：Image 装载地址与入口（与 booting.rst 和 oracle 逐字节一致）、
 页表索引与描述符解码（`swapper_pg_dir`/`init_pg_dir` 位置由 `nm` 定标）、TLBI 与 `TTBR` 写入的失效
 路径（我们是整体失效，保守正确）、`stp` 的偏移定标与写回、`SPSel`/DAIF 是否漏实现、以及
 **generic timer 计数速率**（每指令 1e6 个计数比对外宣告的 62.5 MHz 快 1600 万倍，已在 `606e245`
