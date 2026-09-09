@@ -66,6 +66,7 @@
 #include "oemu/pl011.h"
 
 #include <fcntl.h>
+#include <sys/random.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -553,10 +554,30 @@ static void boot_hang_report(const oemu_vcpu *vcpu, const char *why, uint64_t in
                 esr, far, elr, spsr);
 }
 
+/* Where a stalled console left the UART: enough state to tell "the guest never
+ * printed it" from "the driver never drained it". A boot that ends with bytes
+ * queued, or with a latched-but-unhandled interrupt, or with the modem flags
+ * flow-controlling transmit, is a device-model bug and says so here. */
+static void boot_uart_report(const oemu_pl011 *uart) {
+  if (uart == NULL) {
+    return;
+  }
+  (void)fprintf(stderr,
+                "oemu:   uart: tx_queued=%u tx_emitted=%" PRIu64 " tx_dropped=%" PRIu64
+                " rx_queued=%u CR=0x%03x FR=0x%02x RIS=0x%03x IMSC=0x%03x\n",
+                uart->tx_count, uart->tx_emitted, uart->tx_dropped, uart->rx_count, uart->cr,
+                uart->fr, uart->ris, uart->imsc);
+}
+
 /* One line to stderr if the console dropped anything: a boot gate decides on
  * the log it captured, and a truncated log must never be read as "the guest
  * never printed it". */
-static void boot_console_warn(const oemu_pl011 *uart) {
+static void boot_console_warn(const oemu_pl011 *uart, uint64_t input_dropped) {
+  if (input_dropped != 0ULL) {
+    (void)fprintf(
+        stderr, "oemu: console dropped %" PRIu64 " input byte(s): the guest never read them\n",
+        input_dropped);
+  }
   const uint64_t lost = oemu_pl011_tx_dropped(uart);
   if (lost != 0U) {
     (void)fprintf(stderr, "oemu: console dropped %" PRIu64 " TX bytes (log is truncated)\n",
@@ -592,17 +613,54 @@ static void boot_refresh_levels(oemu_vcpu *vcpu, oemu_gicv2 *gic, oemu_pl011 *ua
    * async probe ran, /dev/console never opened, and pid 1 spun in a write()
    * retry loop forever. */
   oemu_gicv2_set_pending(gic, BOOT_TIMER_VIRT_PPI,
-               oemu_gtimer_pending(sr->cntvct - sr->cntvoff_el1, sr->cntv_ctl_el1,
-                         sr->cntv_cval_el1) != 0);
+                         oemu_gtimer_pending(sr->cntvct - sr->cntvoff_el1, sr->cntv_ctl_el1,
+                                             sr->cntv_cval_el1) != 0);
   oemu_gicv2_set_pending(
-    gic, BOOT_TIMER_PHYS_PPI,
-    oemu_gtimer_pending(sr->cntvct, sr->cntp_ctl_el1, sr->cntp_cval_el1) != 0);
+      gic, BOOT_TIMER_PHYS_PPI,
+      oemu_gtimer_pending(sr->cntvct, sr->cntp_ctl_el1, sr->cntp_cval_el1) != 0);
   oemu_vcpu_set_irq(vcpu, oemu_gicv2_irq_level(gic) != 0);
+}
+
+/* Hand one slice of typed input to the UART, holding back what it cannot take.
+ *
+ * The device refuses a byte while UARTEN|RXE is clear -- correct for a receiver
+ * that is not listening -- but the driver clears RXE as a matter of course
+ * (`pl011_start_tx` disables the receiver before each transmit, half-duplex
+ * style, and `pl011_stop_tx` restores it), and the oracle is forgiving about the
+ * resulting window: measured at an idle shell prompt its CR is 0x0f01, i.e. RXE
+ * clear, yet a line typed there is still delivered and echoed. So a refused byte
+ * must be held and retried, not dropped: the byte has already left the host
+ * terminal, and the old drop-on-refuse meant a keystroke that arrived during a
+ * transmission -- or before /init opened the tty -- simply vanished, which is
+ * exactly how the SHELL_ALIVE marker went missing. The queue is bounded and the
+ * overflow is counted rather than silently lost. */
+#define BOOT_HELD_MAX 256U
+
+static void boot_pump_stdin(oemu_pl011 *uart, unsigned char *held, size_t *held_len,
+                            uint64_t *dropped) {
+  unsigned char c = 0U;
+  while (read(STDIN_FILENO, &c, 1U) == 1) {
+    if (*held_len >= BOOT_HELD_MAX) {
+      (*dropped)++; /* a guest that never opens its console loses input */
+      continue;
+    }
+    held[(*held_len)++] = c;
+  }
+  size_t kept = 0U;
+  for (size_t i = 0U; i < *held_len; ++i) {
+    if (oemu_pl011_inject(uart, held[i]) != OEMU_OK) {
+      held[kept++] = held[i]; /* the receiver is off: keep it for later */
+    }
+  }
+  *held_len = kept;
 }
 
 static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oemu_gicv2 *gic,
                     bool pump_stdin, uint64_t max_insns) {
   uint64_t budget = max_insns;
+  unsigned char held[BOOT_HELD_MAX];
+  size_t held_len = 0U;
+  uint64_t held_drop = 0U;
   for (;;) {
     const uint64_t slice = (budget < BOOT_QUANTUM) ? budget : BOOT_QUANTUM;
     uint64_t done = 0U;
@@ -624,16 +682,11 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
      * A byte the ring cannot hold is dropped, exactly as QEMU drops an early
      * byte before the driver enables the receiver. */
     if (pump_stdin) {
-      unsigned char c = 0U;
-      while (read(STDIN_FILENO, &c, 1U) == 1) {
-        if (oemu_pl011_inject(uart, c) != OEMU_OK) {
-          break;
-        }
-      }
+      boot_pump_stdin(uart, held, &held_len, &held_drop);
     }
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
-      boot_console_warn(uart);
+      boot_console_warn(uart, held_drop);
       return machine->exit_code & 0xFF; /* the code travels as a shell sees it */
     }
     if (ev == OEMU_MACHINE_EVENT_RESET) {
@@ -642,6 +695,7 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
     }
     if (st == OEMU_ERR_BLOCKED) {
       boot_hang_report(vcpu, "guest parked", max_insns - budget);
+      boot_uart_report(uart);
       (void)fputs("oemu: guest parked at WFI/WFE with nothing to wake it\n", stderr);
       return EXIT_BLOCKED;
     }
@@ -652,7 +706,8 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
     }
     if (budget == 0U) {
       boot_hang_report(vcpu, "timeout", max_insns);
-      boot_console_warn(uart);
+      boot_uart_report(uart);
+      boot_console_warn(uart, held_drop);
       return EXIT_TIMEOUT;
     }
     oemu_vcpu_rearm(vcpu);
@@ -671,6 +726,34 @@ typedef struct boot_opts {
   uint64_t max_insns;      /* --max-insns */
   bool stdio;              /* -serial stdio: console is interactive (RX wired) */
 } boot_opts;
+
+/* Bytes for /chosen/rng-seed, which the guest's early_init_dt() feeds to
+ * add_bootloader_randomness() before nopping the property out of the live tree.
+ * The oracle always injects a seed, so without one our guest reaches the
+ * initcalls with an uninitialised CRNG -- a divergence no amount of CPU
+ * emulation is going to explain away. Best-effort: on failure the caller omits
+ * the property and the boot carries on, as it always did. */
+static bool boot_rng_seed(void *out, uint32_t len) {
+  if (getrandom(out, len, 0) == (ssize_t)len) {
+    return true;
+  }
+  const int fd = open("/dev/urandom", O_RDONLY);
+  if (fd < 0) {
+    return false;
+  }
+  unsigned char *const bytes = (unsigned char *)out;
+  uint32_t got = 0U;
+  while (got < len) {
+    const ssize_t n = read(fd, bytes + got, (size_t)(len - got));
+    if (n <= 0) {
+      break;
+    }
+    got += (uint32_t)n;
+  }
+  (void)close(fd);
+  return got == len;
+}
+
 /* For `-serial stdio`: put stdin in non-blocking raw mode so the run loop can
  * drain typed bytes into the UART RX ring between slices without ever blocking
  * the vCPU. Best-effort -- a redirected or closed stdin just yields EOF. */
@@ -776,8 +859,21 @@ static int boot(const boot_opts *opts) {
         goto done;
       }
     }
-    const oemu_virt_dtb_params vp = {BOOT_RAM_BASE, ram, initrd_pa,
-                                     initrd_pa + (uint64_t)initrd_len, opts->cmdline};
+    /* 32 bytes, the size the oracle injects. */
+    uint8_t rng_seed[32];
+    const bool seeded = boot_rng_seed(rng_seed, (uint32_t)sizeof(rng_seed));
+    if (!seeded) {
+      (void)fputs(
+          "oemu: no host entropy for /chosen/rng-seed; the guest CRNG will stay unseeded\n",
+          stderr);
+    }
+    const oemu_virt_dtb_params vp = {BOOT_RAM_BASE,
+                                     ram,
+                                     initrd_pa,
+                                     initrd_pa + (uint64_t)initrd_len,
+                                     opts->cmdline,
+                                     seeded ? rng_seed : NULL,
+                                     seeded ? (uint32_t)sizeof(rng_seed) : 0U};
     st = oemu_virt_dtb_build(&gen, &vp);
     if (st != OEMU_OK) {
       (void)fprintf(stderr, "oemu: building the device tree failed: %s\n", oemu_status_str(st));
@@ -929,6 +1025,41 @@ static int boot(const boot_opts *opts) {
     boot_arm_stdin();
   }
   result = boot_run(&vcpu, &machine, &uart, &gic, opts->stdio, opts->max_insns);
+  { /* TEMPORARY diagnostic (issue #28): OEMU_DUMP_MEM=pa:size:file dumps guest RAM
+     * at exit, so a suspicion about what the guest did to a page becomes a fact. */
+    const char *m = getenv("OEMU_DUMP_MEM");
+    if (m != NULL) {
+      /* OEMU_DUMP_MEM=<pa>:<len>:<file>, both hex, to look at guest RAM at a chosen
+       * moment. Parsed with strtoull rather than sscanf("%lx"): the conversion
+       * must be checked, the values are uint64_t (no room for an unsigned-long
+       * cast on ILP32), and a hex field is not something sscanf may read past
+       * whitespace for. */
+      char *end = NULL;
+      uint64_t base = 0ULL;
+      uint64_t size = 0ULL;
+      char path[256];
+      const char *colon1 = (m != NULL) ? strchr(m, ':') : NULL;
+      const char *colon2 = (colon1 != NULL) ? strchr(colon1 + 1, ':') : NULL;
+      errno = 0;
+      base = (m != NULL) ? strtoull(m, &end, 16) : 0ULL;
+      size = (end == colon1) ? strtoull(colon1 + 1, &end, 16) : 0ULL;
+      if ((errno == 0) && (colon2 != NULL) && (end == colon2) &&
+          (sscanf(colon2 + 1, "%255s", path) == 1) && (size != 0ULL)) {
+        FILE *f = fopen(path, "wb");
+        if (f != NULL) {
+          for (uint64_t off = 0ULL; off < size; off++) {
+            uint64_t b = 0ULL;
+            if (oemu_aspace_read(&machine.aspace, base + off, OEMU_MEM_BYTE, false, &b) !=
+                OEMU_OK) {
+              b = 0xDEULL;
+            }
+            (void)fputc((int)(b & 0xFFULL), f);
+          }
+          (void)fclose(f);
+        }
+      }
+    }
+  }
   (void)oemu_pl011_pump(&uart); /* whatever the guest queued before it died */
 
 done:
