@@ -1249,6 +1249,35 @@ TEST_F(ExecTest, PreIndexNegativePairOpsAreTheBackwardCopyCore) {
   EXPECT_EQ(kData, x(5)) << "stp writeback";
 }
 
+TEST_F(ExecTest, MemcpyOverlapDecisionIsAnUnsignedCompare) {
+  /* __memcpy decides "overlapping, copy backwards" with `sub x14, x0, x1;
+   * cmp x14, x2; b.cc`. When dst < src the difference is a huge unsigned
+   * value, which must NOT take the backwards path -- if the carry were wrong
+   * there, an overlapping copy would run the wrong direction and smear the
+   * source over itself. Encodings from the cross assembler. */
+  const struct {
+    uint64_t diff;
+    uint64_t len;
+    uint64_t lo;
+    uint64_t hs;
+  } cases[] = {
+      {16U, 32U, 1U, 0U}, {32U, 16U, 0U, 1U}, {0U, 0U, 0U, 1U},
+      {UINT64_MAX, 16U, 0U, 1U}, {UINT64_C(0x8000000000000000), 1U, 0U, 1U},
+      {UINT64_C(0x8000000000000000), UINT64_C(0x8000000000000001), 1U, 0U},
+  };
+  for (const auto &c : cases) {
+    program({0xeb0201dfU, /* cmp  x14, x2 */
+             0x1a9f27e0U, /* cset w0, lo */
+             0x1a9f37e1U, /* cset w1, hs */
+             0xd65f03c0U});
+    set_x(14, c.diff);
+    set_x(2, c.len);
+    step_ok(4);
+    EXPECT_EQ(c.lo, x(0)) << "diff=" << c.diff << " len=" << c.len;
+    EXPECT_EQ(c.hs, x(1)) << "diff=" << c.diff << " len=" << c.len;
+  }
+}
+
 TEST_F(ExecTest, VectorPairLoadStoreRoundTrip) {
   store64(kData, UINT64_C(0xAAAAAAAAAAAAAAAA));
   store64(kData + 8U, UINT64_C(0xBBBBBBBBBBBBBBBB));
