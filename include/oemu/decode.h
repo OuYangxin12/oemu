@@ -130,7 +130,8 @@ typedef enum oemu_opcode {
   OEMU_OP_LSRV,
   OEMU_OP_ASRV,
   OEMU_OP_RORV,
-  OEMU_OP_CRC32, /* CRC32B/H/W/X; the byte count rides in insn.uimm */
+  OEMU_OP_CRC32,  /* CRC32B/H/W/X; the byte count rides in insn.uimm */
+  OEMU_OP_CRC32C, /* CRC32CB/CH/CW/CX: same shape, Castagnoli polynomial */
 
   /* one-source */
   OEMU_OP_RBIT,

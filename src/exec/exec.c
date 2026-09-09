@@ -85,8 +85,7 @@ static void oemu_tr_init(void) {
     const char *max = getenv("OEMU_TRACE_MAX");
     if (va != NULL) {
       g_tr.va_lo = strtoull(va, NULL, 0);
-      g_tr.va_hi =
-          g_tr.va_lo + ((vasize != NULL) ? strtoull(vasize, NULL, 0) : 0x1000ULL);
+      g_tr.va_hi = g_tr.va_lo + ((vasize != NULL) ? strtoull(vasize, NULL, 0) : 0x1000ULL);
       g_tr.on = true; /* a VA watch is armed from the very first instruction */
     }
     if ((wonly != NULL) && (wonly[0] == 'w')) {
@@ -838,20 +837,34 @@ static oemu_status do_bitfield(oemu_cpu *cpu, const oemu_insn *in) {
   return OEMU_OK;
 }
 
-uint32_t oemu_exec_internal_crc32(uint32_t crc_in, uint64_t data, unsigned bytes) {
-  /* The architecture's CRC() pseudocode verbatim: XOR the running sum's MSB
-   * with the incoming data LSB, shift the sum left, feed the data right, and
-   * fold in the polynomial where they differ. LSB-first => the reflected
-   * CRC-32 the guest's crc32() returns. */
-  const uint32_t poly = 0x04C11DB7U;
+uint32_t oemu_exec_internal_crc32(uint32_t crc_in, uint64_t data, unsigned bytes,
+                                  bool castagnoli) {
+  /* One step of a reflected (LSB-first) LFSR: fold a byte into the low byte of
+   * the state, then shift right eight times, XORing the *reflected* polynomial
+   * wherever a set bit drops off the bottom. Reflected forms of the two
+   * architecturally named polynomials: 0x04C11DB7 -> 0xEDB88320, and
+   * 0x1EDC6F41 -> 0x82F63B78 for the C variants.
+   *
+   * The version this replaces claimed to be "the architecture's CRC() pseudocode
+   * verbatim" but inverted the data operand (it fed the stream out of `data`
+   * LSB-first while the pseudocode reads `data<N-1-j>`, MSB-first) and paired
+   * that with the non-reflected polynomial. Two inversions that do not cancel:
+   * it disagreed with the architecture on 400 of 400 random vectors. That is
+   * what the boot log's `OF: fdt: not creating '/sys/firmware/fdt': CRC check
+   * failed` was reporting -- Linux computes the devicetree CRC with its generic
+   * C table early, before the ARM64_HAS_CRC32 capability is applied, then
+   * recomputes it late through these instructions, and only our half of that
+   * comparison was wrong. */
+  const uint32_t poly = castagnoli ? UINT32_C(0x82F63B78) : UINT32_C(0xEDB88320);
   uint32_t crc = crc_in;
-  const unsigned nbits = bytes * 8U;
-  for (unsigned j = 0U; j < nbits; ++j) {
-    const uint32_t topbit = ((crc >> 31) ^ (uint32_t)(data & UINT64_C(1))) & UINT32_C(1);
-    crc <<= 1;
-    data >>= 1;
-    if (topbit != 0U) {
-      crc ^= poly;
+  for (unsigned i = 0U; i < bytes; ++i) {
+    crc ^= (uint32_t)((data >> (8U * i)) & UINT64_C(0xFF));
+    for (unsigned bit = 0U; bit < 8U; ++bit) {
+      const uint32_t out = crc & UINT32_C(1);
+      crc >>= 1;
+      if (out != 0U) {
+        crc ^= poly;
+      }
     }
   }
   return crc;
@@ -1440,14 +1453,16 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       break;
     }
 
-    case OEMU_OP_CRC32: {
-      /* Reflected CRC-32 (poly 0x04C11DB7). The data operand is Rm: its low
-       * `in->uimm` bytes (all 8 for CRC32X, read from the full 64-bit
-       * register); the seed is Rn's low 32 bits; the result is 32-bit. */
+    case OEMU_OP_CRC32:
+    case OEMU_OP_CRC32C: {
+      /* The data operand is Rm: its low `in->uimm` bytes (all 8 for CRC32X,
+       * read from the full 64-bit register), taken little-endian first; the
+       * seed is Rn's low 32 bits; the result is 32-bit. */
       const uint32_t seed = (uint32_t)read_g(cpu, in->rn, false, OEMU_REG_W32);
       const uint64_t data = read_g(cpu, in->rm, false, OEMU_REG_W64);
-      write_g(cpu, in->rd, false, OEMU_REG_W32,
-              oemu_exec_internal_crc32(seed, data, (unsigned)in->uimm));
+      write_g(
+          cpu, in->rd, false, OEMU_REG_W32,
+          oemu_exec_internal_crc32(seed, data, (unsigned)in->uimm, in->op == OEMU_OP_CRC32C));
       break;
     }
     case OEMU_OP_RBIT:

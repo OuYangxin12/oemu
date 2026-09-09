@@ -86,14 +86,21 @@ uint64_t oemu_exec_internal_rev16(uint64_t value, oemu_reg_width width);
 uint64_t oemu_exec_internal_rev32(uint64_t value);
 
 /*
- * Reflected CRC-32 (Arm CRC extension, polynomial 0x04C11DB7): the pure core
- * of CRC32B/H/W/X. `crc_in` seeds the running sum, `data`'s low `bytes` bytes
- * feed the shift register (8 for CRC32X, 1 for CRC32B), and the 32-bit result
- * is returned. Bit order is LSB-first, exactly as the
- * architecture's CRC() pseudocode, so the guest's crc32 library gets the same
- * value the oracle does.
+ * The Arm CRC extension's state update: the pure core of CRC32B/H/W/X
+ * (`castagnoli` false, polynomial 0x04C11DB7) and CRC32CB/CH/CW/CX (true,
+ * 0x1EDC6F41).
+ *
+ * Both instructions are a *state step* of a reflected (LSB-first) LFSR: `crc_in`
+ * is the running state, the low `bytes` bytes of `data` -- taken in
+ * little-endian byte order, so CRC32W feeds the bytes low byte first -- advance
+ * it, and the new state is returned. There is no initial or final complement
+ * here; the guest's crc32 library applies those (start at ~0, invert the last
+ * result), which is why chaining this over "123456789" from ~0 and complementing
+ * gives the standard CRC-32 check value 0xCBf43926 -- the anchor the golden
+ * vectors in tests/unit/test_exec_internal.cpp are derived from.
  */
-uint32_t oemu_exec_internal_crc32(uint32_t crc_in, uint64_t data, unsigned bytes);
+uint32_t oemu_exec_internal_crc32(uint32_t crc_in, uint64_t data, unsigned bytes,
+                                  bool castagnoli);
 
 /*
  * Executes one already-decoded instruction (op != OEMU_OP_UNKNOWN), including

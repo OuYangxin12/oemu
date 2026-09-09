@@ -376,16 +376,26 @@ TEST(SysReencode, ReproducesHarvestedWords) {
   EXPECT_EQ(oemu_exec_internal_reencode_sys(0x0438U, 31U), 0xD508871FU);
 }
 
-/* --- CRC32 (reflected CRC-32, poly 0x04C11DB7) --------------------------------------
- * Expected values come from an independent transcription of the architecture's
- * CRC() pseudocode, and are confirmed against the boot: Linux's own crc32 self
- * test runs these exact instructions and the guest boots to init only when the
- * results agree with the oracle. */
+/* --- CRC32 / CRC32C (the Arm CRC extension) --------------------------------------
+ * The instructions are a state step of a *reflected* CRC: `seed` is the running
+ * state and the low `bytes` bytes of `data` -- little-endian order, so CRC32W
+ * feeds its low byte first -- advance it. There is no complement inside the
+ * instruction; the caller applies the init/final inversion.
+ *
+ * Expected values come from zlib's crc32 (an independent implementation of the
+ * same polynomial) and from the standard CRC-32 check value: chaining the byte
+ * form over "123456789" from ~0 and complementing must give 0xCBF43926. An
+ * earlier version of this table was generated from our own implementation, which
+ * hid a real bug: the data operand was consumed LSB-first against a
+ * non-reflected polynomial, and the guest noticed -- the boot logged
+ * `OF: fdt: ... CRC check failed` because Linux's generic C crc32_be and our
+ * crc32w disagreed. */
 
 struct CrcCase {
   uint32_t seed;
   uint64_t data;
-  unsigned bytes; /* 1 = CRC32B, 2 = H, 4 = W, 8 = X */
+  unsigned bytes;  /* 1 = CRC32B, 2 = H, 4 = W, 8 = X */
+  bool castagnoli; /* false: CRC32* (0x04C11DB7), true: CRC32C* (0x1EDC6F41) */
   uint32_t expect;
 };
 
@@ -393,38 +403,66 @@ class Crc32Table : public ::testing::TestWithParam<CrcCase> {};
 
 TEST_P(Crc32Table, MatchesArchitecture) {
   const CrcCase &c = GetParam();
-  EXPECT_EQ(oemu_exec_internal_crc32(c.seed, c.data, c.bytes), c.expect);
+  EXPECT_EQ(oemu_exec_internal_crc32(c.seed, c.data, c.bytes, c.castagnoli), c.expect);
 }
 
-INSTANTIATE_TEST_SUITE_P(Crc32Edges, Crc32Table,
-                         ::testing::Values(
-                             // Zero data with a zero seed folds nothing: identity.
-                             CrcCase{0x00000000U, 0x00ULL, 1U, 0x00000000U},
-                             // A single byte, seeds and payloads drawn from the CRC-32 tables.
-                             CrcCase{0x00000000U, 0xFFULL, 1U, 0xB1F740B4U},
-                             CrcCase{0x00000000U, 0x31ULL, 1U, 0x5C007B8AU},
-                             CrcCase{0xFFFFFFFFU, 0xABULL, 1U, 0x48569F36U},
-                             // Halfword.
-                             CrcCase{0x00000000U, 0x3231ULL, 2U, 0x4C6A5170U},
-                             // Word: only the low four bytes feed the shift register.
-                             CrcCase{0x00000000U, 0x12345678ULL, 4U, 0x731A9471U},
-                             CrcCase{0x12345678U, 0xCAFEBABEULL, 4U, 0x572B0073U},
-                             CrcCase{0x00000000U, 0xAABBCCDDULL, 4U, 0xA7CC9DBEU},
-                             // X: all eight bytes, so the high half matters.
-                             CrcCase{0x00000000U, 0x0123456789ABCDEFULL, 8U, 0x74BC9884U},
-                             CrcCase{0x00000000U, 0x00FF00FF00FF00FFULL, 8U, 0x956A75F1U}));
+INSTANTIATE_TEST_SUITE_P(
+    Crc32Edges, Crc32Table,
+    ::testing::Values(
+        // Zero data with a zero seed folds nothing: identity.
+        CrcCase{0x00000000U, 0x00ULL, 1U, false, 0x00000000U},
+        // Single bytes, from zlib.crc32 over one byte with the seed as state.
+        CrcCase{0x00000000U, 0xFFULL, 1U, false, 0x2D02EF8DU},
+        CrcCase{0x00000000U, 0x31ULL, 1U, false, 0x51DE003AU},
+        CrcCase{0xFFFFFFFFU, 0xABULL, 1U, false, 0x6CF96A12U},
+        // Halfword: bytes 0x31, 0x32 in that order.
+        CrcCase{0x00000000U, 0x3231ULL, 2U, false, 0x0E8A5632U},
+        // Word: only the low four bytes feed the shift register.
+        CrcCase{0x00000000U, 0x12345678ULL, 4U, false, 0x8E2958CEU},
+        CrcCase{0x12345678U, 0xCAFEBABEULL, 4U, false, 0x4AC3FD3CU},
+        CrcCase{0x00000000U, 0xAABBCCDDULL, 4U, false, 0x7DB933E5U},
+        CrcCase{0xFFFFFFFFU, 0x12345678ULL, 4U, false, 0x5092782DU},
+        // X: all eight bytes, so the high half matters.
+        CrcCase{0x00000000U, 0x0123456789ABCDEFULL, 8U, false, 0x21193D2EU},
+        CrcCase{0x00000000U, 0x00FF00FF00FF00FFULL, 8U, false, 0x8FAE56A9U},
+        // Castagnoli: same shapes, different polynomial.
+        CrcCase{0x00000000U, 0xFFULL, 1U, true, 0xAD7D5351U},
+        CrcCase{0xFFFFFFFFU, 0x12345678ULL, 4U, true, 0x4DECE20CU},
+        CrcCase{0xCAFEBABEU, 0x5AULL, 1U, true, 0x2460C1BFU},
+        CrcCase{0xFFFFFFFFU, 0x0123456789ABCDEFULL, 8U, true, 0x9A4F27DCU}));
+
+TEST(Crc32, CheckValueOfTheStandardTestString) {
+  // The externally published check value of CRC-32: init ~0, no complement per
+  // step, final complement, over the nine bytes of "123456789".
+  uint32_t state = 0xFFFFFFFFU;
+  const char *msg = "123456789";
+  for (const char *p = msg; *p != '\0'; ++p) {
+    state = oemu_exec_internal_crc32(state, (uint64_t)(uint8_t)*p, 1U, false);
+  }
+  EXPECT_EQ(~state, 0xCBF43926U);
+}
+
+TEST(Crc32c, CheckValueOfTheStandardTestString) {
+  // The published CRC-32C (Castagnoli) check value for the same input.
+  uint32_t state = 0xFFFFFFFFU;
+  const char *msg = "123456789";
+  for (const char *p = msg; *p != '\0'; ++p) {
+    state = oemu_exec_internal_crc32(state, (uint64_t)(uint8_t)*p, 1U, true);
+  }
+  EXPECT_EQ(~state, 0xE3069283U);
+}
 
 TEST(Crc32, CompositionOfTwoBytesMatchesTheHalfwordForm) {
   // CRC is a state machine: two CRC32B steps must equal one CRC32H.
-  const uint32_t mid = oemu_exec_internal_crc32(0U, 0x31ULL, 1U);
-  EXPECT_EQ(oemu_exec_internal_crc32(mid, 0x32ULL, 1U),
-            oemu_exec_internal_crc32(0U, 0x3231ULL, 2U));
+  const uint32_t mid = oemu_exec_internal_crc32(0U, 0x31ULL, 1U, false);
+  EXPECT_EQ(oemu_exec_internal_crc32(mid, 0x32ULL, 1U, false),
+            oemu_exec_internal_crc32(0U, 0x3231ULL, 2U, false));
 }
 
 TEST(Crc32, UpperDataBytesAreIgnoredForNarrowForms) {
   // CRC32W sees only bits[31:0] of the data operand.
-  EXPECT_EQ(oemu_exec_internal_crc32(0U, 0xDEADBEEF12345678ULL, 4U),
-            oemu_exec_internal_crc32(0U, 0x12345678ULL, 4U));
+  EXPECT_EQ(oemu_exec_internal_crc32(0U, 0xDEADBEEF12345678ULL, 4U, false),
+            oemu_exec_internal_crc32(0U, 0x12345678ULL, 4U, false));
 }
 
 }  // namespace
