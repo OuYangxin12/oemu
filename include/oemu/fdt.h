@@ -69,6 +69,19 @@ OEMU_NODISCARD oemu_status oemu_fdt_prop_str(oemu_fdt *fdt, const char *name,
                                              const char *value);
 OEMU_NODISCARD oemu_status oemu_fdt_prop_cells(oemu_fdt *fdt, const char *name,
                                                const uint32_t *cells, size_t count);
+/* An opaque property, emitted verbatim and padded to the 4-byte boundary: for
+ * byte-defined values such as /chosen/rng-seed, where "big-endian" has no
+ * meaning. */
+OEMU_NODISCARD oemu_status oemu_fdt_prop_bytes(oemu_fdt *fdt, const char *name,
+                                               const void *data, uint32_t len);
+
+/* One string-list property: the elements are concatenated NUL-separated, each
+ * terminated, which is the wire form of dtc's `compatible = "a", "b"`. A
+ * device node needs it whenever a driver matches on the bus-level fallback
+ * (a PL011 that only says "arm,pl011" is invisible to the kernel's AMBA scan,
+ * which looks for "arm,primecell"). */
+OEMU_NODISCARD oemu_status oemu_fdt_prop_strv(oemu_fdt *fdt, const char *name,
+                                              const char *const *values, size_t count);
 
 /* Close the tree (balanced nodes required): completes the structure block,
  * appends the strings block and the empty reservation map, and fixes the

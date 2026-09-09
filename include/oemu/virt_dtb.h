@@ -36,6 +36,15 @@ typedef struct oemu_virt_dtb_params {
   uint64_t initrd_start; /* 0 when no initrd; else the load physical address */
   uint64_t initrd_end;   /* one past the last initrd byte (0 when none) */
   const char *cmdline;   /* /chosen/bootargs (NULL -> a safe default) */
+  /* /chosen/rng-seed: entropy the guest's CRNG is seeded from at
+   * early_init_dt(), which consumes it and then nops the property out of the
+   * live tree. The oracle always injects one, so a tree without it leaves the
+   * guest unseeded (`random: crng init done` never appears) and anything that
+   * draws randomness during initcalls runs on an uninitialised pool. It is a
+   * caller-supplied buffer rather than something read here so that building the
+   * tree stays deterministic -- and byte-for-byte testable. NULL/0 omits it. */
+  const uint8_t *rng_seed;
+  uint32_t rng_seed_len;
 } oemu_virt_dtb_params;
 
 /* Emit the whole virt tree into `fdt` and finish it (the caller supplies the

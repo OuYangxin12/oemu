@@ -71,6 +71,12 @@ static oemu_status emit_chosen(oemu_fdt *fdt, const oemu_virt_dtb_params *p) {
   if (st != OEMU_OK) {
     return st;
   }
+  if ((p->rng_seed != NULL) && (p->rng_seed_len != 0U)) {
+    st = oemu_fdt_prop_bytes(fdt, "rng-seed", p->rng_seed, p->rng_seed_len);
+    if (st != OEMU_OK) {
+      return st;
+    }
+  }
   return oemu_fdt_end_node(fdt);
 }
 
@@ -250,7 +256,8 @@ static oemu_status emit_timer(oemu_fdt *fdt) {
 }
 
 static oemu_status emit_osc(oemu_fdt *fdt) {
-  static const uint32_t one = 1U;
+  static const uint32_t zero = 0U;
+
   oemu_status st = oemu_fdt_begin_node(fdt, "oscillator");
   if (st != OEMU_OK) {
     return st;
@@ -259,7 +266,7 @@ static oemu_status emit_osc(oemu_fdt *fdt) {
   if (st != OEMU_OK) {
     return st;
   }
-  st = oemu_fdt_prop_u32(fdt, "#clock-cells", one);
+  st = oemu_fdt_prop_u32(fdt, "#clock-cells", zero); /* bare phandles, as in the oracle tree */
   if (st != OEMU_OK) {
     return st;
   }
@@ -276,12 +283,14 @@ static oemu_status emit_osc(oemu_fdt *fdt) {
 
 static oemu_status emit_pl011(oemu_fdt *fdt) {
   static const uint32_t irq[3] = {0U, 1U, 4U}; /* SPI offset 1 -> IRQ 33 */
-  static const uint32_t clock[2] = {PHANDLE_OSC, 0U};
+  /* Both names, in the binding's order: the kernel's AMBA scan creates the
+   * device only for a node matching the generic "arm,primecell". */
+  static const char *const compatible[2] = {"arm,pl011", "arm,primecell"};
   oemu_status st = oemu_fdt_begin_node(fdt, "pl011@9000000");
   if (st != OEMU_OK) {
     return st;
   }
-  st = oemu_fdt_prop_str(fdt, "compatible", "arm,pl011");
+  st = oemu_fdt_prop_strv(fdt, "compatible", compatible, 2U);
   if (st != OEMU_OK) {
     return st;
   }
@@ -293,11 +302,20 @@ static oemu_status emit_pl011(oemu_fdt *fdt) {
   if (st != OEMU_OK) {
     return st;
   }
+  /* Two clocks, named exactly as drivers/amba/bus.c asks for them: the bus
+   * looks the second one up by the name "apb_pclk" (amba_get_enable_pclk) and
+   * any failure there -- including a missing name -- becomes -EPROBE_DEFER in
+   * amba_match, so the PL011 never probes, no console is registered,
+   * /dev/console will not open and /init has no stdin/stdout. boot.dts, our
+   * source of truth for this tree, already declared both names; the builder
+   * had dropped the second one. */
+  static const uint32_t clock[2] = {PHANDLE_OSC, PHANDLE_OSC};
+  static const char *const clock_names[2] = {"uartclk", "apb_pclk"};
   st = oemu_fdt_prop_cells(fdt, "clocks", clock, 2U);
   if (st != OEMU_OK) {
     return st;
   }
-  st = oemu_fdt_prop_str(fdt, "clock-names", "uartclk");
+  st = oemu_fdt_prop_strv(fdt, "clock-names", clock_names, 2U);
   if (st != OEMU_OK) {
     return st;
   }

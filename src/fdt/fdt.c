@@ -264,6 +264,23 @@ oemu_status oemu_fdt_prop_u64(oemu_fdt *fdt, const char *name, uint64_t value) {
   return fdt_prop_emit(fdt, off, word, sizeof(word));
 }
 
+oemu_status oemu_fdt_prop_bytes(oemu_fdt *fdt, const char *name, const void *data,
+                                uint32_t len) {
+  if (data == NULL) {
+    (void)fdt_require_emitting(fdt);
+    return OEMU_ERR_INVALID_ARG;
+  }
+  uint32_t off = 0U;
+  const oemu_status st = fdt_prop_guard(fdt, name, len, &off);
+  if (st != OEMU_OK) {
+    return st;
+  }
+  /* Verbatim bytes, padded to the 4-byte boundary the spec requires: unlike the
+   * u32/u64/cell forms there is no byte order to apply -- an opaque blob such as
+   * /chosen/rng-seed is defined by its byte sequence. */
+  return fdt_prop_emit(fdt, off, (const unsigned char *)data, len);
+}
+
 oemu_status oemu_fdt_prop_str(oemu_fdt *fdt, const char *name, const char *value) {
   if (value == NULL) {
     (void)fdt_require_emitting(fdt);
@@ -302,6 +319,50 @@ oemu_status oemu_fdt_prop_cells(oemu_fdt *fdt, const char *name, const uint32_t 
     s = fdt_emit_raw(fdt, word, sizeof(word));
   }
   return s;
+}
+
+oemu_status oemu_fdt_prop_strv(oemu_fdt *fdt, const char *name, const char *const *values,
+                               size_t count) {
+  oemu_status st = fdt_require_emitting(fdt);
+  if (st != OEMU_OK) {
+    return st;
+  }
+  if (values == NULL) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  /* A string-list property (the `compatible` convention) is the NUL-separated
+   * concatenation of its elements, every element NUL-terminated, with no
+   * separator and no extra terminator -- byte-for-byte what dtc writes for
+   * `compatible = "a", "b"`. Readers walk it by skipping one string at a
+   * time, so a single-string writer silently hides a node from every
+   * driver that matches on the bus-level fallback. */
+  size_t len = 0U;
+  for (size_t i = 0U; i < count; ++i) {
+    if (values[i] == NULL) {
+      return OEMU_ERR_INVALID_ARG;
+    }
+    len += strlen(values[i]) + 1U;
+  }
+  uint32_t off = 0U;
+  st = fdt_prop_guard(fdt, name, len, &off);
+  if (st != OEMU_OK) {
+    return st;
+  }
+  unsigned char head[12];
+  fdt_put_be32(head, OEMU_FDT_TOKEN_PROP);
+  fdt_put_be32(head + 4U, (uint32_t)len); /* length before name, per dtc */
+  fdt_put_be32(head + 8U, off);
+  st = fdt_emit_raw(fdt, head, sizeof(head));
+  for (size_t i = 0U; (st == OEMU_OK) && (i < count); ++i) {
+    const size_t bytes = strlen(values[i]) + 1U;
+    st = fdt_emit_raw(fdt, (const unsigned char *)values[i], bytes);
+  }
+  const size_t pad = fdt_pad4(len) - len;
+  if ((st == OEMU_OK) && (pad != 0U)) {
+    const unsigned char zeros[4] = {0U, 0U, 0U, 0U};
+    st = fdt_emit_raw(fdt, zeros, pad);
+  }
+  return st;
 }
 
 oemu_status oemu_fdt_finish(oemu_fdt *fdt) {

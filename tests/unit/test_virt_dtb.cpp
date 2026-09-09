@@ -36,7 +36,7 @@ uint64_t be64(const unsigned char *p) {
 }
 
 oemu_virt_dtb_params params(uint64_t irs, uint64_t ire, const char *cmd) {
-  return oemu_virt_dtb_params{kRamBase, kRamSize, irs, ire, cmd};
+  return oemu_virt_dtb_params{kRamBase, kRamSize, irs, ire, cmd, nullptr, 0U};
 }
 
 class VirtDtb : public ::testing::Test {
@@ -117,6 +117,35 @@ TEST_F(VirtDtb, ChosenPointsAtTheInitrdCells) {
   EXPECT_EQ(0x4C400000ULL, be64(prop("/chosen", "linux,initrd-end", 8)));
 }
 
+TEST_F(VirtDtb, RngSeedIsEmittedVerbatimAndOmittedWhenAbsent) {
+  // The guest consumes /chosen/rng-seed as opaque bytes, so the tree must carry
+  // them untouched -- not byte-swapped, not truncated to a cell count.
+  static const uint8_t seed[32] = {0x00U, 0x01U, 0x02U, 0x03U, 0x04U, 0x05U, 0x06U, 0x07U,
+                                   0x08U, 0x09U, 0x0AU, 0x0BU, 0x0CU, 0x0DU, 0x0EU, 0x0FU,
+                                   0x10U, 0x11U, 0x12U, 0x13U, 0x14U, 0x15U, 0x16U, 0x17U,
+                                   0x18U, 0x19U, 0x1AU, 0x1BU, 0x1CU, 0x1DU, 0x1EU, 0x1FU};
+  oemu_virt_dtb_params p = params(0, 0, nullptr);
+  p.rng_seed = seed;
+  p.rng_seed_len = (uint32_t)sizeof(seed);
+  ASSERT_EQ(OEMU_OK, build(p));
+  const unsigned char *out = prop("/chosen", "rng-seed", 32U);
+  for (unsigned i = 0U; i < 32U; ++i) {
+    EXPECT_EQ(seed[i], out[i]) << "rng-seed byte " << i;
+  }
+
+  // Without a seed the property must not be there at all: an empty rng-seed is
+  // not "no seed" to the guest, it is a zero-length one. (Covered by its own
+  // case because the writer is single-use once finished.)
+}
+
+TEST_F(VirtDtb, NoRngSeedPropertyWhenNoneSupplied) {
+  ASSERT_EQ(OEMU_OK, build(params(0, 0, nullptr)));
+  const unsigned char *absent = nullptr;
+  size_t len = 0U;
+  EXPECT_NE(OEMU_OK, oemu_fdt_internal_find(oemu_fdt_bytes(&fdt_), oemu_fdt_length(&fdt_),
+                                            "/chosen", "rng-seed", &absent, &len));
+}
+
 TEST_F(VirtDtb, NullCmdlineUsesASafeDefault) {
   ASSERT_EQ(OEMU_OK, build(params(0, 0, nullptr)));
   EXPECT_NE(std::string::npos, str("/chosen", "bootargs").find("earlycon=pl011,0x9000000"));
@@ -158,7 +187,21 @@ TEST_F(VirtDtb, TimerAdvertisesFourPpis) {
 
 TEST_F(VirtDtb, Pl011ConsoleOnSpi33) {
   ASSERT_EQ(OEMU_OK, build(params(0, 0, nullptr)));
-  EXPECT_EQ("arm,pl011", str("/pl011@9000000", "compatible"));
+  /* The binding the guest actually obeys: the AMBA device is created only for
+   * a node whose compatible list also names the generic "arm,primecell", and
+   * only below a parent the OF scan descends into ("simple-bus"). Both come
+   * from drivers/of/platform.c, and issue #28 was exactly this node being
+   * invisible to the scan: no port, no console, /init with no stdio. */
+  const unsigned char *compat = prop("/pl011@9000000", "compatible", 24);
+  ASSERT_TRUE(compat != nullptr);
+  EXPECT_EQ(0, std::memcmp(compat, "arm,pl011\0", 10));
+  EXPECT_EQ(0, std::memcmp(compat + 10, "arm,primecell\0", 14));
+  /* Two clocks, both names present: drivers/amba/bus.c looks the second one up
+   * by the literal name "apb_pclk" and defers the probe when that fails. */
+  const unsigned char *names = prop("/pl011@9000000", "clock-names", 17);
+  ASSERT_TRUE(names != nullptr);
+  EXPECT_EQ(0, std::memcmp(names, "uartclk\0", 8));
+  EXPECT_EQ(0, std::memcmp(names + 8, "apb_pclk\0", 9));
   const unsigned char *irq = prop("/pl011@9000000", "interrupts", 12);
   EXPECT_EQ(0U, be32(irq + 0)); /* SPI type */
   EXPECT_EQ(1U, be32(irq + 4)); /* SPI offset 1 -> interrupt id 33 */
