@@ -70,26 +70,20 @@ TEST_F(ExcTest, RoutesEverythingToEl1ExceptEl3) {
 
 TEST_F(ExcTest, VectorOffsetsFollowTheArchitecturalGroups) {
   // Lower-EL group is fixed at 0x400 (AArch64); the same-EL group picks 0x000
-  // or 0x200 on the interrupted SPSel. Inside a group the four entries are in
-  // the architectural order Synchronous, System error, IRQ, FIQ -- which is
-  // NOT the order of oemu_exc_kind, so the table below spells the slots out
-  // rather than striding by the enum value. An earlier version of this test
-  // asserted the enum order (IRQ at +0x080), and that is what it was wrong
-  // about: it was written against the implementation, and the implementation
-  // was delivering every IRQ to the System-error vector.
+  // or 0x200 on the interrupted SPSel; kinds stride by 0x80.
   const struct {
     bool same_el;
     bool sp_sel;
     oemu_exc_kind kind;
     uint64_t offset;
   } cases[] = {
-      {false, false, OEMU_EXC_KIND_SYNC, 0x400},  {false, false, OEMU_EXC_KIND_SERROR, 0x480},
-      {false, false, OEMU_EXC_KIND_IRQ, 0x500},   {false, false, OEMU_EXC_KIND_FIQ, 0x580},
+      {false, false, OEMU_EXC_KIND_SYNC, 0x400},  {false, false, OEMU_EXC_KIND_IRQ, 0x480},
+      {false, false, OEMU_EXC_KIND_FIQ, 0x500},   {false, false, OEMU_EXC_KIND_SERROR, 0x580},
       {false, true, OEMU_EXC_KIND_SYNC, 0x400},   {true, false, OEMU_EXC_KIND_SYNC, 0x000},
-      {true, false, OEMU_EXC_KIND_SERROR, 0x080}, {true, false, OEMU_EXC_KIND_IRQ, 0x100},
-      {true, false, OEMU_EXC_KIND_FIQ, 0x180},    {true, true, OEMU_EXC_KIND_SYNC, 0x200},
-      {true, true, OEMU_EXC_KIND_SERROR, 0x280},  {true, true, OEMU_EXC_KIND_IRQ, 0x300},
-      {true, true, OEMU_EXC_KIND_FIQ, 0x380},
+      {true, false, OEMU_EXC_KIND_IRQ, 0x080},    {true, false, OEMU_EXC_KIND_FIQ, 0x100},
+      {true, false, OEMU_EXC_KIND_SERROR, 0x180}, {true, true, OEMU_EXC_KIND_SYNC, 0x200},
+      {true, true, OEMU_EXC_KIND_IRQ, 0x280},     {true, true, OEMU_EXC_KIND_FIQ, 0x300},
+      {true, true, OEMU_EXC_KIND_SERROR, 0x380},
   };
   for (const auto &c : cases) {
     EXPECT_EQ(c.offset, oemu_exc_vector_offset(c.same_el, c.sp_sel, c.kind))
@@ -158,7 +152,7 @@ TEST_F(ExcTest, TakeWithIrqKindLeavesEsrAndFarAlone) {
 
   oemu_exc_take(&regs_, &sr_, OEMU_EXC_KIND_IRQ, OEMU_EL1, 0xDEADBEEFU, 0x6000, false);
 
-  EXPECT_EQ(0x8000U + 0x200U + 0x100U, regs_.pc);  // IRQ slot of the same-EL group
+  EXPECT_EQ(0x8000U + 0x200U + 0x080U, regs_.pc);  // IRQ slot of the same-EL group
   EXPECT_EQ(0x1234U, sr_.esr_el[OEMU_EL1]);
   EXPECT_EQ(0U, sr_.far_el[OEMU_EL1]);
 }
@@ -167,7 +161,7 @@ TEST_F(ExcTest, SerrorWritesEsr) {
   const uint32_t esr = EcBase(OEMU_EXC_EC_SERROR) | kIlBit;
   oemu_exc_take(&regs_, &sr_, OEMU_EXC_KIND_SERROR, OEMU_EL1, esr, 0x6000, false);
 
-  EXPECT_EQ(0x8000U + 0x200U + 0x080U, regs_.pc);  // System-error slot of the same-EL group
+  EXPECT_EQ(0x8000U + 0x200U + 0x180U, regs_.pc);
   EXPECT_EQ(esr, sr_.esr_el[OEMU_EL1]);
 }
 
