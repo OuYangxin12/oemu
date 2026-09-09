@@ -25,10 +25,10 @@ uint64_t BootPstate(oemu_el el) {
   return pstate;
 }
 
-// Entry PSTATE: h-mode of the target, DAIF all set, IL set.
+// Entry PSTATE: h-mode of the target, DAIF all set, IL clear -- the handler
+// runs in a legal state; IL is only ever recorded in a saved SPSR.
 uint64_t EntryPstate(oemu_el el) {
-  return oemu_pstate_mode(el) | (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT) |
-         OEMU_PSTATE_IL;
+  return oemu_pstate_mode(el) | (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT);
 }
 
 constexpr uint64_t kIlBit = 1U << 25;  // ESR IL: raised by a 32-bit instruction
@@ -171,10 +171,12 @@ TEST_F(ExcTest, FarIsWrittenOnlyWhenValid) {
   EXPECT_EQ(0x6000U, sr_.far_el[OEMU_EL1]);
 }
 
-TEST_F(ExcTest, EntryAlwaysRecordsIlInSpsrOnNestedExceptions) {
+TEST_F(ExcTest, NestedEntryRecordsTheHandlersLegalPstate) {
+  /* The handler runs with IL clear, so a nested exception saves IL=0. Charging
+   * the handler's own PSTATE with IL=1 made the nested ERET an illegal one. */
   oemu_exc_undefined(&regs_, &sr_, 0);  // entry: SPSR = boot PSTATE (IL=0)
-  oemu_exc_undefined(&regs_, &sr_, 0);  // nested: SPSR = entry PSTATE (IL=1)
-  EXPECT_EQ(OEMU_PSTATE_IL, sr_.spsr_el[OEMU_EL1] & OEMU_PSTATE_IL);
+  oemu_exc_undefined(&regs_, &sr_, 0);  // nested: SPSR = entry PSTATE (IL=0)
+  EXPECT_EQ(0U, sr_.spsr_el[OEMU_EL1] & OEMU_PSTATE_IL);
 }
 
 // --- entry: abort helpers ---------------------------------------------------------
@@ -284,7 +286,8 @@ TEST_F(ExcTest, EretWithIlSetDeliversIllegalEret) {
 
   EXPECT_EQ(EcBase(OEMU_EXC_EC_ILLEGAL_ERET) | kIlBit, sr_.esr_el[OEMU_EL1]);
   EXPECT_EQ(0x8200U, regs_.pc);  // re-entered the same-EL sync vector
-  EXPECT_EQ(OEMU_PSTATE_IL, sr_.pstate & OEMU_PSTATE_IL);
+  /* The illegal-ERET handler itself runs in a legal state. */
+  EXPECT_EQ(0U, sr_.pstate & OEMU_PSTATE_IL);
 }
 
 TEST_F(ExcTest, EretToAHigherElIsUndefined) {

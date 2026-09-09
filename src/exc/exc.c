@@ -96,15 +96,20 @@ void oemu_exc_take(oemu_regs *regs, oemu_sysregs *sysregs, oemu_exc_kind kind, o
       sysregs->vbar_el[target] +
       oemu_exc_vector_offset(from == target, oemu_pstate_sp_sel(old_pstate) != 0U, kind);
 
-  /* Entry PSTATE: h-mode of the target (entry always selects SP_ELx), all
-   * four interrupt masks set, IL=1. DAIF is taken from QEMU's entry path --
-   * it writes DAIF=0b1111 on every exception type; the ARM ARM's sync
-   * variant preserves I/F, a distinction only a guest that relies on
-   * in-handler unmasking would notice, and the kernel entry code masks
-   * first thing either way. */
+  /* Entry PSTATE: h-mode of the target (entry always selects SP_ELx) and all
+   * four interrupt masks set. DAIF is taken from QEMU's entry path -- it
+   * writes DAIF=0b1111 on every exception type; the ARM ARM's sync variant
+   * preserves I/F, a distinction only a guest that relies on in-handler
+   * unmasking would notice, and the kernel entry code masks first thing
+   * either way.
+   *
+   * IL is deliberately *clear*. It records an illegal execution state, and the
+   * hardware copies the interrupted PSTATE into SPSR_ELx and enters the
+   * handler in a legal one. Setting it here made every nested exception save
+   * SPSR.IL = 1, so the nested handler's own ERET tripped the illegal-ERET
+   * tripwire below -- an exception the guest never asked for. */
   const uint64_t entry_pstate = oemu_pstate_mode(target) |
-                                (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT) |
-                                OEMU_PSTATE_IL;
+                                (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT);
   /* Bank switch first (it still sees the interrupted PSTATE as "from"), then
    * record the interrupted world in the target's banks. */
   oemu_sysregs_switch_sp(sysregs, entry_pstate);

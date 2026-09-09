@@ -1129,6 +1129,126 @@ TEST_F(ExecTest, UnscaledOffsetAccesses) {
   EXPECT_EQ(x(3), 0xBEU); /* the byte the sttr above left at kData */
 }
 
+TEST_F(ExecTest, MemcpyTailPathsCopyTheRightBytes) {
+  /* arch/arm64/lib/memcpy.S finishes with three size-specific tails; the M5
+   * boot's blake2s self-test fails exactly one vector and pty_init later sees a
+   * duplicate sysfs dev_t, so a corrupted small copy is the standing suspect.
+   * These are the literal instructions from __memcpy's 8/4/1-3 byte tails. */
+  for (uint64_t len = 1U; len <= 3U; ++len) {
+    for (uint64_t i = 0U; i < 16U; ++i) {
+      store64(kData + (i * 8U), UINT64_C(0xEEEEEEEEEEEEEEEE));
+      store64((kData + 0x800U) + (i * 8U), 0U);
+    }
+    for (uint64_t i = 0U; i < len; ++i) {
+      store64((kData + 0x800U) + i, 0xA0U + i);
+    }
+    program({0xd341fc4eU, /* lsr  x14, x2, #1 */
+             0x39400026U, /* ldrb w6,  [x1] */
+             0x385ff08aU, /* ldurb w10, [x4, #-1] */
+             0x386e6828U, /* ldrb w8,  [x1, x14] */
+             0x39000006U, /* strb w6,  [x0] */
+             0x382e6808U, /* strb w8,  [x0, x14] */
+             0x381ff0aaU, /* sturb w10, [x5, #-1] */
+             0xd65f03c0U});
+    set_x(0, kData);
+    set_x(1, (kData + 0x800U));
+    set_x(2, len);
+    set_x(4, (kData + 0x800U) + len);
+    set_x(5, kData + len);
+    step_ok(8); /* lsr, ldrb, ldurb, ldrb, strb, strb, sturb, ret */
+    for (uint64_t i = 0U; i < len; ++i) {
+      EXPECT_EQ(0xA0U + i, load64(kData + i) & 0xFFU) << "len=" << len << " byte " << i;
+    }
+  }
+  /* 4-byte tail, len = 6 so the two stores land on different halves. */
+  for (uint64_t i = 0U; i < 8U; ++i) {
+    store64(kData + (i * 8U), UINT64_C(0xEEEEEEEEEEEEEEEE));
+    store64((kData + 0x800U) + (i * 8U), 0U);
+  }
+  for (uint64_t i = 0U; i < 6U; ++i) {
+    store64((kData + 0x800U) + i, 0xA0U + i);
+  }
+  program({0xb9400026U, /* ldr  w6, [x1] */
+           0xb85fc088U, /* ldur w8, [x4, #-4] */
+           0xb9000006U, /* str  w6, [x0] */
+           0xb81fc0a8U, /* stur w8, [x5, #-4] */
+           0xd65f03c0U});
+  set_x(0, kData);
+  set_x(1, kData + 0x800U);
+  set_x(4, kData + 0x800U + 6U);
+  set_x(5, kData + 6U);
+  step_ok(5);
+  for (uint64_t i = 0U; i < 6U; ++i) {
+    EXPECT_EQ(0xA0U + i, load64(kData + i) & 0xFFU) << "4-byte tail byte " << i;
+  }
+  /* 8-byte tail, len = 12. */
+  for (uint64_t i = 0U; i < 16U; ++i) {
+    store64((kData + 0x800U) + (i * 8U), 0U);
+  }
+  for (uint64_t i = 0U; i < 12U; ++i) {
+    store64((kData + 0x800U) + i, 0xB0U + i);
+  }
+  program({0xf9400026U, /* ldr  x6, [x1] */
+           0xf85f8087U, /* ldur x7, [x4, #-8] */
+           0xf9000006U, /* str  x6, [x0] */
+           0xf81f80a7U, /* stur x7, [x5, #-8] */
+           0xd65f03c0U});
+  set_x(0, kData);
+  set_x(1, kData + 0x800U);
+  set_x(4, kData + 0x800U + 12U);
+  set_x(5, kData + 12U);
+  step_ok(5);
+  for (uint64_t i = 0U; i < 12U; ++i) {
+    EXPECT_EQ(0xB0U + i, load64(kData + i) & 0xFFU) << "8-byte tail byte " << i;
+  }
+}
+
+TEST_F(ExecTest, MemsetTailPostIndexStoresCoverEveryWidth) {
+  /* arch/arm64/lib/memset.S finishes with post-indexed 8/4/2/1-byte stores.
+   * kzalloc rides on this: a hole here would leave stale bytes in a fresh
+   * allocation, which is the shape of the duplicate sysfs dev_t the M5 boot
+   * hit in pty_init. */
+  for (uint64_t i = 0U; i < 4U; ++i) {
+    store64(kData + (i * 8U), UINT64_C(0xEEEEEEEEEEEEEEEE));
+  }
+  const uint64_t pattern = UINT64_C(0xAABBCCDDEEFF0011);
+  program({0xf8008507U, /* str  x7, [x8], #8 */
+           0xb8004507U, /* str  w7, [x8], #4 */
+           0x78002507U, /* strh w7, [x8], #2 */
+           0x39000107U, /* strb w7, [x8] */
+           0xd65f03c0U});
+  set_x(7, pattern);
+  set_x(8, kData);
+  step_ok(5);
+  EXPECT_EQ(pattern, load64(kData)) << "8-byte post-index store";
+  EXPECT_EQ(pattern & 0xFFFFFFFFU, load64(kData + 8U) & 0xFFFFFFFFU) << "4-byte post-index";
+  EXPECT_EQ(pattern & 0xFFFFU, load64(kData + 12U) & 0xFFFFU) << "2-byte post-index";
+  EXPECT_EQ(pattern & 0xFFU, load64(kData + 14U) & 0xFFU) << "1-byte store";
+  EXPECT_EQ(kData + 14U, x(8)) << "8+4+2 advanced the base; the strb has no writeback";
+}
+
+TEST_F(ExecTest, PreIndexNegativePairOpsAreTheBackwardCopyCore) {
+  /* __memcpy's overlapping (backward) path moves 16 bytes at a time with
+   * ldp/stp [base, #-64]!, the pre-indexed negative pair form. The initramfs
+   * unpack copies file data over memory the allocator may have reused, so this
+   * path runs during the M5 boot. */
+  const uint64_t src = kData + 0x800U;
+  store64(src, UINT64_C(0x0123456789ABCDEF));
+  store64(src + 8U, UINT64_C(0xFEDCBA9876543210));
+  store64(kData, 0U);
+  store64(kData + 8U, 0U);
+  program({0xa9fc348cU, /* ldp x12, x13, [x4, #-64]! */
+           0xa9bc34acU, /* stp x12, x13, [x5, #-64]! */
+           0xd65f03c0U});
+  set_x(4, src + 64U);
+  set_x(5, kData + 64U);
+  step_ok(3);
+  EXPECT_EQ(UINT64_C(0x0123456789ABCDEF), load64(kData)) << "low half";
+  EXPECT_EQ(UINT64_C(0xFEDCBA9876543210), load64(kData + 8U)) << "high half";
+  EXPECT_EQ(src, x(4)) << "ldp writeback";
+  EXPECT_EQ(kData, x(5)) << "stp writeback";
+}
+
 TEST_F(ExecTest, VectorPairLoadStoreRoundTrip) {
   store64(kData, UINT64_C(0xAAAAAAAAAAAAAAAA));
   store64(kData + 8U, UINT64_C(0xBBBBBBBBBBBBBBBB));
