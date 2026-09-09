@@ -41,57 +41,40 @@ make boot-linux
     --max-insns 4000000000 -serial stdio
 ```
 
-## 当前状态：红，且是诚实的红
+## 当前状态：红（以下只记实测，不记解释）
 
-门禁现在**不通过**，原因不是脚本、判据或 guest 镜像，而是 oemu 侧一个尚未修掉的缺陷，全部证据与
-排查顺序记在 issue **#28**。现象固定：内核一路正常到
+门禁不通过。原因不是脚本、判据或夹具，而是 oemu 侧一处尚未定位的机器级偏差。串口日志固定停在
+`CPU: All CPU(s) started at EL1`，`Run /init` 不出现；已确认非控制台丢字节（`tx_dropped` 恒 0，
+门禁也会因丢弃而 exit 2）。
 
-```
-SMP: Total of 1 processors activated.
-CPU features: detected: CRC32 instructions
-CPU: All CPU(s) started at EL1
-```
+用 #28 里那组探针量到的、彼此独立的事实：
 
-之后停住，`Run /init` 再也不出现，`BOOT OK` 因此拿不到。指令预算耗尽时模型报告
+1. 载入后首次一级翻译失败：`ESR=0x96000005`（同 EL 数据中止、`DFSC=0x05`、WnR=0 ⇒ **读**），
+   `FAR=_text+0x226260`，PC 在 `el1h_64_irq_handler + 0xc`。4 亿条指令内**只有一次**，不嵌套。
+2. 遍历本身是对的：失败处读到的原始 8 字节是 `0xffffff800022e950`，`bits[1:0]=0b00` ⇒ 按架构确实无效；
+   `idx` 是**字节偏移**（`0x810/8 = 0x102` 号项，在 512 项之内）。⇒ 中止是真的，不是遍历算错。
+3. 那一槽先被 `pc=0xffffffc08001be54` 写成合法表项 `0x100000004ffff003`；随后被
+   **`el1h_64_irq_handler` 的第一条指令**写成 `0xffffff800022e950`。
+4. 那次写**不是页表写**，而是入口存根保存 `pt_regs::sp`：写入值恰为 `x21 − 0x20`，`x22` 是 `ELR`
+   （`el1_interrupt+0x1c`）、`x23` 是 `SPSR`（`0x100005`）、`0x20` 是栈帧大小。
+5. 于是关键量是 `x21 = 0xffffff800022e970`：在本内核线性映射下（`PAGE_OFFSET=0xffffff8000000000`、
+   `PHYS_OFFSET=0x40000000`）它指 **PA `0x4022e970`**，恰在**承载 `swapper_pg_dir` 的那一页**、且在镜像
+   之内（`_text.._end = 0x40000000..0x40350000`）。**即中断发生时钟指针位于内核自身镜像内**，压帧便写坏
+   了 PGD 第 `0x102` 项，随后要走的正是这张表。
 
-```
-[abrt1] esr=0x96000005 far=0xffffffc080226260 pc=0xffffffc0801a66c4 sp=0xffffff8000226fc0
-[del1..N] kind=1 daif=0 pc=0xffffffc0801a6484 (= el1_interrupt + 0x1c) ttbr1=0x4022e000
-```
+已用实测排除（不要再走）：镜像装载与入口（`text_offset=0`，入口 `0x40000000`，与 guest 的
+`__pa(_text)` 自洽；`BOOT_IMAGE_BASE=0x40080000` 是无代码使用的死宏）；`--initrd` 告知（`virt_dtb.c` 注入
+`linux,initrd-start/end`，initrd 在 RAM 四分之三处）；DTB 内存描述（与 QEMU 的 `dumpdtb` 逐字段比过，
+`memory@40000000` 一致，仅差 `rng-seed`/`kaslr-seed`）；GIC 两个使能位（`gicv2.c:396` 门住）、逐线
+ISENABLER、ACTIVE 抑制；DAIF 屏蔽（前 400 次投递无一例在 I 置位时投递）；向量槽次序（原实现
+`kind << 7` 一直正确，被我用 `296b7c7`/`042aec1` 错改两次，已由 `5e901ec`/`cfa1de0` 撤销）；
+`TTBR0/TTBR1_EL1` 写不落地或被掩码（`SysregTest.TtbrWritesLandWholeAndDoNotDisturbEachOther` 钉住）；
+一级块解码（`test_mmu` 的 `l1_block` 用例）；KPTI（`CONFIG_UNMAP_KERNEL_AT_EL0 is not set`）；PSCI 挂起
+（`FEATURES=0` ⇒ 内核不注册 `cpu_suspend`）；`ICC_*` 系统寄存器；WFI 唤醒次序；控制台丢字节。
 
-即 guest 在自己的 EL1h IRQ 入口存根里（`el1h_64_irq_handler + 0xc`，正在 `kernel_entry` 建栈帧）对
-`_text + 0x226260` 做一次**读**时撞上 level-1 translation fault；此后中断风暴恢复原状（投递点恒为
-`el1_interrupt + 0x1c`、每次 SP 递降 `0x170`，说明栈帧只推一半、处理器从未跑完，电平拉高的定时器线约
-40 条指令后再次被取）。决定性的一条是：**每次投递时 `TTBR1_EL1` 都是 `swapper_pg_dir`
-（`0x4022e000`），从第一次投递到第一万次都是**，而日志走到 `CPU: All CPU(s) started at EL1` 时
-Linux 的活页表必然是 `init_pg_dir`（`0x40341000`；`paging_init` 在 `setup_arch`，打印该行的 `smp_init`
-在晚得多的 `rest_init`）。这两条互斥，其一必被读错；且曾见过 `0x40341000` 被写入两次、其后又写入
-`reserved`/`swapper`，而 `TTBR0/TTBR1_EL1` 的表行是朴素的（`offset` + 全 `write_mask`，无 CCI 屏蔽），
-所以掩码类缺陷不成立。下一记判据：写 `TTBR1_EL1` 后立刻读回比对——若 `0x40341000` 的写读回不是它自己，
-就是一个可脱离 guest 单测的 sysreg 缺陷，并能一句话解释风暴。
-
-注意本条曾被写错两次：一次记成 `ESR=0x86000005`（取指中止），一次记成 `ESR=0x96000045` 且 `FAR`
-越界——**后一条是我自己引入的向量回归（`296b7c7`、`042aec1`，已由 `5e901ec`、`cfa1de0` 撤销）造成的
-伪象**，不是 guest 的行为。教训是：改了异常投递的实现之后，旧二进制/旧签名都会把回归伪装成 guest 缺陷，
-所以重测前必须删掉 trace 二进制重建。
-
-已经用实测排除的方向（不要再走一遍）：镜像装载与入口、陈旧 TLB、`stp` 前索引缩放、`task_struct->stack`
-被写坏、`ICC_*` 系统寄存器、银行化 `SP_EL1` 陈旧、入口 DAIF 不生效（单测钉住）、**向投递屏蔽中的
-guest 投递**（前 400 次投递 DAIF 均可为 0，无一例在 I 置位时投递）、**WFI 唤醒打断上下文恢复**
-（`TTBR1` 恒为 swapper，非瞬时状态）、GIC ACTIVE 抑制、DT/GIC 探测失败、嵌套同步数据中止、
-向量槽次序（原实现 `kind << 7` 一直是对的，我错改两次并已撤销）、`TTBR0/1_EL1` 的 `write_mask`/CCI 屏蔽、**`TTBR0/TTBR1_EL1` 写不落地**（`SysregTest.TtbrWritesLandWholeAndDoNotDisturbEachOther` 用启动实际用到的三个地址外加一个带 ASID 高位的值钉住了往返）。原列出的：Image 装载地址与入口（与 booting.rst 和 oracle 逐字节一致）、
-页表索引与描述符解码（`swapper_pg_dir`/`init_pg_dir` 位置由 `nm` 定标）、TLBI 与 `TTBR` 写入的失效
-路径（我们是整体失效，保守正确）、`stp` 的偏移定标与写回、`SPSel`/DAIF 是否漏实现、以及
-**generic timer 计数速率**（每指令 1e6 个计数比对外宣告的 62.5 MHz 快 1600 万倍，已在 `606e245`
-修掉，中断风暴随之消失）。当前最强证据：那次致命写是 `el1h_64_irq_handler` 序言的 `stp`，
-`sp` 指向内核自己的页表页，而 `tsk` 寄存器指向一整页全零的内存——异常是在上下文尚未建好时进入的。
-
-CI 若要在修好之前继续跑这条门禁，用 `GATE_ARGS="--allow-blocked"`：它把这一条特定的失败映射成
-`3`（跳过），既保留信号，也不假装通过。
-
-```
-make boot-linux GATE_ARGS="--allow-blocked"
-```
+本 issue 的排查方式本身是一条教训：线程里贴出过 5–6 个被下一次实测否证的结论，每次都是"测量正确、
+框定测量的假设出自我记忆"。因此本节只列事实。下一件该拿的东西是**装载后写进 RAM 的那份 FDT 的转储**
+（夹具源文件不是地面真值，它会被补丁），以及"guest 为何会把首个用栈分到自身镜像内"的正面答案。
 
 ## `--smp 4` → `nproc == 4`
 
