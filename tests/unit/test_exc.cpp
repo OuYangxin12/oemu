@@ -157,6 +157,28 @@ TEST_F(ExcTest, TakeWithIrqKindLeavesEsrAndFarAlone) {
   EXPECT_EQ(0U, sr_.far_el[OEMU_EL1]);
 }
 
+TEST_F(ExcTest, IrqEntrySavesTheConditionFlagsItInterrupted) {
+  // SPSR_ELx holds the *whole* interrupted PSTATE, condition flags included.
+  // They live in the register file rather than the sysreg bank's pstate, so
+  // entry has to fold them in by hand. Saving mode and DAIF alone handed every
+  // ERET a zeroed NZCV, and the interrupted code then branched on whatever its
+  // handler had last left in the flags: measured on issue #28, where an IRQ
+  // landing between a `cmp` and its `b.cond` silently skipped loop iterations.
+  const uint32_t flags = OEMU_NZCV_N | OEMU_NZCV_C | OEMU_NZCV_V; /* N=1 Z=0 C=1 V=1 */
+  oemu_regs_set_nzcv(&regs_, flags);
+  ASSERT_EQ(flags, oemu_regs_nzcv(&regs_));
+  ASSERT_EQ(0ULL, sr_.spsr_el[OEMU_EL1]); /* the interrupted world's SPSR is clear */
+
+  oemu_exc_take(&regs_, &sr_, OEMU_EXC_KIND_IRQ, OEMU_EL1, 0U, 0U, false);
+
+  EXPECT_EQ((uint64_t)flags, sr_.spsr_el[OEMU_EL1] & (uint64_t)OEMU_NZCV_MASK);
+  /* The masks still say masked, and the PC is in the IRQ slot: only the flags
+   * were added to the saved PSTATE, nothing else about the entry state. */
+  EXPECT_NE(0ULL, sr_.spsr_el[OEMU_EL1] &
+                      ((uint64_t)OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT));
+  EXPECT_EQ(0x8000U + 0x200U + 0x080U, regs_.pc);
+}
+
 TEST_F(ExcTest, SerrorWritesEsr) {
   const uint32_t esr = EcBase(OEMU_EXC_EC_SERROR) | kIlBit;
   oemu_exc_take(&regs_, &sr_, OEMU_EXC_KIND_SERROR, OEMU_EL1, esr, 0x6000, false);

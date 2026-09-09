@@ -108,13 +108,20 @@ void oemu_exc_take(oemu_regs *regs, oemu_sysregs *sysregs, oemu_exc_kind kind, o
    * handler in a legal one. Setting it here made every nested exception save
    * SPSR.IL = 1, so the nested handler's own ERET tripped the illegal-ERET
    * tripwire below -- an exception the guest never asked for. */
-  const uint64_t entry_pstate = oemu_pstate_mode(target) |
-                                (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT);
+  const uint64_t entry_pstate =
+      oemu_pstate_mode(target) | (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT);
   /* Bank switch first (it still sees the interrupted PSTATE as "from"), then
    * record the interrupted world in the target's banks. */
   oemu_sysregs_switch_sp(sysregs, entry_pstate);
 
-  sysregs->spsr_el[target] = old_pstate;
+  /* SPSR_ELx is the *whole* interrupted PSTATE, and the condition flags live
+   * in the register file, not in sysregs->pstate, so they are folded in by
+   * hand (masked first: a pstate adopted from a guest MSR SPSR can carry
+   * stale flag bits). Leaving NZCV out meant every ERET restored a zeroed
+   * flags field and the interrupted code branched on whatever the handler
+   * had last left in the flags (issue #28: an IRQ landing between a cmp and
+   * its b.cond skipped loop iterations and corrupted kernel state). */
+  sysregs->spsr_el[target] = (old_pstate & ~(uint64_t)OEMU_NZCV_MASK) | oemu_regs_nzcv(regs);
   /* ELR = the faulting instruction's address: callers invoke this before the
    * PC advances, so regs->pc still names it (precise-exception contract). */
   sysregs->elr_el[target] = regs->pc;
@@ -161,8 +168,12 @@ void oemu_exc_eret(oemu_regs *regs, oemu_sysregs *sysregs) {
   }
 
   /* Restore: the shared switch saves the pre-ERET SP into its bank, loads
-   * the returned-to bank, and adopts the restored PSTATE in one step. */
-  oemu_sysregs_switch_sp(sysregs, saved);
+   * the returned-to bank, and adopts the restored PSTATE in one step. The
+   * NZCV field is stripped here -- the register file owns the live flags --
+   * and applied to it separately, so the interrupted code sees its own
+   * condition flags again rather than the handler's leftovers. */
+  oemu_sysregs_switch_sp(sysregs, saved & ~(uint64_t)OEMU_NZCV_MASK);
+  oemu_regs_set_nzcv(regs, (uint32_t)(saved & OEMU_NZCV_MASK));
   regs->pc = sysregs->elr_el[cur];
 }
 
