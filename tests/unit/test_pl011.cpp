@@ -158,16 +158,21 @@ TEST_F(Pl011, TxRingDropsOldestWhenOverflowed) {
   EXPECT_EQ(6ULL, uart_.tx_dropped);             /* exactly the overflow */
 }
 
-TEST_F(Pl011, FlagsShowBusyWhileTxQueuedThenEmptyAfterPump) {
+TEST_F(Pl011, TxFlagsNeverAdvertiseBusyForAQueuedByte) {
+  /* A queued byte must not read as "FIFO full". The driver's transmit loop
+   * polls FR.TXFF and its tty room callback returns 0 when it is set, so a byte
+   * that is merely waiting for the host to drain the ring put /init's second
+   * write to sleep on tty->write_wait with nothing left to wake it -- the drain
+   * was a host-side event and raised no interrupt. The oracle's chardev drains
+   * as it writes, so FR reads TXFE with TXFF and BUSY clear even mid-burst. */
   wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE | PL011_CR_FEN);
   wr(PL011_REG_DR, 'x');
-  const uint32_t busy = rd(PL011_REG_FR);
-  EXPECT_NE(0U, busy & PL011_FR_BUSY);
-  EXPECT_EQ(0U, busy & PL011_FR_TXFE); /* queue not drained: TX not empty */
-  (void)oemu_pl011_pump(&uart_);
-  const uint32_t idle = rd(PL011_REG_FR);
-  EXPECT_NE(0U, idle & PL011_FR_TXFE); /* drained: TXFE reasserted */
-  EXPECT_EQ(0U, idle & PL011_FR_BUSY);
+  const uint32_t queued = rd(PL011_REG_FR);
+  EXPECT_NE(0U, queued & PL011_FR_TXFE);
+  EXPECT_EQ(0U, queued & PL011_FR_TXFF);
+  EXPECT_EQ(0U, queued & PL011_FR_BUSY);
+  EXPECT_EQ(1U, oemu_pl011_pump(&uart_)); /* the byte is queued, not lost */
+  EXPECT_NE(0U, rd(PL011_REG_FR) & PL011_FR_TXFE);
 }
 
 // --- RIS / interrupt state --------------------------------------------------
@@ -175,7 +180,7 @@ TEST_F(Pl011, FlagsShowBusyWhileTxQueuedThenEmptyAfterPump) {
 TEST_F(Pl011, TransmitIntStatusSetsOnDataWrite) {
   enable_no_loopback();
   wr(PL011_REG_DR, 'z');
-  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TIEM);
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TXIS);
 }
 
 TEST_F(Pl011, IntStatusWriteIsIgnored) {
@@ -189,19 +194,19 @@ TEST_F(Pl011, IntStatusWriteIsIgnored) {
 TEST_F(Pl011, IntClearRetiresTheSelectedBits) {
   enable_no_loopback();
   wr(PL011_REG_DR, 'z');
-  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TIEM);
-  wr(PL011_REG_INTCLR, PL011_INT_TIEM);
-  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_TIEM);
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TXIS);
+  wr(PL011_REG_INTCLR, PL011_INT_TXIS);
+  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_TXIS);
 }
 
 TEST_F(Pl011, IrqLevelFollowsMaskedStatus) {
   enable_no_loopback();
-  wr(PL011_REG_INTIM, PL011_INT_TIEM);        /* unmask transmit */
+  wr(PL011_REG_INTIM, PL011_INT_TXIS);        /* unmask transmit */
   EXPECT_EQ(0, oemu_pl011_irq_level(&uart_)); /* no event yet */
   wr(PL011_REG_DR, 'z');                      /* raises RIS.TIEM */
   EXPECT_EQ(1, oemu_pl011_irq_level(&uart_)); /* masked and raised: line high */
-  EXPECT_NE(0U, rd(PL011_REG_MIS) & PL011_INT_TIEM);
-  wr(PL011_REG_INTCLR, PL011_INT_TIEM);
+  EXPECT_NE(0U, rd(PL011_REG_MIS) & PL011_INT_TXIS);
+  wr(PL011_REG_INTCLR, PL011_INT_TXIS);
   EXPECT_EQ(0, oemu_pl011_irq_level(&uart_)); /* cleared: line low */
 }
 
@@ -210,9 +215,9 @@ TEST_F(Pl011, MaskedEventLeavesTheLineLow) {
   /* imsc still zero (reset): an unmasked-by-omission event raises RIS but
    * never the line. */
   wr(PL011_REG_DR, 'z');
-  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TIEM);
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TXIS);
   EXPECT_EQ(0, oemu_pl011_irq_level(&uart_));
-  EXPECT_EQ(0U, rd(PL011_REG_MIS) & PL011_INT_TIEM);
+  EXPECT_EQ(0U, rd(PL011_REG_MIS) & PL011_INT_TXIS);
 }
 
 // --- RX: injection is gated, ringed, and clears on drain --------------------
@@ -227,12 +232,33 @@ TEST_F(Pl011, InjectThenReadBackAndRetire) {
   enable_no_loopback(); /* UARTEN|TXE|RXE: the receiver is live */
   ASSERT_EQ(OEMU_OK, oemu_pl011_inject(&uart_, 'Q'));
   EXPECT_EQ(1U, uart_.rx_count);
-  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_RLIS);
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_RX);
   EXPECT_EQ(0U, rd(PL011_REG_FR) & PL011_FR_RXFE); /* a byte is waiting */
   EXPECT_EQ((uint32_t)'Q', rd(PL011_REG_DR));      /* DR read pops it */
   EXPECT_EQ(0U, uart_.rx_count);
-  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_RLIS); /* last byte read: bit retires */
-  EXPECT_NE(0U, rd(PL011_REG_FR) & PL011_FR_RXFE);   /* empty again */
+  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_RX); /* last byte read: bit retires */
+  EXPECT_NE(0U, rd(PL011_REG_FR) & PL011_FR_RXFE); /* empty again */
+}
+
+TEST_F(Pl011, ReceivedByteRaisesTheBitTheDriverMasksFor) {
+  /* The regression the missing SHELL_ALIVE marker came from: a received byte has
+   * to assert RXIS (bit 4), which is the bit the driver masks (RXIM) and the bit
+   * its ISR dispatches on. Raising bit 0 instead -- which reads as an RI
+   * modem-status change -- let the ISR take the modem branch and throw the byte
+   * away, so a fed keystroke never reached the guest while every other RX
+   * assertion still passed. */
+  enable_no_loopback();
+  wr(PL011_REG_INTIM, PL011_INT_RXIS | PL011_INT_RTIS); /* the driver's mask */
+  ASSERT_EQ(OEMU_OK, oemu_pl011_inject(&uart_, 'e'));
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_RXIS);
+  EXPECT_NE(0U, rd(PL011_REG_MIS) & PL011_INT_RXIS);
+  /* A byte below the trigger level also raises receive timeout: that is the
+   * interrupt a driver waiting for one typed character actually gets. */
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_RTIS);
+  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_RIMIS); /* bit 0 is RI: it stays quiet on RX */
+  EXPECT_EQ(1, oemu_pl011_irq_level(&uart_));         /* the GIC line really moves */
+  wr(PL011_REG_INTCLR, PL011_INT_RX);
+  EXPECT_EQ(0, oemu_pl011_irq_level(&uart_));
 }
 
 TEST_F(Pl011, InjectFillsTheRingThenRefuses) {
@@ -300,11 +326,11 @@ TEST_F(Pl011, IntMaskIsWrittenWhole) {
    * whole IMSC in one access. A write therefore overwrites the mask, it does
    * not accumulate -- the earlier model's phantom SET/CLR registers were not
    * part of the real register file. */
-  wr(PL011_REG_INTIM, PL011_INT_RLIS);
-  EXPECT_EQ(PL011_INT_RLIS, rd(PL011_REG_INTIM) & PL011_INT_RLIS);
-  wr(PL011_REG_INTIM, PL011_INT_TIEM); /* whole-mask overwrite */
-  EXPECT_EQ(0U, rd(PL011_REG_INTIM) & PL011_INT_RLIS);
-  EXPECT_NE(0U, rd(PL011_REG_INTIM) & PL011_INT_TIEM);
+  wr(PL011_REG_INTIM, PL011_INT_RX);
+  EXPECT_EQ(PL011_INT_RX, rd(PL011_REG_INTIM) & PL011_INT_RX);
+  wr(PL011_REG_INTIM, PL011_INT_TXIS); /* whole-mask overwrite */
+  EXPECT_EQ(0U, rd(PL011_REG_INTIM) & PL011_INT_RX);
+  EXPECT_NE(0U, rd(PL011_REG_INTIM) & PL011_INT_TXIS);
 }
 
 TEST_F(Pl011, SinklessPumpStillDrainsAndCounts) {
