@@ -345,4 +345,26 @@ TEST_F(ExcTest, EcNamesAreStableAndNeverNull) {
   EXPECT_STREQ("unknown", oemu_exc_ec_name(static_cast<oemu_exc_ec>(0x3FU)));
 }
 
+TEST_F(ExcTest, TakingAnInterruptAtEl1hStoresTheFrameOnTheLiveStack) {
+  // PSTATE.SP=1 at EL1 makes SP_EL1 the active stack, so an exception entry must
+  // keep using the SP the guest last moved and must not resurrect a stale bank
+  // copy. On the M5 boot the raw sp_el[OEMU_EL1] slot kept holding the boot
+  // stack (0x4ffffff0) long after the kernel had moved to a task stack, which
+  // looks alarming in a trace: it is benign only because the entry path keeps
+  // the live SP (asserted below) and because the guest cannot read SP_EL1 at
+  // EL1 to notice (MRS SP_EL1 is Undefined below EL2, so it never reaches the
+  // stale slot either).
+  oemu_regs_set_sp(&regs_, 0x41000000ULL);
+  sr_.sp_el[OEMU_EL1] = 0x4ffffff0ULL;
+  oemu_exc_take(&regs_, &sr_, OEMU_EXC_KIND_IRQ, OEMU_EL1, 0U, 0U, false);
+  EXPECT_EQ(0x8300U, regs_.pc);  // IRQ slot of the same-EL group, not System error
+  EXPECT_EQ(0x41000000ULL, oemu_regs_sp(&regs_));
+  EXPECT_EQ(0x1000U, sr_.elr_el[OEMU_EL1]);
+  // Crossing into another bank and back deposits the live value, so the slot is
+  // refreshed rather than left as whatever the boot path stored there.
+  oemu_sysregs_switch_sp(&sr_, OEMU_PSTATE_M_EL0T);
+  oemu_sysregs_switch_sp(&sr_, OEMU_PSTATE_M_EL1H);
+  EXPECT_EQ(0x41000000ULL, sr_.sp_el[OEMU_EL1]);
+}
+
 }  // namespace
