@@ -352,3 +352,31 @@ TEST_F(SysregTest, NameIsNeverNull) {
 }
 
 }  // namespace
+
+TEST_F(SysregTest, FpStatusRegistersAreModelledAndThirtyTwoBitsWide) {
+  // FPCR/FPSR are not optional here: 6.6's fpsimd_load_state / fpsimd_save_state
+  // run on every return to user mode and issue `mrs x0, fpcr` / `msr fpcr, x8`
+  // unconditionally, because system_supports_fpsimd() is merely
+  // !have_cpucap(ARM64_HAS_NO_FPSIMD) and that cap is a dummy nothing can set.
+  // Refusing the selectors therefore kills /init before it prints a byte.
+  uint64_t value = 0U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_FPCR, &value));
+  EXPECT_EQ(value, 0U);                 /* both reset to zero, as the oracle's A53 shows */
+  ASSERT_EQ(OEMU_SYSREG_FPCR, 0x1a20U); /* the selector the guest actually emits */
+  ASSERT_EQ(OEMU_SYSREG_FPSR, 0x1a21U);
+  // Only the low 32 bits exist; the write mask is the architecture's, not ours.
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_FPCR, UINT64_C(0xFFFF0000FF00FFFF)));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_FPCR, &value));
+  EXPECT_EQ(value, UINT64_C(0xFF00FFFF));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_FPSR, UINT64_C(0x100000001)));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_FPSR, &value));
+  EXPECT_EQ(value, 1U);
+  // And they are EL0-accessible, which is what makes `msr fpcr` from a freestanding
+  // /init (or a kernel running at EL1 with EL1FFI... nothing) legal.
+  oemu_sysregs el0{};
+  oemu_regs regs0{};
+  BootAt(&el0, &regs0, OEMU_EL0, 0x2000U);
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&el0, OEMU_SYSREG_FPCR, 0x8U));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&el0, OEMU_SYSREG_FPCR, &value));
+  EXPECT_EQ(value, 8U);
+}

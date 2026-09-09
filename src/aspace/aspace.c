@@ -40,6 +40,8 @@ static unsigned size_to_bytes(oemu_mem_size size) {
       return 4;
     case OEMU_MEM_DWORD:
       return 8;
+    case OEMU_MEM_128:
+      return 16; /* the vector pair path splits this into two 8-byte pieces */
     default:
       return 0;
   }

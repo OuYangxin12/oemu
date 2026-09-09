@@ -387,9 +387,11 @@ TEST_F(AspaceTest, AccessRejectsNullBusBadSizeAndNullValueOut) {
             OEMU_ERR_INVALID_ARG);
   EXPECT_EQ(oemu_aspace_read(&as_, kRam, OEMU_MEM_WORD, false, nullptr), OEMU_ERR_INVALID_ARG);
   /* The size selector is an unguarded uint8_t off the instruction word, so a
-   * non-encoding (4..7) must still be refused. Feeding it through an int keeps
-   * the literal out of -Wconversion, which would call the cast itself UB. */
-  const int bad_sizes[] = {4, 7};
+   * non-encoding (5..7) must still be refused. Four is the 128-bit transfer the
+   * SIMD pair group asks for and is defined; 0..3 stay the scalar encodings.
+   * Feeding these through an int keeps the literal out of -Wconversion, which
+   * would call the cast itself UB. */
+  const int bad_sizes[] = {5, 7};
   EXPECT_EQ(
       oemu_aspace_read(&as_, kRam, static_cast<oemu_mem_size>(bad_sizes[0]), false, &value),
       OEMU_ERR_INVALID_ARG); /* not one of the four encodings */

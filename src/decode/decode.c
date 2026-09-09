@@ -1143,8 +1143,20 @@ static oemu_status decode_ldst_imm_unscaled(uint32_t word, oemu_insn *insn) {
       insn->index_mode = OEMU_INDEX_PRE;
       break;
     default:
-      /* form == 2 is the unprivileged LDTR/STTR family. */
-      return OEMU_ERR_UNSUPPORTED;
+      /* form == 2, the unprivileged family: LDTR/STTR (and the sign-extending
+       * LDTRSB/LDTRSH/LDTRSW variants). Same addressing as the forms above --
+       * a signed 9-bit offset that is never scaled, no writeback -- so the
+       * only difference is the access permission class. oemu models neither
+       * PAN nor UAO nor ATOM, and from EL1 with TCR_EL1.TCF=0 an unprivileged
+       * access is exactly a normal one, so it decodes the same way. Refusing
+       * these instead is what killed init in issue #27: the kernel reaches for
+       * `sttr` whenever PAN is absent, and Linux boots with PAN absent, so
+       * every load_elf_binary that copies a string to a user stack died on the
+       * first `user_st64` -- a single `sttr x3, [x6]` between the kernel and a
+       * shell. If PAN ever gets modelled, revisit this together with the
+       * unprivileged fault class it should raise. */
+      insn->index_mode = OEMU_INDEX_NONE;
+      break;
   }
 
   insn->rd = field_rd(word);
@@ -1185,6 +1197,59 @@ static oemu_status decode_ldst_reg_offset(uint32_t word, oemu_insn *insn) {
   /* S selects whether the index is scaled by the access size. */
   insn->shift_amount = (BIT(word, 12) != 0U) ? (unsigned)size : 0U;
   insn->extend_is_lsl = (option == 0x3U); /* UXTX with a 64-bit index is an LSL */
+  insn->rn_is_sp_form = true;
+  return OEMU_OK;
+}
+
+/*
+ * LDP/STP for the SIMD&FP group (V=1): the same fields and the same four index
+ * forms as the general-register pair accesses, with opc selecting the element
+ * width -- 0 the two-S form, 1 the two-D form, 2 the two-Q form; 1 and 3 are
+ * unallocated, since LDPSW has no vector spelling.
+ *
+ * These are not a luxury: arch/arm64/kernel/fpsimd.c's fpsimd_load_state and
+ * fpsimd_save_state are nothing but `ldp q0, q1, [x0]`-style pairs plus MRS/MSR
+ * of FPCR/FPSR, and Linux 6.6 runs them on every return to and switch out of
+ * userspace. Refusing them costs the boot its first init.
+ */
+static oemu_status decode_ldst_pair_vector(uint32_t word, oemu_insn *insn) {
+  const uint32_t opc = BITS(word, 30, 2);
+  const bool is_load = BIT(word, 22) != 0U;
+  const uint32_t form = BITS(word, 23, 2);
+
+  if (opc == 0x3U) {
+    return OEMU_ERR_DECODE;
+  }
+
+  insn->is_vector = true;
+  insn->op = is_load ? OEMU_OP_LDP : OEMU_OP_STP;
+  insn->mem_size =
+      (opc == 0x0U) ? OEMU_MEM_WORD : ((opc == 0x1U) ? OEMU_MEM_DWORD : OEMU_MEM_128);
+
+  switch (form) {
+    case 0x1:
+      insn->index_mode = OEMU_INDEX_POST;
+      break;
+    case 0x2:
+      insn->index_mode = OEMU_INDEX_NONE;
+      break;
+    case 0x3:
+      insn->index_mode = OEMU_INDEX_PRE;
+      break;
+    default:
+      /* form 0: the non-temporal pair LDNP/STNP, advice about the cache only. */
+      insn->index_mode = OEMU_INDEX_NONE;
+      break;
+  }
+
+  insn->rd = field_rd(word);
+  insn->rn = field_rn(word);
+  insn->rt2 = BITS(word, 10, 5);
+  insn->operand_kind = OEMU_OPERAND_MEM;
+  /* The 7-bit immediate is signed and scaled by the transfer size. */
+  insn->imm = oemu_decode_internal_sign_extend(BITS(word, 15, 7), 7U) *
+              (int64_t)(UINT64_C(1) << (unsigned)insn->mem_size);
+  insn->uimm = (uint64_t)insn->imm;
   insn->rn_is_sp_form = true;
   return OEMU_OK;
 }
@@ -1308,12 +1373,20 @@ static oemu_status decode_ldst_exclusive(uint32_t word, oemu_insn *insn) {
 }
 
 static oemu_status decode_load_store(uint32_t word, uint64_t pc, oemu_insn *insn) {
-  /* Bit 31 clear together with the SIMD selector marks the vector forms. */
-  if (BIT(word, 26) != 0U) {
-    return OEMU_ERR_UNSUPPORTED; /* SIMD load/store */
-  }
-
   const uint32_t op0 = BITS(word, 28, 2);
+
+  /* The SIMD selector. Of the vector load/store space only the pair accesses
+   * are decoded, because those are all the kernel's FP state save and restore
+   * is made of -- see decode_ldst_pair_vector. Everything else (single
+   * element, multiple structure, element-against-element) stays outside the
+   * emulated subset, and saying so keeps `ldr q0, [x0]` a clean refusal
+   * rather than a mis-decoded general-register access. */
+  if (BIT(word, 26) != 0U) {
+    if ((op0 == 0x2U) && (BITS(word, 25, 1) == 0U)) {
+      return decode_ldst_pair_vector(word, insn);
+    }
+    return OEMU_ERR_UNSUPPORTED;
+  }
 
   if (op0 == 0x0U) {
     /* Exclusive and ordered accesses. */

@@ -988,11 +988,17 @@ TEST_F(ExecTest, SysregWhitelistRoundTrips) {
 }
 
 TEST_F(ExecTest, SysregRefusalsAndUnsupportedEncodings) {
-  program({0xd53b4400U}); /* mrs x0,fpcr : outside the whitelist */
-  set_x(0, 0xAAU);
+  program({0xd538cc03U}); /* mrs x3,icc_iar1_el1: the GICv2 CPU interface is
+                             system-register state we do not model yet, and the
+                             answer must be an Undefined instruction, not a
+                             silent zero that the guest would EOI as spurious */
+  set_x(3, 0xAAU);
   EXPECT_EQ(step(), OEMU_ERR_UNSUPPORTED);
-  EXPECT_EQ(x(0), 0xAAU); /* a refusal must not touch the destination */
-  program({0xd51b4400U}); /* msr fpcr,x0 */
+  EXPECT_EQ(x(3), 0xAAU); /* a refusal must not touch the destination */
+  program({0xd518cc23U}); /* msr icc_eoir1_el1,x3 */
+  oemu_regs_set_pc(&cpu_.regs, kText);
+  EXPECT_EQ(step(), OEMU_ERR_UNSUPPORTED);
+  program({0x3dc00020U}); /* ldr q0,[x1]: a scalar SIMD load, still unsupported */
   oemu_regs_set_pc(&cpu_.regs, kText);
   EXPECT_EQ(step(), OEMU_ERR_UNSUPPORTED);
   program({0xd53800a0U}); /* mrs x0,mpidr_el1 : an EL1 register */
@@ -1102,3 +1108,65 @@ TEST_F(ExecTest, MovWideAssemblersMatchTheExpectedBitPattern) {
 }
 
 }  // namespace
+
+TEST_F(ExecTest, UnscaledOffsetAccesses) {
+  /* LDTR/STTR (issue #27): the offset is signed and unscaled, the register is
+   * never written back, and the access is the plain one the base alone names. */
+  store64(kData, UINT64_C(0x1122334455667788));
+  program({0xb8404820U}); /* ldtr w0, [x1, #4] */
+  set_x(1, kData);
+  step_ok(1);
+  EXPECT_EQ(x(0), 0x11223344U); /* the high word of the stored qword, unsigned */
+  program({0xf81f8822U});       /* sttr x2, [x1, #-8] */
+  set_x(2, UINT64_C(0xDEADBEEFCAFEBABE));
+  set_x(1, kData + 8U);
+  step_ok(1);
+  EXPECT_EQ(load64(kData), UINT64_C(0xDEADBEEFCAFEBABE));
+  EXPECT_EQ(x(1), kData + 8U); /* and no writeback */
+  program({0x385f8023U});      /* ldurb w3, [x1, #-8]: the sibling form, still plain */
+  set_x(1, kData + 8U);
+  step_ok(1);
+  EXPECT_EQ(x(3), 0xBEU); /* the byte the sttr above left at kData */
+}
+
+TEST_F(ExecTest, VectorPairLoadStoreRoundTrip) {
+  store64(kData, UINT64_C(0xAAAAAAAAAAAAAAAA));
+  store64(kData + 8U, UINT64_C(0xBBBBBBBBBBBBBBBB));
+  store64(kData + 16U, UINT64_C(0xCCCCCCCCCCCCCCCC));
+  store64(kData + 24U, UINT64_C(0xDDDDDDDDDDDDDDDD));
+  program({0xad400420U}); /* ldp q0, q1, [x1] : 16 bytes and stride 16 each */
+  set_x(1, kData);
+  step_ok(1);
+  uint64_t lo = 0U;
+  uint64_t hi = 0U;
+  ASSERT_EQ(oemu_vec_read(&cpu_, 0U, &lo, &hi), OEMU_OK);
+  EXPECT_EQ(lo, UINT64_C(0xAAAAAAAAAAAAAAAA));
+  EXPECT_EQ(hi, UINT64_C(0xBBBBBBBBBBBBBBBB));
+  ASSERT_EQ(oemu_vec_read(&cpu_, 1U, &lo, &hi), OEMU_OK);
+  EXPECT_EQ(lo, UINT64_C(0xCCCCCCCCCCCCCCCC));
+  EXPECT_EQ(hi, UINT64_C(0xDDDDDDDDDDDDDDDD));
+  program({0xad810420U}); /* stp q0, q1, [x1, #32]! */
+  set_x(1, kData);
+  step_ok(1);
+  EXPECT_EQ(load64(kData + 32U), UINT64_C(0xAAAAAAAAAAAAAAAA));
+  EXPECT_EQ(load64(kData + 40U), UINT64_C(0xBBBBBBBBBBBBBBBB));
+  EXPECT_EQ(x(1), kData + 32U); /* pre-index writeback of the base */
+  store64(kData + 16U, UINT64_C(0xCCCCCCCCCCCCCCCC));
+  store64(kData + 24U, UINT64_C(0xDDDDDDDDDDDDDDDD));
+  ASSERT_EQ(
+      oemu_vec_write(&cpu_, 4U, UINT64_C(0xFFFFFFFFFFFFFFFF), UINT64_C(0xFFFFFFFFFFFFFFFF)),
+      OEMU_OK);
+  program({0x2d421424U}); /* ldp s4, s5, [x1, #16] : single precision zeroes the
+                             upper 96 bits of both registers, as the
+                             architecture requires */
+  set_x(1, kData);
+  step_ok(1);
+  ASSERT_EQ(oemu_vec_read(&cpu_, 4U, &lo, &hi), OEMU_OK);
+  EXPECT_EQ(lo, UINT64_C(0x00000000CCCCCCCC));
+  EXPECT_EQ(hi, 0U);
+  program({0x6d3e1c26U}); /* stp d6, d7, [x1, #-32] : only eight bytes each */
+  set_x(1, kData + 64U);
+  step_ok(1);
+  EXPECT_EQ(load64(kData + 32U), 0U);
+  EXPECT_EQ(load64(kData + 40U), 0U); /* q6/q1 never stored anything there */
+}

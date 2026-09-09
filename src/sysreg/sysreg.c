@@ -551,6 +551,20 @@ static const oemu_sysreg_row k_rows[] = {
      .reset_value = 0,
      .get = get_daif,
      .set = set_daif},
+    {.name = "FPCR",
+     .sel = OEMU_SYSREG_FPCR,
+     .min_el = OEMU_EL0,
+     .flags = OEMU_SYSREG_F_NONE,
+     .offset = offsetof(oemu_sysregs, fpcr),
+     .write_mask = UINT64_C(0xFFFFFFFF),
+     .reset_value = 0},
+    {.name = "FPSR",
+     .sel = OEMU_SYSREG_FPSR,
+     .min_el = OEMU_EL0,
+     .flags = OEMU_SYSREG_F_NONE,
+     .offset = offsetof(oemu_sysregs, fpsr),
+     .write_mask = UINT64_C(0xFFFFFFFF),
+     .reset_value = 0},
     {.name = "PMUSERENR_EL0",
      .sel = OEMU_SYSREG_PMUSERENR_EL0,
      .min_el = OEMU_EL0,
@@ -614,6 +628,15 @@ static const oemu_sysreg_row k_rows[] = {
      * privileged CNTP_* / CNTVOFF views land in the same 0x1f__ band as the
      * EL0 counter views (CNTKCTL_EL1 alone keeps its low 0x07__ slot). Values
      * are read straight out of vmlinux, never from an alias table. */
+    /* FPCR/FPSR: the two FP status registers, and they are not optional for a
+     * modern Linux. 6.6's fpsimd_load_state/fpsimd_save_state run on every
+     * return to user mode and issue `mrs x0, fpcr` / `msr fpcr, x8`
+     * unconditionally -- system_supports_fpsimd() is !have_cpucap(ARM64_HAS_
+     * NO_FPSIMD), and that cap is a dummy nothing can set -- so refusing these
+     * selectors traps an Undefined instruction inside the return-to-user path
+     * and the guest dies before /init ever starts. Both are EL0-accessible,
+     * both are 32-bit wide (the write mask is the architecture's, not ours),
+     * and both reset to zero, which is what the oracle's Cortex-A53 shows. */
     {.name = "CNTVOFF_EL1",
      .sel = OEMU_SYSREG_CNTVOFF_EL1,
      .min_el = OEMU_EL1,

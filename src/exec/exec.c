@@ -46,6 +46,8 @@ static uint64_t read_g(const oemu_cpu *cpu, unsigned n, bool sp_form, oemu_reg_w
                  : oemu_regs_read(&cpu->regs, n, width);
 }
 
+static oemu_status do_pair_vector(oemu_cpu *cpu, const oemu_memops *mem, const oemu_insn *in);
+
 static void write_g(oemu_cpu *cpu, unsigned n, bool sp_form, oemu_reg_width width,
                     uint64_t value) {
   if (sp_form) {
@@ -344,7 +346,7 @@ static void note_store(oemu_cpu *cpu, uint64_t addr, uint64_t nbytes) {
   }
 }
 
-static oemu_status do_mrs(oemu_cpu *cpu, const oemu_insn *in) {
+static oemu_status do_mrs(oemu_cpu *cpu, const oemu_sysregs *sr, const oemu_insn *in) {
   const uint32_t sel = in->sysreg & SYSREG_MASK;
   uint64_t value;
   switch (sel) {
@@ -364,15 +366,22 @@ static oemu_status do_mrs(oemu_cpu *cpu, const oemu_insn *in) {
       value = 0U; /* read-only, and nothing here sets it */
       break;
     default:
-      /* CurrentEL and every other register: at EL0 there is nothing honest to
-       * return except a refusal. */
-      return OEMU_ERR_UNSUPPORTED;
+      /* Everything else -- FPCR/FPSR, the counters, the ID registers -- is the
+       * sysreg table's business, and the table is where accessibility is
+       * decided: a row that does not exist, or one whose min_el is above the
+       * current EL, or a read-only row answers with a refusal, which is the
+       * architecturally right answer (an Undefined instruction) and is what the
+       * old flat whitelist did by hand for the five registers it knew. */
+      if ((sr == NULL) || (oemu_sysreg_read(sr, sel, &value) != OEMU_OK)) {
+        return OEMU_ERR_UNSUPPORTED;
+      }
+      break;
   }
   write_g(cpu, in->rd, false, OEMU_REG_W64, value);
   return OEMU_OK;
 }
 
-static oemu_status do_msr(oemu_cpu *cpu, const oemu_insn *in) {
+static oemu_status do_msr(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_insn *in) {
   const uint32_t sel = in->sysreg & SYSREG_MASK;
   const uint64_t value = read_g(cpu, in->rd, false, OEMU_REG_W64);
   switch (sel) {
@@ -385,8 +394,15 @@ static oemu_status do_msr(oemu_cpu *cpu, const oemu_insn *in) {
     case SYSREG_TPIDRUR_EL0:
       cpu->tpidrur_el0 = value;
       break;
-    default: /* TPIDRRO_EL0 is read-only; the rest are outside the subset */
-      return OEMU_ERR_UNSUPPORTED;
+    default:
+      /* The same fall-through as the read side: FPCR/FPSR and every other
+       * writable row the table carries, with the table's own write mask,
+       * min_el and read-only verdicts applied. TPIDRRO_EL0 has no row, so it
+       * still refuses. */
+      if ((sr == NULL) || (oemu_sysreg_write(sr, sel, value) != OEMU_OK)) {
+        return OEMU_ERR_UNSUPPORTED;
+      }
+      break;
   }
   return OEMU_OK;
 }
@@ -462,6 +478,65 @@ static oemu_status do_pair(oemu_cpu *cpu, const oemu_memops *mem, const oemu_ins
     access_or_panic(mem->read(mem->ctx, addr2, in->mem_size, in->is_signed_load, &v2));
     write_g(cpu, in->rd, false, in->width, v1);
     write_g(cpu, in->rt2, false, in->width, v2);
+  }
+  if (in->index_mode != OEMU_INDEX_NONE) {
+    write_g(cpu, in->rn, true, OEMU_REG_W64, writeback);
+  }
+  return OEMU_OK;
+}
+
+/*
+ * LDP/STP over V0-V31: two registers, each `stride` bytes apart, where the
+ * stride is the transfer size -- 4 for the S form, 8 for D, 16 for Q. A
+ * 128-bit register is moved as two 64-bit bus accesses, so nothing new reaches
+ * the bus, the MMU or a device; a narrower form writes the low bits and
+ * clears the rest of the destination, which is what the architecture requires
+ * rather than an optimisation.
+ */
+static oemu_status do_pair_vector(oemu_cpu *cpu, const oemu_memops *mem, const oemu_insn *in) {
+  uint64_t addr = 0U;
+  uint64_t writeback = 0U;
+  (void)resolve_mem_addr(cpu, in, &addr, &writeback);
+  const oemu_mem_size piece = (in->mem_size == OEMU_MEM_128) ? OEMU_MEM_DWORD : in->mem_size;
+  const uint64_t stride = UINT64_C(1) << (unsigned)in->mem_size;
+  const unsigned pieces = (in->mem_size == OEMU_MEM_128) ? 2U : 1U;
+  const uint64_t bytes = (stride < 8U) ? stride : 8U; /* the two-S form moves 4 */
+  const bool is_store = (in->op == OEMU_OP_STP);
+  const uint32_t perm = is_store ? OEMU_PERM_WRITE : OEMU_PERM_READ;
+
+  /* Every piece of both registers is validated first, so an abort leaves the
+   * pair, the register file and the base register untouched. */
+  for (unsigned r = 0U; r < 2U; r++) {
+    for (unsigned p = 0U; p < pieces; p++) {
+      if (mem->validate(mem->ctx, addr + r * stride + p * 8U, bytes, perm) != OEMU_OK) {
+        return OEMU_ERR_FAULT;
+      }
+    }
+  }
+
+  for (unsigned r = 0U; r < 2U; r++) {
+    const unsigned reg = (r == 0U) ? in->rd : in->rt2;
+    const uint64_t a = addr + r * stride;
+    uint64_t lo = 0U;
+    uint64_t hi = 0U;
+    if (is_store) {
+      lo = cpu->v[reg][0];
+      hi = cpu->v[reg][1];
+      access_or_panic(mem->write(mem->ctx, a, piece, lo));
+      if (pieces == 2U) {
+        access_or_panic(mem->write(mem->ctx, a + 8U, OEMU_MEM_DWORD, hi));
+      }
+    } else {
+      access_or_panic(mem->read(mem->ctx, a, piece, false, &lo));
+      if (pieces == 2U) {
+        access_or_panic(mem->read(mem->ctx, a + 8U, OEMU_MEM_DWORD, false, &hi));
+      }
+      cpu->v[reg][0] = lo; /* a sub-128-bit transfer zeroes the rest */
+      cpu->v[reg][1] = hi;
+    }
+  }
+  if (is_store) {
+    note_store(cpu, addr, stride * 2U);
   }
   if (in->index_mode != OEMU_INDEX_NONE) {
     write_g(cpu, in->rn, true, OEMU_REG_W64, writeback);
@@ -1387,6 +1462,8 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       break;
     case OEMU_OP_LDP:
     case OEMU_OP_STP:
+      st = in->is_vector ? do_pair_vector(cpu, mem, in) : do_pair(cpu, mem, in);
+      break;
     case OEMU_OP_LDPSW:
       st = do_pair(cpu, mem, in);
       break;
@@ -1419,10 +1496,13 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
     case OEMU_OP_BARRIER:
       break; /* architecturally observable: nothing happens */
     case OEMU_OP_MRS:
-      st = do_mrs(cpu, in);
+      /* The user-mode path has no sysreg state to consult -- no oemu_sysregs at
+       * all -- so it hands down a null table and keeps the old refusal for every
+       * selector outside its five. */
+      st = do_mrs(cpu, NULL, in);
       break;
     case OEMU_OP_MSR:
-      st = do_msr(cpu, in);
+      st = do_msr(cpu, NULL, in);
       break;
     case OEMU_OP_MSR_IMM:
       /* The user-mode subset does not touch privileged mode bits; system mode
@@ -1471,6 +1551,10 @@ oemu_status oemu_cpu_init(oemu_cpu *cpu, uint64_t entry_pc, uint64_t initial_sp)
   cpu->monitor_size = 0U;
   cpu->monitor_valid = false;
   cpu->tpidrur_el0 = 0U;
+  for (unsigned i = 0U; i < 32U; i++) {
+    cpu->v[i][0] = 0U;
+    cpu->v[i][1] = 0U;
+  }
   return OEMU_OK;
 }
 
@@ -1550,4 +1634,27 @@ oemu_status oemu_exec_run(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env, uin
   const oemu_env_ops environment = oemu_sysenv_envops(env);
   return oemu_exec_run_bus(cpu, &bus, (env != NULL) ? &environment : NULL, max_insns,
                            completed_out);
+}
+
+oemu_status oemu_vec_read(const oemu_cpu *cpu, unsigned n, uint64_t *lo, uint64_t *hi) {
+  OEMU_REQUIRE(cpu != NULL, "NULL cpu in oemu_vec_read");
+  if ((lo == NULL) || (hi == NULL)) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  if (n >= OEMU_VEC_REGS) {
+    return OEMU_ERR_INVALID_ARG; /* there is no register 32 to read */
+  }
+  *lo = cpu->v[n][0];
+  *hi = cpu->v[n][1];
+  return OEMU_OK;
+}
+
+oemu_status oemu_vec_write(oemu_cpu *cpu, unsigned n, uint64_t lo, uint64_t hi) {
+  OEMU_REQUIRE(cpu != NULL, "NULL cpu in oemu_vec_write");
+  if (n >= OEMU_VEC_REGS) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  cpu->v[n][0] = lo;
+  cpu->v[n][1] = hi;
+  return OEMU_OK;
 }

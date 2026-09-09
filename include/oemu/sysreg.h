@@ -39,7 +39,12 @@
  * TLB maintenance plus the MMU control semantics of SCTLR/TTBR/TCR/MAIR (M3
  * stores them but does not yet honour them), MDSCR_EL1 (required before a
  * Linux guest, which writes it during early boot), and FP/SIMD state --
- * FPCR/FPSR have no row on purpose, so FP access reads as Undefined, matching
+ * FPCR and FPSR do have rows (M5): Linux 6.6 restores FP state with
+ * `mrs x0, fpcr` / `msr fpsr, x8` on every return to user mode, and the vector
+ * register file they belong to is what makes an /init able to run. No FP
+ * arithmetic is modelled, so nothing reads them back except the guest itself.
+ *
+ * Before that, FPCR/FPSR had no row on purpose, so FP access read as Undefined, matching
  * ID_AA64PFR0 advertising no FP/SIMD (roadmap D7).
  */
 #ifndef OEMU_SYSREG_H
@@ -135,7 +140,10 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
 /* Debug System Control: the kernel clears it at boot (disable debug events)
  * and never reads it back, so oemu models it RAZ/WI rather than faulting on
  * a legal EL1 access it does not otherwise model. */
-#define OEMU_SYSREG_MDSCR_EL1        ((uint32_t)0x0012)
+#define OEMU_SYSREG_MDSCR_EL1 ((uint32_t)0x0012)
+/* FP control and status, the two the kernel's fpsimd save/restore touches. */
+#define OEMU_SYSREG_FPCR             ((uint32_t)0x1a20)
+#define OEMU_SYSREG_FPSR             ((uint32_t)0x1a21)
 #define OEMU_SYSREG_ID_AA64PFR0_EL1  ((uint32_t)0x0020)
 #define OEMU_SYSREG_ID_AA64DFR0_EL1  ((uint32_t)0x0028)
 #define OEMU_SYSREG_ID_AA64ISAR0_EL1 ((uint32_t)0x0030)
@@ -323,6 +331,8 @@ typedef struct oemu_sysregs {
   uint64_t amair_el1;
   uint64_t contextidr_el1;
   uint64_t cpacr_el1;
+  uint64_t fpcr; /* FP control: RES0 above bit 31, so that is the write mask */
+  uint64_t fpsr; /* FP status: flags and the quiescent bit, same width rule */
   uint64_t tpidr_el1;
   uint64_t tpidr_el0;   /* user thread ID, RW at EL0 */
   uint64_t tpidrro_el0; /* user read-only ID; oemu models writes as Undefined
