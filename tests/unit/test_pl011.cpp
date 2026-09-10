@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 
 #include "dev/pl011_internal.h"
+#include "oemu/gicv2.h"
 #include "oemu/pl011.h"
 
 namespace {
@@ -33,6 +34,19 @@ constexpr uint64_t kRamBase = 0x40000000ULL;
 constexpr uint64_t kRamSize = 0x00010000ULL; /* 64 KiB: plenty, we never touch RAM */
 constexpr uint64_t kUart = 0x09000000ULL;
 constexpr uint64_t kUartSize = 0x1000ULL;
+
+/* A distributor to hand the console's interrupt to, and the handful of its
+ * registers this test touches. Offsets are the GICv2 TRM's, spelled as literals
+ * for the same reason the UART's are: this suite reads the bus, not the model. */
+constexpr uint64_t kGicDist = 0x08000000ULL;
+constexpr uint64_t kGicCpu = 0x08010000ULL;
+constexpr uint64_t kGicSize = 0x10000ULL;
+constexpr uint64_t GICD_CTL = 0x000U;        /* bit0: distributor enable */
+constexpr uint64_t GICD_ISENABLER0 = 0x100U; /* word n -> lines 32n..32n+31 */
+constexpr uint64_t GICC_CTLR = 0x000U;       /* bit0: CPU interface enable */
+constexpr uint64_t GICC_PMR = 0x004U;        /* drop lines at or above this */
+constexpr uint64_t GICC_IAR = 0x00CU;        /* acknowledge: reads the id */
+constexpr unsigned kConsoleIrq = 33U;        /* /pl011@9000000's SPI */
 
 /* A sink that appends every emitted byte, so TX order is observable. */
 std::vector<unsigned char> g_sink;
@@ -69,6 +83,47 @@ class Pl011 : public ::testing::Test {
   oemu_machine machine_{};
   oemu_pl011 uart_{};
 };
+
+// --- the console's promise to the interrupt controller ----------------------
+
+// The seam the whole interactive console hangs on, and which no component test
+// covers: the byte is in the device, the run loop copies the device's level into
+// the distributor once a slice, and the CPU is therefore holding interrupt 33 --
+// with the routing left at its reset value, because a driver with no reason to move
+// an affinity will not move it. The device and the controller each had tests of
+// their own; the *composition* is what measured `device=1 gic=0` for hours and
+// turned a received keystroke into silence, so the composition is what is asserted
+// here. The one `set_pending` call below is exactly what the boot loop does.
+TEST_F(Pl011, AReceivedByteEndsUpPendingOnTheCpu) {
+  oemu_gicv2 gic;
+  oemu_gicv2_init(&gic, 64U);
+  ASSERT_EQ(OEMU_OK,
+            oemu_aspace_attach_device(&machine_.aspace, kGicDist, kGicSize, &gic.dist_ops));
+  ASSERT_EQ(OEMU_OK,
+            oemu_aspace_attach_device(&machine_.aspace, kGicCpu, kGicSize, &gic.cpu_ops));
+  const auto gic_wr = [&](uint64_t reg, uint32_t v) {
+    EXPECT_EQ(OEMU_OK, oemu_aspace_write(&machine_.aspace, reg, OEMU_MEM_WORD, v));
+  };
+  const auto gic_rd = [&](uint64_t reg) {
+    uint64_t v = 0xDEADBEEFULL;
+    EXPECT_EQ(OEMU_OK, oemu_aspace_read(&machine_.aspace, reg, OEMU_MEM_WORD, false, &v));
+    return (uint32_t)v;
+  };
+  // The driver's opening state: receiver on, RX and RX-timeout interrupts unmasked.
+  enable_no_loopback();
+  wr(PL011_REG_INTIM, PL011_INT_RX);
+  gic_wr(kGicCpu + GICC_PMR, 0xFFU);
+  gic_wr(kGicCpu + GICC_CTLR, 1U);
+  gic_wr(kGicDist + GICD_CTL, 1U);
+  gic_wr(kGicDist + GICD_ISENABLER0 + 4U, 1U << (kConsoleIrq % 32U)); /* enable 33 */
+
+  ASSERT_EQ(OEMU_OK, oemu_pl011_inject(&uart_, 'e'));
+  EXPECT_NE(0, oemu_pl011_irq_level(&uart_)); /* the device raised its line */
+
+  oemu_gicv2_set_pending(&gic, kConsoleIrq, oemu_pl011_irq_level(&uart_) != 0);
+  EXPECT_EQ(1, oemu_gicv2_irq_level(&gic));           /* ... and the controller passes it on */
+  EXPECT_EQ(kConsoleIrq, gic_rd(kGicCpu + GICC_IAR)); /* ... and the driver can name it */
+}
 
 // --- reset state ------------------------------------------------------------
 
