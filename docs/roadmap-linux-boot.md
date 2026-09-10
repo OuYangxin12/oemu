@@ -96,5 +96,24 @@ M6。Image 3.2 MB / 内核代码 1728K 说明内存模型规模无需担心（25
 ## 5. 现状对照
 
 M1 ✅（总线/地址空间/机器）· M2a ✅（sysreg）· M2b ✅（exc）·
-M2c 进行中（vCPU + exec 接线）→ 之后按 M3a → M3b → M4a → M4b → M5
-推进。每个 PR 保持 `make test`、`make asan` 全绿后再合入。
+M2c ✅（PR #21）· M3a ✅（PR #19）· M3b ✅（PR #22）· M4a ✅（PR #24）·
+M4b ✅（GICv2 + arch timer + PSCI，见带 `(M4b)` 的提交）·
+**M5 ✅（本 PR）** · M6 未开始。每个 PR 保持 `make test`、`make asan` 全绿后再合入。
+
+M5 的验收门已经按下：
+
+```
+$ bash scripts/boot-linux-gate.sh
+boot-linux-gate: PASS (markers: BOOT OK MINIMAL-BOOT-CHECK-PASSED SHELL_ALIVE; exit: 0)
+```
+
+默认 `build/debug/bin/oemu`、默认超时，17 s 墙钟；判据与断言都在树里，来源是
+`qemu-system-aarch64` 的实测记录（`scripts/qemu-oracle.sh`、
+`scripts/oracle-uart-regs.py`，另见 `docs/booting-linux.md`）。
+
+标题里的 "busybox" 需要一句说明：交互 shell 目前是本仓库手写的静态 `/init`
+（`tests/guest/init.c`，由 `scripts/build-linux-initramfs.sh` 用内核自带的
+`gen_init_cpio` 打包，2048 字节），它理解 `echo` 与 `poweroff` 两行、回显
+`SHELL_ALIVE`，足以判定"提示符可交互 + 干净关机"。第 4 节风险表里"实证基线用静态
+busybox"那条还没在 oemu 上复验——换 busybox 只换 initramfs 的内容，门禁判据不变，
+所以记作 M5 的后续项，不算缺口。
