@@ -22,19 +22,42 @@
  * guest needs no kernel headers of its own. */
 typedef unsigned long size_t;
 
-#define SYS_read           63
-#define SYS_write          64
-#define SYS_reboot         142
-#define SYS_exit_group     94
-#define LINUX_REBOOT_MAGIC 0x01234567
-#define RB_POWERDOWN       0x4321FDA1
+#define SYS_read       63
+#define SYS_write      64
+#define SYS_reboot     142
+#define SYS_exit_group 94
+/* The reboot contract of the kernel we actually boot. This tree is patched: its
+ * _reboot() takes *two* magics, and its LINUX_REBOOT_CMD_POWER_OFF is 0x4321FEDC
+ * where mainline says 0x4321fed5. Written against distro headers the call answers
+ * -EINVAL, init returns, the kernel panics with "Attempted to kill init", and the
+ * gate reads as an emulator that cannot power off -- so the fixture is pinned to
+ * include/uapi/linux/reboot.h of the tree under guest/, not to a memory of mainline. */
+#define REBOOT_MAGIC1        0xfee1dead
+#define REBOOT_MAGIC2        672274793 /* this tree's LINUX_REBOOT_MAGIC2 */
+#define REBOOT_CMD_POWER_OFF 0x4321FEDC
+
+/* The kernel may scratch x0-x5 and x8 across a trap. x0-x3 and x8 are operands
+ * here, which already tells the compiler they die; x4-x7 are the ones an argument
+ * could otherwise be parked in and come back changed. See the note at the top of
+ * tests/guest/probe.c, where omitting this made a fixture accuse the emulator. */
+#define SVC_CLOBBERS "x4", "x5", "x6", "x7", "memory"
+
+static long sys4(long n, long a, long b, long c, long d) {
+  register long x8 __asm__("x8") = n;
+  register long x0 __asm__("x0") = a;
+  register long x1 __asm__("x1") = b;
+  register long x2 __asm__("x2") = c;
+  register long x3 __asm__("x3") = d;
+  __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3) : SVC_CLOBBERS);
+  return x0;
+}
 
 static long sys3(long n, long a, long b, long c) {
   register long x8 __asm__("x8") = n;
   register long x0 __asm__("x0") = a;
   register long x1 __asm__("x1") = b;
   register long x2 __asm__("x2") = c;
-  __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+  __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : SVC_CLOBBERS);
   return x0;
 }
 
@@ -77,7 +100,7 @@ void _start(void) {
       line[i] = '\0';
       if (seq(line, "poweroff")) {
         say("reboot: Power down\n");
-        (void)sys3(SYS_reboot, LINUX_REBOOT_MAGIC, RB_POWERDOWN, 0);
+        (void)sys4(SYS_reboot, REBOOT_MAGIC1, REBOOT_MAGIC2, REBOOT_CMD_POWER_OFF, 0);
         break;
       }
       if (seq(line, "echo ")) {
