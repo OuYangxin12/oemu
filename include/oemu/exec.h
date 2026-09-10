@@ -123,6 +123,12 @@ OEMU_NODISCARD oemu_status oemu_exec_run_bus(oemu_cpu *cpu, const oemu_memops *m
                                              const oemu_env_ops *env, uint64_t max_insns,
                                              uint64_t *completed_out);
 
+/* Print the tracer's PC histogram -- where the guest was spending its
+ * instructions -- to `out`, reporting at most `top` entries, and return how many
+ * were printed. A no-op returning 0 unless OEMU_TRACE_HIST armed the sampler, so
+ * a run loop can call it unconditionally when it gives up on a boot. */
+unsigned oemu_exec_trace_report(FILE *out, unsigned top);
+
 OEMU_END_DECLS
 
 #endif /* OEMU_EXEC_H */

@@ -33,6 +33,9 @@
  * OEMU_TRACE_VA_SIZE  window size (default 0x1000)
  * OEMU_TRACE_W     "w" restricts the watch to stores
  * OEMU_TRACE_MAX   stop recording after this many records (default 400000)
+ * OEMU_TRACE_SVC   log each supervisor call with the value it handed back
+ * OEMU_TRACE_HIST  sample the PC every Nth instruction into a histogram, so a
+ *                  run that merely times out can say where it was spinning
  *
  * Record: count, pc, va, value, size, kind (kind 1 = load, 2 = store).
  */
@@ -58,11 +61,51 @@ static struct {
   uint64_t va_hi;
   uint64_t max;
   uint64_t entered;
+  uint64_t hits;
+  bool svc;
+  bool svc_pending;
+  uint64_t svc_insn;
+  uint64_t svc_nr;
+  int64_t svc_a0;
+  int64_t svc_fd;
+  int64_t svc_n3;
+  uint64_t hist_step;
+  uint64_t hist_samples;
   bool stores_only;
   bool watch_reported;
   bool on;
   bool inited;
-} g_tr = {NULL, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, false, false, false, false};
+} g_tr = {.file = NULL,
+          .count = 0ULL,
+          .enter_pc = 0ULL,
+          .exit_pc = 0ULL,
+          .hit_pc = 0ULL,
+          .va_lo = 0ULL,
+          .va_hi = 0ULL,
+          .max = 0ULL,
+          .entered = 0ULL,
+          .hits = 0ULL,
+          .svc = false,
+          .svc_pending = false,
+          .svc_insn = 0ULL,
+          .svc_nr = 0ULL,
+          .svc_fd = 0,
+          .svc_n3 = 0,
+          .hist_step = 0ULL,
+          .hist_samples = 0ULL,
+          .stores_only = false,
+          .watch_reported = false,
+          .on = false,
+          .inited = false}; /* designators: a positional
+                             * list here silently shifts
+                             * when a field is added */
+
+/* An address knob is hex, with or without the 0x: System.map prints bare hex, and
+ * strtoull(..., 0) would read "ffffffc08014f730" as *decimal*, i.e. as zero -- a
+ * latch that silently never trips. Sizes keep base 0 so 0x and decimal both work. */
+static uint64_t tr_hex(const char *text) {
+  return strtoull(text, NULL, 16);
+}
 
 static void oemu_tr_init(void) {
   const char *path = getenv("OEMU_TRACE_FILE");
@@ -70,13 +113,13 @@ static void oemu_tr_init(void) {
   const char *exitp = getenv("OEMU_TRACE_EXIT");
   const char *hit = getenv("OEMU_TRACE_HIT");
   if (enter != NULL) {
-    g_tr.enter_pc = strtoull(enter, NULL, 0);
+    g_tr.enter_pc = tr_hex(enter);
   }
   if (exitp != NULL) {
-    g_tr.exit_pc = strtoull(exitp, NULL, 0);
+    g_tr.exit_pc = tr_hex(exitp);
   }
   if (hit != NULL) {
-    g_tr.hit_pc = strtoull(hit, NULL, 0);
+    g_tr.hit_pc = tr_hex(hit);
   }
   {
     const char *va = getenv("OEMU_TRACE_VA");
@@ -84,14 +127,27 @@ static void oemu_tr_init(void) {
     const char *wonly = getenv("OEMU_TRACE_W");
     const char *max = getenv("OEMU_TRACE_MAX");
     if (va != NULL) {
-      g_tr.va_lo = strtoull(va, NULL, 0);
-      g_tr.va_hi = g_tr.va_lo + ((vasize != NULL) ? strtoull(vasize, NULL, 0) : 0x1000ULL);
+      g_tr.va_lo = tr_hex(va);
+      const uint64_t span = (vasize != NULL) ? strtoull(vasize, NULL, 0) : 0x1000ULL;
+      /* Clamp, never wrap. A window running off the top of the address space
+       * used to land at va_hi == 0, and the range test then rejected *every*
+       * access -- a two-byte window asking about the whole upper half of the
+       * address space came back as "no device traffic at all", which is the
+       * most misleading kind of zero. */
+      g_tr.va_hi = ((span == 0ULL) || ((UINT64_MAX - g_tr.va_lo) < span)) ? UINT64_MAX
+                                                                          : g_tr.va_lo + span;
       g_tr.on = true; /* a VA watch is armed from the very first instruction */
     }
     if ((wonly != NULL) && (wonly[0] == 'w')) {
       g_tr.stores_only = true;
     }
     g_tr.max = (max != NULL) ? strtoull(max, NULL, 0) : 400000ULL;
+    g_tr.svc = getenv("OEMU_TRACE_SVC") != NULL;
+    const char *hist = getenv("OEMU_TRACE_HIST");
+    if (hist != NULL) {
+      const unsigned long long step = strtoull(hist, NULL, 0);
+      g_tr.hist_step = (step > 0ULL) ? step : 64ULL;
+    }
   }
   if (path != NULL) {
     g_tr.file = fopen(path, "wb");
@@ -101,15 +157,100 @@ static void oemu_tr_init(void) {
   }
 }
 
+/* --- PC histogram -----------------------------------------------------------
+ * "The guest is still alive but makes no progress" is the most common failure in
+ * a boot emulator, and a single sampled PC (the one the run happened to stop on)
+ * answers it about as well as a photograph of one frame answers "why is the film
+ * stuck". So the tracer can also sample the PC every Nth instruction into a
+ * fixed table of heavy hitters, which the run loop prints when it gives up.
+ * Collisions replace the smaller count: lossy on purpose, but the loop that eats
+ * 99% of the budget is never the small count. */
+#define OEMU_TR_HIST_BUCKETS 4096U
+typedef struct oemu_tr_hist {
+  uint64_t pc;
+  uint64_t count;
+} oemu_tr_hist;
+static oemu_tr_hist g_tr_hist[OEMU_TR_HIST_BUCKETS];
+
+void oemu_exec_internal_hist_add(uint64_t pc) {
+  unsigned slot = (unsigned)((pc >> 2U) & (OEMU_TR_HIST_BUCKETS - 1U));
+  oemu_tr_hist *victim = NULL;
+  for (unsigned probe = 0U; probe < 8U; ++probe) {
+    oemu_tr_hist *b = &g_tr_hist[slot];
+    if ((b->count == 0ULL) || (b->pc == pc)) {
+      b->pc = pc;
+      b->count++;
+      return;
+    }
+    if ((victim == NULL) || (b->count < victim->count)) {
+      victim = b; /* the weakest resident seen: displaced if we run out of slots */
+    }
+    slot = (unsigned)((slot + 1U) & (OEMU_TR_HIST_BUCKETS - 1U));
+  }
+  if (victim != NULL) {
+    victim->pc = pc;
+    victim->count = 1ULL;
+  }
+}
+
+unsigned oemu_exec_trace_report(FILE *out, unsigned top) {
+  if ((out == NULL) || (g_tr.hist_step == 0ULL)) {
+    return 0U;
+  }
+  /* Sort a copy of the buckets; the table is small and this runs once, at the
+   * point where a human is about to read it. */
+  oemu_tr_hist sorted[OEMU_TR_HIST_BUCKETS];
+  unsigned used = 0U;
+  for (unsigned i = 0U; i < OEMU_TR_HIST_BUCKETS; ++i) {
+    if (g_tr_hist[i].count != 0ULL) {
+      sorted[used++] = g_tr_hist[i];
+    }
+  }
+  for (unsigned i = 0U; i < used; ++i) {
+    for (unsigned j = i + 1U; j < used; ++j) {
+      if (sorted[j].count > sorted[i].count) {
+        const oemu_tr_hist t = sorted[i];
+        sorted[i] = sorted[j];
+        sorted[j] = t;
+      }
+    }
+  }
+  unsigned n = (top < used) ? top : used;
+  fprintf(out, "oemu:   pc histogram (%llu samples, every %llu insns):\n",
+          (unsigned long long)g_tr.hist_samples, (unsigned long long)g_tr.hist_step);
+  for (unsigned i = 0U; i < n; ++i) {
+    fprintf(out, "oemu:     %6.2f%%  0x%016llx\n",
+            (g_tr.hist_samples != 0ULL)
+                ? (100.0 * (double)sorted[i].count / (double)g_tr.hist_samples)
+                : 0.0,
+            (unsigned long long)sorted[i].pc);
+  }
+  return n;
+}
+
 static void oemu_tr_step(uint64_t pc) {
   if (!g_tr.inited) {
     g_tr.inited = true;
     oemu_tr_init();
   }
   g_tr.count++;
+  /* With a PC latch configured, the histogram describes the latched region and
+   * nothing else: a boot's samples are dominated by early boot, and mixing them
+   * in hides exactly the loop the question is about. */
+  if ((g_tr.hist_step != 0ULL) && ((g_tr.enter_pc == 0ULL) || g_tr.on) &&
+      ((g_tr.count % g_tr.hist_step) == 0ULL)) {
+    g_tr.hist_samples++;
+    oemu_exec_internal_hist_add(pc);
+  }
   if ((g_tr.hit_pc != 0U) && (pc == g_tr.hit_pc)) {
-    fprintf(stderr, "[tr] hit pc=0x%llx count=%llu\n", (unsigned long long)pc,
-            (unsigned long long)g_tr.count);
+    /* A latch is often pointed at a loop, so the print must not be able to fill
+     * the disk: the first eight hits, then one in every 4096 -- enough to tell
+     * "entered once and never again" from "spinning here". */
+    g_tr.hits++;
+    if ((g_tr.hits <= 8ULL) || ((g_tr.hits & 0xfffULL) == 0ULL)) {
+      fprintf(stderr, "[tr] hit pc=0x%llx n=%llu insn=%llu\n", (unsigned long long)pc,
+              (unsigned long long)g_tr.hits, (unsigned long long)g_tr.count);
+    }
   }
   if (!g_tr.on && (g_tr.enter_pc != 0U) && (pc == g_tr.enter_pc)) {
     g_tr.on = true;
@@ -1172,10 +1313,34 @@ oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
     return OEMU_ERR_INVALID_ARG;
   }
 
+  /* The vCPU's per-instruction entry, so the PC knobs see *every* instruction:
+   * the hints and system instructions (bti, wfi, eret) never reach the bus
+   * dispatch, and a function prologue usually starts with one of them, so a
+   * latch on a function's entry PC stayed silent while the function ran. The
+   * matching hook in oemu_exec_step_bus covers the standalone step API, and
+   * neither path traverses the other, so nothing double-counts. The call is
+   * unconditional on purpose: the environment is only read inside, so gating it
+   * on the parsed knobs -- as this once did -- means the knobs are never read,
+   * and a latch that is never armed reports exactly the same silence as a guest
+   * that never ran the function. */
+  oemu_tr_step(oemu_regs_pc(&cpu->regs)); /* inits itself; see the note there */
+
   /* An if-chain, not a switch: -Wswitch-enum would demand every opcode be
+   * named here even though everything not listed is deliberately left to the
+   * shared switch below. */  /* An if-chain, not a switch: -Wswitch-enum would demand every opcode be
    * named here even though everything not listed is deliberately left to the
    * shared switch below. */
   if (in->op == OEMU_OP_SVC) {
+    if (g_tr.svc) {
+      /* x8 names the call at the trap; the answer only exists when the kernel
+       * returns, which is the next ERET into EL0t -- see below. */
+      g_tr.svc_pending = true;
+      g_tr.svc_insn = g_tr.count;
+      g_tr.svc_nr = oemu_regs_read(&cpu->regs, 8U, OEMU_REG_W64);
+      g_tr.svc_a0 = (int64_t)oemu_regs_read(&cpu->regs, 0U, OEMU_REG_W64);
+      g_tr.svc_fd = (int64_t)oemu_regs_read(&cpu->regs, 1U, OEMU_REG_W64);
+      g_tr.svc_n3 = (int64_t)oemu_regs_read(&cpu->regs, 2U, OEMU_REG_W64);
+    }
     oemu_exc_svc(&cpu->regs, sr, (uint16_t)in->imm);
     return OEMU_OK;
   }
@@ -1209,6 +1374,19 @@ oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
     return OEMU_OK;
   }
   if (in->op == OEMU_OP_ERET) {
+    const unsigned cur_el = (unsigned)((sr->pstate >> 2U) & 3U);
+    const uint64_t x0 = oemu_regs_read(&cpu->regs, 0U, OEMU_REG_W64);
+    if (g_tr.svc_pending && ((sr->spsr_el[cur_el] & 0xCULL) == 0ULL)) {
+      /* Returning to EL0t with a pending request is the syscall's answer, and
+       * x0 carries it. A write() that produces no output but returns -EAGAIN or
+       * -ERESTARTSYS is invisible from the console and indistinguishable from a
+       * hang, which is precisely the difference this line settles. */
+      fprintf(stderr, "[tr] svc insn=%llu nr=%llu a0=0x%llx a1=0x%llx a2=0x%llx -> x0=0x%llx\n",
+              (unsigned long long)g_tr.svc_insn, (unsigned long long)g_tr.svc_nr,
+              (unsigned long long)g_tr.svc_a0, (unsigned long long)g_tr.svc_fd,
+              (unsigned long long)g_tr.svc_n3, (unsigned long long)x0);
+      g_tr.svc_pending = false;
+    }
     /* oemu_exc_eret gates at EL0 itself (Undefined there). */
     oemu_exc_eret(&cpu->regs, sr);
     return OEMU_OK;
@@ -1286,7 +1464,6 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       (mem->validate == NULL)) {
     return OEMU_ERR_INVALID_ARG;
   }
-  oemu_tr_step(oemu_regs_pc(&cpu->regs)); /* TEMP issue #28 tracer */
 
   oemu_status st = OEMU_OK;
   bool take_branch = false;
@@ -1722,6 +1899,14 @@ oemu_status oemu_exec_step_bus(oemu_cpu *cpu, const oemu_memops *mem, const oemu
   if (cpu == NULL || mem == NULL) {
     return OEMU_ERR_INVALID_ARG;
   }
+  /* The PC-latching knobs (ENTER/EXIT/HIT) have to see every instruction, and
+   * this is the one choke point that both the single-step and the run-loop path
+   * pass through. The hook used to live in the bus dispatch, where it only ever
+   * saw loads, stores and system instructions: a function-entry latch there
+   * quietly never tripped, and a run that printed nothing looked like a guest
+   * that never ran the function. */
+  oemu_tr_step(oemu_regs_pc(&cpu->regs)); /* inits itself; see the note there */
+
   uint32_t word = 0U;
   const oemu_status fetch = mem->fetch32(mem->ctx, oemu_regs_pc(&cpu->regs), &word);
   if (fetch != OEMU_OK) {

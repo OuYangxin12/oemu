@@ -32,6 +32,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 OEMU_BEGIN_DECLS
 
@@ -171,3 +172,8 @@ OEMU_NODISCARD oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oem
 OEMU_END_DECLS
 
 #endif /* OEMU_SRC_EXEC_INTERNAL_H */
+
+/* Feed one sample into the tracer's PC histogram (see OEMU_TRACE_HIST). Kept
+ * internal so the sampling policy stays in exec.c and the table stays testable
+ * without a running guest. */
+void oemu_exec_internal_hist_add(uint64_t pc);
