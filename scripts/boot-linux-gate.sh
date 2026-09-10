@@ -45,6 +45,14 @@ initrd=$repo/guest/build/initramfs.cpio
 bin=""
 mib=256
 smp=1
+# Measured, default debug binary, interactive exchange and shutdown included:
+# 17 s wall. The fixture reaches /init in ~10 s; the rest is the exchange. The
+# figure that used to live in this comment -- "the prompt appears after ~140 s" --
+# was inferred from a serial log that had stopped growing, and it had stopped
+# growing because the guest was stuck, not because it was still booting. A fixed
+# feed delay built on that reading cost 90 s per run and hid how fast a real
+# failure was. 420 s is therefore generous by design: it is what a *hung* guest
+# should die at, not what a healthy one takes.
 timeout_sec=420
 expect_exit=0
 interactive=1
@@ -114,7 +122,19 @@ run_with_stdin() {
   # SHELL_ALIVE` and require the echo back, then ask for a clean shutdown.
   if [ "$interactive" -eq 1 ]; then
     (
-      sleep "${OEMU_BOOT_GATE_FEED_DELAY:-90}"
+      # Feed on the prompt, not on a stopwatch. The same image reaches /init in
+      # ~2 minutes (release) and ~7 (debug), so every fixed delay is either a race
+      # or six wasted minutes -- and a line typed into a guest that has not
+      # started listening yet is a test whose failure says nothing. We wait for the
+      # second marker, which is the last thing the fixture writes before it reads.
+      # OEMU_BOOT_GATE_FEED_DELAY stays as an optional floor.
+      deadline=$((timeout_sec - 90)); [ "$deadline" -lt 30 ] && deadline=30
+      waited=0
+      while [ "$waited" -lt "$deadline" ]; do
+        grep -q "${markers[1]:-MINIMAL-BOOT-CHECK-PASSED}" "$log" 2>/dev/null && break
+        sleep 2; waited=$((waited + 2))
+      done
+      sleep "${OEMU_BOOT_GATE_FEED_DELAY:-0}"
       printf 'echo SHELL_ALIVE\n'
       sleep 5
       printf 'poweroff -f\n'
