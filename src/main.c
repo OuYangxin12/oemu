@@ -177,7 +177,12 @@ static void print_usage(FILE *out) {
       "       oemu boot -kernel <Image> [-initrd <cpio>] [-append <cmdline>] "
       "[-m MiB] [-dtb <file>]\n",
       out);
-  (void)fputs("                 [--serial file:PATH] [--entry ADDR] [--max-insns N]\n", out);
+  (void)fputs("                 [--serial file:PATH|stdio] [--entry ADDR] [--max-insns N]\n",
+              out);
+  (void)fputs(
+      "       --serial stdio wires the console to our stdin: a guest parked at a\n"
+      "       prompt is waiting for a keystroke, and EOF on stdin ends the run.\n",
+      out);
   (void)fputs("       oemu --help\n", out);
 }
 
