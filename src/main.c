@@ -636,23 +636,91 @@ static void boot_refresh_levels(oemu_vcpu *vcpu, oemu_gicv2 *gic, oemu_pl011 *ua
  * overflow is counted rather than silently lost. */
 #define BOOT_HELD_MAX 256U
 
-static void boot_pump_stdin(oemu_pl011 *uart, unsigned char *held, size_t *held_len,
-                            uint64_t *dropped) {
-  unsigned char c = 0U;
-  while (read(STDIN_FILENO, &c, 1U) == 1) {
-    if (*held_len >= BOOT_HELD_MAX) {
-      (*dropped)++; /* a guest that never opens its console loses input */
-      continue;
-    }
-    held[(*held_len)++] = c;
-  }
+/* Deliver what we are holding and keep back what the device refused: the driver
+ * clears RXE every time it transmits (pl011_start_tx, half-duplex), so a
+ * keystroke can be legitimately unwelcome at the moment it arrives. */
+static void boot_inject_held(oemu_pl011 *uart, unsigned char *held, size_t *held_len) {
   size_t kept = 0U;
   for (size_t i = 0U; i < *held_len; ++i) {
-    if (oemu_pl011_inject(uart, held[i]) != OEMU_OK) {
-      held[kept++] = held[i]; /* the receiver is off: keep it for later */
+    if (oemu_pl011_inject(uart, held[i]) == OEMU_OK) {
+      continue;
     }
+    held[kept++] = held[i];
   }
   *held_len = kept;
+}
+
+static void boot_pump_stdin(oemu_pl011 *uart, unsigned char *held, size_t *held_len,
+                            uint64_t *dropped, bool *eof) {
+  unsigned char c = 0U;
+  for (;;) {
+    const ssize_t got = read(STDIN_FILENO, &c, 1U);
+    if (got < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break; /* EAGAIN: nothing typed at this instant */
+    }
+    if (got == 0) {
+      *eof = true;
+      break; /* the pipe is closed: no keystroke is ever coming */
+    }
+    if (*held_len >= BOOT_HELD_MAX) {
+      (*dropped)++; /* a guest that never opens its console loses input */
+    } else {
+      held[(*held_len)++] = c;
+    }
+  }
+  boot_inject_held(uart, held, held_len);
+}
+
+/* A parked vCPU whose console is wired to our stdin is an *idle* guest, not a
+ * dead one: the shell is sitting in read(2) waiting for someone to type, which is
+ * exactly what the boot gate does -- its interactive line arrives seconds after
+ * the prompt. QEMU's -serial stdio simply blocks in read() here; declaring the
+ * boot blocked instead loses the marker no matter how far the guest got. So wait
+ * for the next byte (with the O_NONBLOCK we set, cleared), feed it, and only give
+ * up once stdin has reported EOF. */
+static bool boot_await_input(oemu_pl011 *uart, unsigned char *held, size_t *held_len,
+                             uint64_t *dropped, bool *eof) {
+  if (*held_len != 0U) {
+    boot_inject_held(uart, held, held_len);
+    if (*held_len != 0U) {
+      return true; /* input is still queued: the guest has a reason to run */
+    }
+  }
+  if (*eof) {
+    return false;
+  }
+  const int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+  if ((flags >= 0) && ((flags & O_NONBLOCK) != 0)) {
+    (void)fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
+  }
+  unsigned char c = 0U;
+  bool got = false;
+  ssize_t n = read(STDIN_FILENO, &c, 1U);
+  while ((n < 0) && (errno == EINTR)) {
+    n = read(STDIN_FILENO, &c, 1U);
+  }
+  if ((flags >= 0) && ((flags & O_NONBLOCK) == 0)) {
+    (void)fcntl(STDIN_FILENO, F_SETFL, flags); /* back to polling for the loop */
+  }
+  if (n == 1) {
+    got = true;
+    if (*held_len < BOOT_HELD_MAX) {
+      held[(*held_len)++] = c;
+    } else {
+      (*dropped)++;
+    }
+  } else if (n == 0) {
+    *eof = true;
+    return false;
+  } else {
+    *eof = true; /* a console we cannot read will not become readable */
+    return false;
+  }
+  (void)boot_pump_stdin(uart, held, held_len, dropped, eof); /* the rest of the line */
+  return got;
 }
 
 static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oemu_gicv2 *gic,
@@ -661,6 +729,8 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
   unsigned char held[BOOT_HELD_MAX];
   size_t held_len = 0U;
   uint64_t held_drop = 0U;
+  bool stdin_eof = false;
+  bool idle_announced = false;
   for (;;) {
     const uint64_t slice = (budget < BOOT_QUANTUM) ? budget : BOOT_QUANTUM;
     uint64_t done = 0U;
@@ -682,7 +752,7 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
      * A byte the ring cannot hold is dropped, exactly as QEMU drops an early
      * byte before the driver enables the receiver. */
     if (pump_stdin) {
-      boot_pump_stdin(uart, held, &held_len, &held_drop);
+      boot_pump_stdin(uart, held, &held_len, &held_drop, &stdin_eof);
     }
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
@@ -694,6 +764,15 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
       return EXIT_ERROR;
     }
     if (st == OEMU_ERR_BLOCKED) {
+      if (pump_stdin && boot_await_input(uart, held, &held_len, &held_drop, &stdin_eof)) {
+        if (!idle_announced) {
+          idle_announced = true;
+          (void)fputs("oemu: guest idle at the console; waiting for input\n", stderr);
+        }
+        boot_refresh_levels(vcpu, gic, uart); /* the byte we just fed may now wake it */
+        oemu_vcpu_rearm(vcpu);
+        continue;
+      }
       boot_hang_report(vcpu, "guest parked", max_insns - budget);
       boot_uart_report(uart);
       (void)fputs("oemu: guest parked at WFI/WFE with nothing to wake it\n", stderr);
