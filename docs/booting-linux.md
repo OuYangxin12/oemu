@@ -76,37 +76,46 @@ ISENABLER、ACTIVE 抑制；DAIF 屏蔽（前 400 次投递无一例在 I 置位
 框定测量的假设出自我记忆"。因此本节只列事实。下一件该拿的东西是**装载后写进 RAM 的那份 FDT 的转储**
 （夹具源文件不是地面真值，它会被补丁），以及"guest 为何会把首个用栈分到自身镜像内"的正面答案。
 
-## 现在卡在哪（issue #28 第三轮复核）
+## 卡点已定位并修复：SVC 的返回地址是下一条指令
 
-上面那节"中断发生时钟指针落在内核镜像内"不再是当前阻塞点。补上 AMBA 组件号之后
-（CID 在 `region_end-0x10`，即 `0xFF0..0xFFC` = `d f0 05 b1`；早先一次实测把
-`0xFD0..0xFDC` 读成"全零"并当成事实记下了，那是错的地址），控制台正常注册，
-`Run /init as init process` 与 `BOOT OK` 都打得出来，panic 消失。补充一条：**之前所有"只有 debug
-构建才 panic"的现象，出自一个 6 小时没重建的 `build/debug/bin/oemu`**——门禁默认用的正是它，
-而当时只重建了 `build/release`。
+第三轮复核记下的"PID 1 的第二次 `write(1, ...)` 永不返回"**不是**阻塞，而是我自己的测量误读，
+真因在下面。当时的现象（`tx_emitted` 等于日志字节数、寄存器与 oracle 逐位相同、第二标记仍缺失）
+都指向"卡在 tty 里"，但那是症状。
 
-当前唯一可复现的偏差：**PID 1 的第二次 `write(1, ...)` 永不返回**，oracle 上同一夹具三次 write
-全部按长度立即返回。
+真因：**`svc` 的 preferred exception return address 是陷阱指令的下一条**（DDI 0487 D1.4.5），
+`hvc` 同理；而 `oemu_exc_take` 对所有 kind 都记 `ELR = pc`。于是内核的 `eret` 把同一个系统调用
+再执行一遍，而 `x0` 此时装着上一次的返回值：
 
-* 探针：`tests/guest/probe.c` + `scripts/mkcpio.py`（本机没有 cross binutils，用
-  `clang --target=aarch64-none-elf -fuse-ld=lld -nostdlib -static -fno-builtin` 造）。
-  oracle 打出 `PROBE-A` 后每条 write 都回 `0x1a`/`0x40`；oemu 只打出 `PROBE-A`。
-* 串口无罪：退出诊断行 `oemu: uart: tx_emitted=... tx_dropped=0` 里 `tx_emitted` 恰等于日志
-  字节数——不是丢字节，是 guest 根本没再写。
-* 设备状态与 oracle 逐位相同：`CR=0x0f01 IMSC=0x0050 RIS=0x0020`（`scripts/oracle-uart-regs.py`
-  从 QEMU monitor 读）；FR 曾差在 0x97 vs 0x90，即我们无端把 CTS/DSR/DCD 报成有效，已改成低。
-* oracle 完全不给输入（`-serial file:` 且 stdin 接 `/dev/null`）时三个标记齐全 ⇒
-  `MINIMAL-BOOT-CHECK-PASSED` 缺失与敲键无关。
+```
+write(1, 0x40028c, 8) -> 8        # "BOOT OK\n" 打出去了
+write(8, 0x40028c, 8) -> -EBADF   # fd 变成了上一次的返回值 8
+write(-9, ...)         -> -EBADF   # 从此每 256 条指令一次，294,542 次
+```
 
-本轮另以实测排除/修复：`/chosen/rng-seed` 缺失（已补，`random: crng init done` 现与 oracle 同行）；
-接收中断路径（收到字节该置 **RXIS = 1<<4**，此前置的是 bit0 = RIMIS，driver 走 modem 分支把字节丢了，
-且 `ris & imsc` 恒低）；`FR.TXFF` 由 host 侧未排空的 TX 队列触发（会让 `pl011_tx_room()` 返回 0，
-`n_tty_write` 睡死在 `tty->write_wait`，而那一次排空不伴随任何中断）；CRC32 一族（`crc32_be` 走
-`arch/arm64/lib/crc32.S`，错了就让内核判 devicetree CRC 失败）。
+内核自己不执行 `svc`，所以到 `/init` 为止一切正常——这正是它藏了这么久的原因。钉住它的测试
+原先写的是"同步陷阱会重试其指令，越过它是指针（handler）的职责"，那句话对 abort / undefined
+成立（handler 可修复并推进 ELR），对 `svc`/`hvc`/`brk` 不成立；我自己写的测试把错误契约钉住了。
 
-下一件该拿的东西：第二次 write 期间驱动是否**真的**又往 UART DR 写过字节——`OEMU_TRACE_VA` 窗口观察
-两次返回零记录，而"零记录"在证明探针会响之前不算答案；可用 `OEMU_DUMP_MEM=<pa>:<len>:<file>`
-（两者皆十六进制）从 guest RAM 里把 `uart_port`/`uart_state` 抠出来看 `suspended`/`x_char`/xmit 头尾。
+同轮的另外两件事：
+
+* **空闲的 guest 不是死掉的 guest**：`-serial stdio` 下控制台就是 stdin，parked 的 vCPU 是在
+  `read(2)` 上等键盘。原先一律 `EXIT_BLOCKED`，于是门禁那行 `echo SHELL_ALIVE` 到达时进程已经退出了
+  ——两个标记都拿到了，仍然判 FAILED。现在只在 stdin 真正 EOF 时才判阻塞。
+* 探针夹具 `tests/guest/probe.c` 报的"第二个 write 不返回"是夹具自身的错（它的 `say()` 忽略返回值，
+  于是上面那串 -EBADF 在日志里完全隐形）。教训：**用项目自己的夹具下结论**，探针只提供问题。
+
+## 本轮把"沉默的零"变成可查的东西
+
+`OEMU_TRACE_*` 的三个缺陷都是同一个类型：探针不响，却读成"guest 没执行"。
+
+* PC 钩子原先只有一个调用点在总线派发里，`bti`/`wfi`/`eret` 与函数序言根本不到它，
+  于是"在函数入口 PC 上装闩"在函数正常跑的时候一言不发。现在钩在 vCPU 每条指令的入口，
+  并且**无条件**调用：用解析后的开关去 gate 它，等于开关永远不会被解析。
+* 地址开关用 `strtoull(base 0)` 解析，`System.map` 的裸十六进制被当成**十进制**读成 0 ⇒ 闩永不合。
+  现在地址一律按 16 进制读，VA 窗口在 `UINT64_MAX` 处截断而不是回绕（回绕会让窗口拒绝所有访问）。
+* 新增 `OEMU_TRACE_HIST`（PC 直方图，撞槽时挤掉计数最小的）与 `OEMU_TRACE_SVC`（记录每次
+  supervisor call 的参数与返回值）。两者一次启动就定位了上面的缺陷：直方图指向三条指令的循环，
+  syscall 轨迹显示 `write()` 对 fd 8 返回 -EBADF。
 
 ## `--smp 4` → `nproc == 4`
 
