@@ -39,7 +39,12 @@
  * TLB maintenance plus the MMU control semantics of SCTLR/TTBR/TCR/MAIR (M3
  * stores them but does not yet honour them), MDSCR_EL1 (required before a
  * Linux guest, which writes it during early boot), and FP/SIMD state --
- * FPCR/FPSR have no row on purpose, so FP access reads as Undefined, matching
+ * FPCR and FPSR do have rows (M5): Linux 6.6 restores FP state with
+ * `mrs x0, fpcr` / `msr fpsr, x8` on every return to user mode, and the vector
+ * register file they belong to is what makes an /init able to run. No FP
+ * arithmetic is modelled, so nothing reads them back except the guest itself.
+ *
+ * Before that, FPCR/FPSR had no row on purpose, so FP access read as Undefined, matching
  * ID_AA64PFR0 advertising no FP/SIMD (roadmap D7).
  */
 #ifndef OEMU_SYSREG_H
@@ -135,7 +140,10 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
 /* Debug System Control: the kernel clears it at boot (disable debug events)
  * and never reads it back, so oemu models it RAZ/WI rather than faulting on
  * a legal EL1 access it does not otherwise model. */
-#define OEMU_SYSREG_MDSCR_EL1        ((uint32_t)0x0012)
+#define OEMU_SYSREG_MDSCR_EL1 ((uint32_t)0x0012)
+/* FP control and status, the two the kernel's fpsimd save/restore touches. */
+#define OEMU_SYSREG_FPCR             ((uint32_t)0x1a20)
+#define OEMU_SYSREG_FPSR             ((uint32_t)0x1a21)
 #define OEMU_SYSREG_ID_AA64PFR0_EL1  ((uint32_t)0x0020)
 #define OEMU_SYSREG_ID_AA64DFR0_EL1  ((uint32_t)0x0028)
 #define OEMU_SYSREG_ID_AA64ISAR0_EL1 ((uint32_t)0x0030)
@@ -190,11 +198,17 @@ static inline unsigned oemu_pstate_daif(uint64_t pstate) {
  * the selector mask discards), so CNTV_CTL_EL0 / CNTV_CVAL_EL0 are the names
  * that appear in the guest; the counter it reads is CNTVCT_EL0 (0x1f02). */
 #define OEMU_SYSREG_CNTV_CVAL_EL0 ((uint32_t)0x1f1a)
+#define OEMU_SYSREG_CNTV_TVAL_EL0 ((uint32_t)0x1f1b)
 #define OEMU_SYSREG_CNTV_CTL_EL0  ((uint32_t)0x1f19)
 /* Default generic-timer counter frequency: the Arm default the QEMU virt
  * machine and this DT both present, so the guest's clock source and oemu's
  * counter agree. */
-#define OEMU_CNTFRQ_EL0_DEFAULT    62500000u
+#define OEMU_CNTFRQ_EL0_DEFAULT 62500000u
+
+/* Counts the generic timer advances per retired instruction. One, so that the
+ * counter's rate equals the frequency advertised through CNTFRQ_EL0 above: the
+ * guest's clock-frequency and the emulator's clock cannot then disagree. */
+#define OEMU_TIMER_COUNTS_PER_INSN 1U
 #define OEMU_SYSREG_CPACR_EL1      ((uint32_t)0x0082)
 #define OEMU_SYSREG_TTBR0_EL1      ((uint32_t)0x0100)
 #define OEMU_SYSREG_TTBR1_EL1      ((uint32_t)0x0101)
@@ -323,6 +337,8 @@ typedef struct oemu_sysregs {
   uint64_t amair_el1;
   uint64_t contextidr_el1;
   uint64_t cpacr_el1;
+  uint64_t fpcr; /* FP control: RES0 above bit 31, so that is the write mask */
+  uint64_t fpsr; /* FP status: flags and the quiescent bit, same width rule */
   uint64_t tpidr_el1;
   uint64_t tpidr_el0;   /* user thread ID, RW at EL0 */
   uint64_t tpidrro_el0; /* user read-only ID; oemu models writes as Undefined

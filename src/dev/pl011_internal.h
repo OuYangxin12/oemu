@@ -66,20 +66,47 @@ OEMU_BEGIN_DECLS
 /* Measured QEMU reset value: TXE | LBE. */
 #define PL011_CR_RESET (PL011_CR_TXE | PL011_CR_LBE)
 
-/* RIS/MIS/IMSC/ICR bits. */
-#define PL011_INT_RLIS 0x01U /* receive */
-#define PL011_INT_TIEM 0x20U /* transmit */
-#define PL011_INT_RTEM 0x40U /* receive timeout */
-#define PL011_INT_OEIS 0x08U /* overflow */
-#define PL011_INT_BEIS 0x02U /* break */
-#define PL011_INT_PEIS 0x04U /* parity */
-#define PL011_INT_FEIS 0x80U /* framing */
+/* RIS/MIS/IMSC/ICR bits, transcribed from the guest's own header
+ * (include/linux/amba/serial.h in the fork) rather than from the PL011 TRM,
+ * because these are the values the driver tests. The status bit for a received
+ * byte is RXIS (1 << 4); bit 0 is RIMIS, an RI modem-status change. Raising bit
+ * 0 for a received byte made the driver's ISR take the modem-status branch and
+ * discard the byte, and the masked line (ris & imsc, with RXIM at bit 4) stayed
+ * low -- so keystrokes never reached the guest at all. Mask bits line up
+ * one-for-one with the status bits, which is why one set of names serves both. */
+#define PL011_INT_RIMIS  0x01U  /* ring indicator: modem status, NOT receive */
+#define PL011_INT_CTSMIS 0x02U  /* */
+#define PL011_INT_DCDMIS 0x04U  /* */
+#define PL011_INT_DSRMIS 0x08U  /* */
+#define PL011_INT_RXIS   0x10U  /* receive */
+#define PL011_INT_TXIS   0x20U  /* transmit */
+#define PL011_INT_RTIS   0x40U  /* receive timeout */
+#define PL011_INT_FEIS   0x80U  /* framing */
+#define PL011_INT_PEIS   0x100U /* parity */
+#define PL011_INT_BEIS   0x200U /* break */
+#define PL011_INT_OEIS   0x400U /* overrun */
+/* A byte parked below the FIFO trigger level raises the receive-timeout
+ * interrupt as well as RXIS: that is the interrupt a driver waiting for one
+ * typed character actually sees (ARM PL011 TRM, "Interrupts"). */
+#define PL011_INT_RX (PL011_INT_RXIS | PL011_INT_RTIS)
 
 /* Peripheral ID at 0xFE0..0xFEC, measured off the QEMU oracle. */
 #define PL011_PID0 0x11U
 #define PL011_PID1 0x10U
 #define PL011_PID2 0x14U
 #define PL011_PID3 0x00U
+
+/*
+ * Component IDs, read by the A64 core at region_end-0x10 .. -0x04 (drivers/amba
+ * /bus.c amba_read_periphid). Assembled little-endian they must equal the
+ * kernel's AMBA_CID, or the bus core records no periphid, returns -ENODEV from
+ * amba_read_periphid, and defers the PL011 probe forever without a word of
+ * complaint -- which is how issue #28 lost its console. Read off the oracle.
+ */
+#define PL011_CID0 0x0DU
+#define PL011_CID1 0xF0U
+#define PL011_CID2 0x05U
+#define PL011_CID3 0xB1U
 
 /* Recompute the flag register from the rings (QEMU does the same on every
  * event): an idle line presents TXFE (empty, ready) with RXFE and the modem

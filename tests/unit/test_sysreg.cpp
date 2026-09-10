@@ -178,10 +178,12 @@ TEST_F(SysregTest, SpselAndDaifRoundTrip) {
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_SPSEL, &value));
   EXPECT_EQ(1u, value);
 
-  EXPECT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_DAIF, 0b1010));
+  /* MRS/MSR DAIF use the PSTATE positions (bits [9:6]), like NZCV at [31:28]. */
+  EXPECT_EQ(OEMU_OK,
+            oemu_sysreg_write(&sr_, OEMU_SYSREG_DAIF, 0b1010U << OEMU_PSTATE_DAIF_SHIFT));
   value = 0;
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_DAIF, &value));
-  EXPECT_EQ(0b1010u, value);
+  EXPECT_EQ(0b1010U << OEMU_PSTATE_DAIF_SHIFT, value);
 
   // Junk above the 4-bit field must not leak into neighbouring PSTATE bits:
   // mark IL/SS first, then a max-width DAIF write, then verify both survive.
@@ -190,7 +192,55 @@ TEST_F(SysregTest, SpselAndDaifRoundTrip) {
   EXPECT_EQ(OEMU_PSTATE_IL | OEMU_PSTATE_SS, sr_.pstate & (OEMU_PSTATE_IL | OEMU_PSTATE_SS))
       << "DAIF write clobbered IL/SS";
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_DAIF, &value));
-  EXPECT_EQ(0xFu, value);
+  EXPECT_EQ(OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT, value);
+}
+
+TEST_F(SysregTest, MsrDaifRegisterFormMasksTheInterruptItNames) {
+  /* The value the guest hands MSR DAIF, Xt is the mask at the PSTATE positions;
+   * Linux's IRQ entry writes 0xc0 (I|F) there. */
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_DAIF, 0xC0U));
+  EXPECT_EQ(0xC0U, sr_.pstate & 0xC0U) << "I and F must be masked";
+  EXPECT_EQ(0U, sr_.pstate & (0xCU << OEMU_PSTATE_DAIF_SHIFT)) << "D and A must be clear";
+  EXPECT_EQ(3U, oemu_pstate_daif(sr_.pstate));
+  uint64_t value = 0;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_DAIF, &value));
+  EXPECT_EQ(0xC0U, value);
+}
+
+TEST_F(SysregTest, TimerControlReportsIstatFromTheLiveComparator) {
+  /* CNTV_CTL bit 2 is read-only ISTAT: set while the timer is enabled, unmasked
+   * and expired. Linux's arch timer handler gates its re-arm on this bit, so a
+   * hardwired zero made it answer IRQ_NONE forever and the PPI stayed pending. */
+  sr_.cntvct = 1000U;
+  sr_.cntvoff_el1 = 0U;
+  sr_.cntv_cval_el1 = 2000U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, 0x1U));
+  uint64_t value = 0;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, &value));
+  EXPECT_EQ(0x1U, value) << "not expired yet: ISTAT clear";
+  sr_.cntvct = 2000U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, &value));
+  EXPECT_EQ(0x5U, value) << "expired: ISTAT set (bit 2)";
+  /* ISTAT is read-only: writing it back must not stick, and masking the
+   * interrupt clears the reported status without touching the enable bit. */
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, 0x7U));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_CNTV_CTL_EL0, &value));
+  EXPECT_EQ(0x3U, value) << "enable+imask stored; ISTAT recomputed to 0";
+}
+
+TEST_F(SysregTest, TimerTvalIsADeltaOnTheLiveCounter) {
+  /* Linux's clockevent reprograms the timer through TVAL on every tick; the
+   * hardware turns the delta into an absolute comparator against the counter. */
+  sr_.cntvct = 5000U;
+  sr_.cntvoff_el1 = 1000U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_CNTV_TVAL_EL0, 250U));
+  EXPECT_EQ(4250U, sr_.cntv_cval_el1) << "cval = (cntvct - cntvoff) + tval";
+  uint64_t value = 0;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_CNTV_TVAL_EL0, &value));
+  EXPECT_EQ(250U, value);
+  sr_.cntvct = 4000U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_CNTP_TVAL_EL1, 100U));
+  EXPECT_EQ(4100U, sr_.cntp_cval_el1) << "the physical bank has no virtual offset";
 }
 
 TEST_F(SysregTest, CurrentElReportsTheBootLevel) {
@@ -351,4 +401,53 @@ TEST_F(SysregTest, NameIsNeverNull) {
   EXPECT_NE(nullptr, oemu_sysreg_name(0x3FFF));
 }
 
+TEST_F(SysregTest, TtbrWritesLandWholeAndDoNotDisturbEachOther) {
+  /* The M5 boot investigation currently rests on one contradiction: the guest is
+   * caught running on swapper_pg_dir at every interrupt delivery although the log
+   * position implies init_pg_dir is live. A TTBR write that did not land, or that
+   * landed with bits eaten by a mask, would explain that outright -- so the
+   * round-trip is pinned here, at the three addresses the boot actually uses and
+   * at an ASID-tagged value whose high bits a masking bug would swallow. */
+  const uint64_t values[] = {0x4022c000ULL, 0x40341000ULL, 0x4022e000ULL,
+                             0x4022e000ULL | (0x123ULL << 48)};
+  for (unsigned i = 0U; i < (sizeof(values) / sizeof(values[0])); ++i) {
+    ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_TTBR0_EL1, values[i]));
+    ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_TTBR1_EL1, values[i]));
+    uint64_t low = 0U;
+    uint64_t high = 0U;
+    ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_TTBR0_EL1, &low));
+    ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_TTBR1_EL1, &high));
+    EXPECT_EQ(values[i], low) << "TTBR0 lost or narrowed the write";
+    EXPECT_EQ(values[i], high) << "TTBR1 lost or narrowed the write";
+  }
+}
+
 }  // namespace
+
+TEST_F(SysregTest, FpStatusRegistersAreModelledAndThirtyTwoBitsWide) {
+  // FPCR/FPSR are not optional here: 6.6's fpsimd_load_state / fpsimd_save_state
+  // run on every return to user mode and issue `mrs x0, fpcr` / `msr fpcr, x8`
+  // unconditionally, because system_supports_fpsimd() is merely
+  // !have_cpucap(ARM64_HAS_NO_FPSIMD) and that cap is a dummy nothing can set.
+  // Refusing the selectors therefore kills /init before it prints a byte.
+  uint64_t value = 0U;
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_FPCR, &value));
+  EXPECT_EQ(value, 0U);                 /* both reset to zero, as the oracle's A53 shows */
+  ASSERT_EQ(OEMU_SYSREG_FPCR, 0x1a20U); /* the selector the guest actually emits */
+  ASSERT_EQ(OEMU_SYSREG_FPSR, 0x1a21U);
+  // Only the low 32 bits exist; the write mask is the architecture's, not ours.
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_FPCR, UINT64_C(0xFFFF0000FF00FFFF)));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_FPCR, &value));
+  EXPECT_EQ(value, UINT64_C(0xFF00FFFF));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&sr_, OEMU_SYSREG_FPSR, UINT64_C(0x100000001)));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_FPSR, &value));
+  EXPECT_EQ(value, 1U);
+  // And they are EL0-accessible, which is what makes `msr fpcr` from a freestanding
+  // /init (or a kernel running at EL1 with EL1FFI... nothing) legal.
+  oemu_sysregs el0{};
+  oemu_regs regs0{};
+  BootAt(&el0, &regs0, OEMU_EL0, 0x2000U);
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_write(&el0, OEMU_SYSREG_FPCR, 0x8U));
+  ASSERT_EQ(OEMU_OK, oemu_sysreg_read(&el0, OEMU_SYSREG_FPCR, &value));
+  EXPECT_EQ(value, 8U);
+}

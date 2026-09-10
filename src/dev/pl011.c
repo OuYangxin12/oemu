@@ -46,15 +46,24 @@ void oemu_pl011_internal_update_flags(oemu_pl011 *uart) {
    * first earlycon character. */
   uint32_t fr = PL011_FR_TXFE;
   if (uart->rx_count == 0U) {
-    fr |= PL011_FR_RXFE | PL011_FR_DSR | PL011_FR_DCD | PL011_FR_CTS;
+    fr |= PL011_FR_RXFE;
   }
-  if (uart->tx_count != 0U) {
-    /* Queue not drained: TX is neither empty nor free to fill. The ring only
-     * backs up because nobody pumped it; TX is never allowed to block the vCPU
-     * (oemu_pl011_pump empties it and reasserts TXFE). */
-    fr &= ~PL011_FR_TXFE;
-    fr |= PL011_FR_TXFF | PL011_FR_BUSY;
-  }
+  /* The modem status lines are wired to nothing here, so they are read as low
+   * -- measured on the oracle at an idle shell prompt, where FR is 0x90
+   * (TXFE|RXFE) and not the 0x97 an asserted-CTS model returned. Nothing in the
+   * guest's transmit path consults them while CTSEN stays clear, but inventing
+   * them was still inventing. */
+  /* TXFF is deliberately never set from the TX ring. The ring is host-side
+   * batching: a sink consumes every byte as it is written, so the modelled
+   * FIFO is never full -- exactly like the oracle, where the chardev drains the
+   * transmit FIFO immediately and FR reads back TXFE|RXFE with TXFF clear.
+   * Reporting TXFF from an un-pumped queue made the driver's tx_room() return 0,
+   * so n_tty_write() slept on tty->write_wait and nothing ever woke it: the
+   * drain was a host-side event with no interrupt to go with it. Measured: /init
+   * printed its first line, its second write never returned, and the guest sat
+   * idle at WFI (ESR_EL1=0x56000000) for the rest of the run. TX must never
+   * block the vCPU; oemu_pl011_pump only empties a ring a sink-less caller left
+   * filled. */
   uart->fr = fr;
 }
 
@@ -88,7 +97,7 @@ static oemu_status pl011_read(void *ctx, uint64_t offset, oemu_mem_size size,
         uart->rx_head = (uart->rx_head + 1U) % OEMU_PL011_RX_RING;
         uart->rx_count--;
         if (uart->rx_count == 0U) {
-          uart->ris &= ~PL011_INT_RLIS;
+          uart->ris &= ~PL011_INT_RX;
         }
       }
       oemu_pl011_internal_update_flags(uart);
@@ -147,6 +156,18 @@ static oemu_status pl011_read(void *ctx, uint64_t offset, oemu_mem_size size,
     case 0xFECU:
       v = PL011_PID3;
       break;
+    case 0xFF0U:
+      v = PL011_CID0;
+      break;
+    case 0xFF4U:
+      v = PL011_CID1;
+      break;
+    case 0xFF8U:
+      v = PL011_CID2;
+      break;
+    case 0xFFCU:
+      v = PL011_CID3;
+      break;
     default:
       v = 0U; /* unimplemented: quiet zero, never a fault */
       break;
@@ -185,12 +206,16 @@ static oemu_status pl011_write(void *ctx, uint64_t offset, oemu_mem_size size, u
       } else {
         pl011_tx_push(uart, (unsigned char)v);
       }
-      uart->ris |= PL011_INT_TIEM;
-      if ((uart->cr & PL011_CR_LBE) != 0U) {
-        /* Loopback mirrors the byte into RX; a full ring drops it -- the
-         * counter tells the story a silent (void) never would. */
+      uart->ris |= PL011_INT_TXIS;
+      if (((uart->cr & PL011_CR_LBE) != 0U) && ((uart->cr & PL011_CR_RXE) != 0U)) {
+        /* Loopback mirrors the byte into the receiver, and only when there is a
+         * receiver: RXE is the same gate the host-injection path honours. The
+         * reset CR is TXE|LBE with RXE clear, so charging these to tx_dropped
+         * turned every earlycon byte into a phantom "console lost data" and the
+         * boot gate refused a log that was complete. A full RX ring is an RX
+         * loss and is counted as one. */
         if (oemu_pl011_inject(uart, (unsigned char)v) != OEMU_OK) {
-          uart->tx_dropped++;
+          uart->rx_dropped++;
         }
       }
       break;
@@ -231,6 +256,11 @@ static oemu_status pl011_write(void *ctx, uint64_t offset, oemu_mem_size size, u
 
 /* --- public service -------------------------------------------------------- */
 
+uint64_t oemu_pl011_tx_dropped(const oemu_pl011 *uart) {
+  OEMU_REQUIRE(uart != NULL, "NULL oemu_pl011 in oemu_pl011_tx_dropped");
+  return uart->tx_dropped;
+}
+
 size_t oemu_pl011_pump(oemu_pl011 *uart) {
   OEMU_REQUIRE(uart != NULL, "NULL oemu_pl011");
   size_t emitted = 0U;
@@ -261,7 +291,7 @@ oemu_status oemu_pl011_inject(oemu_pl011 *uart, unsigned char byte) {
   uart->rx[uart->rx_tail] = byte;
   uart->rx_tail = (uart->rx_tail + 1U) % OEMU_PL011_RX_RING;
   uart->rx_count++;
-  uart->ris |= PL011_INT_RLIS;
+  uart->ris |= PL011_INT_RX;
   oemu_pl011_internal_update_flags(uart);
   return OEMU_OK;
 }

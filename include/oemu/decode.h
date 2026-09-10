@@ -63,7 +63,12 @@ typedef enum oemu_mem_size {
   OEMU_MEM_BYTE = 0,
   OEMU_MEM_HALF = 1,
   OEMU_MEM_WORD = 2,
-  OEMU_MEM_DWORD = 3
+  OEMU_MEM_DWORD = 3,
+  /* 128-bit transfer, i.e. one Q register: only the SIMD pair accesses use it,
+   * and the bus never sees it -- the executor splits it into two 64-bit
+   * accesses, which is what a little-endian implementation does and what the
+   * devices and the translation regime are modelled against. */
+  OEMU_MEM_128 = 4
 } oemu_mem_size;
 
 /* How a load/store computes and writes back its address. */
@@ -125,7 +130,8 @@ typedef enum oemu_opcode {
   OEMU_OP_LSRV,
   OEMU_OP_ASRV,
   OEMU_OP_RORV,
-  OEMU_OP_CRC32, /* CRC32B/H/W/X; the byte count rides in insn.uimm */
+  OEMU_OP_CRC32,  /* CRC32B/H/W/X; the byte count rides in insn.uimm */
+  OEMU_OP_CRC32C, /* CRC32CB/CH/CW/CX: same shape, Castagnoli polynomial */
 
   /* one-source */
   OEMU_OP_RBIT,
@@ -257,6 +263,10 @@ typedef struct oemu_insn {
   oemu_mem_size mem_size;
   oemu_index_mode index_mode;
   bool is_signed_load; /* LDRS*: sign-extend the loaded value */
+  bool is_vector;      /* the transfer moves V0-V31 rather than the general
+                        * registers: same fields, but Rt 31 is V31 rather than ZR,
+                        * and a transfer narrower than 128 bits clears the rest of
+                        * the destination */
   bool extend_is_lsl;  /* register-offset form uses a plain LSL, not an extend */
 
   bool sets_flags;    /* the S variant: write NZCV */

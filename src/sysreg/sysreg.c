@@ -5,11 +5,14 @@
 #include "oemu/sysreg.h"
 
 #include "oemu/check.h"
+#include "oemu/gtimer.h"
 #include "oemu/macros.h"
 #include "oemu/regs.h"
 #include "oemu/status.h"
 
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sysreg_internal.h"
@@ -33,14 +36,19 @@ static void set_sp_sel(oemu_sysregs *sr, uint64_t value) {
   oemu_sysregs_switch_sp(sr, (sr->pstate & ~OEMU_PSTATE_SPSEL) | (value & OEMU_PSTATE_SPSEL));
 }
 
+/* MRS Xt, DAIF reports the field where it sits in PSTATE (bits [9:6]) and MSR
+ * DAIF, Xt takes the mask at those same positions, exactly as MRS Xt, NZCV uses
+ * bits [31:28]. Linux's IRQ entry depends on that: `mov x2, #0xc0; msr daif, x2`
+ * must leave I and F masked for the handler to run. Reading the written value as
+ * a compact 4-bit field turns 0xc0 into 0 -- unmasking the very interrupt the
+ * guest just masked, which re-enters the handler forever. */
 static uint64_t get_daif(const oemu_sysregs *sr) {
-  return (sr->pstate >> OEMU_PSTATE_DAIF_SHIFT) & OEMU_PSTATE_DAIF_MASK;
+  return sr->pstate & (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT);
 }
 
 static void set_daif(oemu_sysregs *sr, uint64_t value) {
   const uint64_t field = OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT;
-  sr->pstate =
-      (sr->pstate & ~field) | ((value & OEMU_PSTATE_DAIF_MASK) << OEMU_PSTATE_DAIF_SHIFT);
+  sr->pstate = (sr->pstate & ~field) | (value & field);
 }
 
 void oemu_sysregs_switch_sp(oemu_sysregs *sr, uint64_t new_pstate) {
@@ -137,6 +145,44 @@ static uint64_t get_cntpct(const oemu_sysregs *sr) {
 }
 static uint64_t get_cntp_tval(const oemu_sysregs *sr) {
   return sr->cntp_cval_el1 - sr->cntvct;
+}
+/* CNTV_CTL/CNTP_CTL bit 2 (ISTAT) is read-only and reflects the live timer
+ * condition, exactly the predicate the PPI refresh uses. Linux's arch timer
+ * handler reads it to decide whether the interrupt is its own and only then
+ * reprograms the comparator; with ISTAT stuck at zero the handler answered
+ * IRQ_NONE, nothing re-armed, and the PPI stayed pending for the rest of the
+ * boot -- the guest spent every instruction in the interrupt path. */
+static uint64_t get_cntv_ctl(const oemu_sysregs *sr) {
+  const uint64_t stored = sr->cntv_ctl_el1 & ~(uint64_t)OEMU_GTIMER_CTL_ISTAT;
+  const int pending =
+      oemu_gtimer_pending(sr->cntvct - sr->cntvoff_el1, sr->cntv_ctl_el1, sr->cntv_cval_el1);
+  return stored | ((pending != 0) ? (uint64_t)OEMU_GTIMER_CTL_ISTAT : 0U);
+}
+static uint64_t get_cntp_ctl(const oemu_sysregs *sr) {
+  const uint64_t stored = sr->cntp_ctl_el1 & ~(uint64_t)OEMU_GTIMER_CTL_ISTAT;
+  const int pending = oemu_gtimer_pending(sr->cntvct, sr->cntp_ctl_el1, sr->cntp_cval_el1);
+  return stored | ((pending != 0) ? (uint64_t)OEMU_GTIMER_CTL_ISTAT : 0U);
+}
+static void set_cntv_ctl(oemu_sysregs *sr, uint64_t value) {
+  sr->cntv_ctl_el1 = value & ~(uint64_t)OEMU_GTIMER_CTL_ISTAT;
+}
+static void set_cntp_ctl(oemu_sysregs *sr, uint64_t value) {
+  sr->cntp_ctl_el1 = value & ~(uint64_t)OEMU_GTIMER_CTL_ISTAT;
+}
+/* TVAL is a *delta*: reading it returns comparator - counter, writing it sets
+ * the comparator to counter + delta. Linux's arch timer clockevent programs
+ * every tick through CNTV_TVAL_EL0 (not CNTV_CVAL_EL1), so leaving it
+ * unimplemented dropped every re-arm on the floor: the comparator stayed in
+ * the past, the PPI stayed pending, and the guest spent the whole boot
+ * re-entering the timer handler instead of running. */
+static uint64_t get_cntv_tval(const oemu_sysregs *sr) {
+  return sr->cntv_cval_el1 - (sr->cntvct - sr->cntvoff_el1);
+}
+static void set_cntv_tval(oemu_sysregs *sr, uint64_t value) {
+  sr->cntv_cval_el1 = (sr->cntvct - sr->cntvoff_el1) + value;
+}
+static void set_cntp_tval(oemu_sysregs *sr, uint64_t value) {
+  sr->cntp_cval_el1 = sr->cntvct + value;
 }
 
 static const oemu_sysreg_row k_rows[] = {
@@ -551,6 +597,20 @@ static const oemu_sysreg_row k_rows[] = {
      .reset_value = 0,
      .get = get_daif,
      .set = set_daif},
+    {.name = "FPCR",
+     .sel = OEMU_SYSREG_FPCR,
+     .min_el = OEMU_EL0,
+     .flags = OEMU_SYSREG_F_NONE,
+     .offset = offsetof(oemu_sysregs, fpcr),
+     .write_mask = UINT64_C(0xFFFFFFFF),
+     .reset_value = 0},
+    {.name = "FPSR",
+     .sel = OEMU_SYSREG_FPSR,
+     .min_el = OEMU_EL0,
+     .flags = OEMU_SYSREG_F_NONE,
+     .offset = offsetof(oemu_sysregs, fpsr),
+     .write_mask = UINT64_C(0xFFFFFFFF),
+     .reset_value = 0},
     {.name = "PMUSERENR_EL0",
      .sel = OEMU_SYSREG_PMUSERENR_EL0,
      .min_el = OEMU_EL0,
@@ -614,6 +674,15 @@ static const oemu_sysreg_row k_rows[] = {
      * privileged CNTP_* / CNTVOFF views land in the same 0x1f__ band as the
      * EL0 counter views (CNTKCTL_EL1 alone keeps its low 0x07__ slot). Values
      * are read straight out of vmlinux, never from an alias table. */
+    /* FPCR/FPSR: the two FP status registers, and they are not optional for a
+     * modern Linux. 6.6's fpsimd_load_state/fpsimd_save_state run on every
+     * return to user mode and issue `mrs x0, fpcr` / `msr fpcr, x8`
+     * unconditionally -- system_supports_fpsimd() is !have_cpucap(ARM64_HAS_
+     * NO_FPSIMD), and that cap is a dummy nothing can set -- so refusing these
+     * selectors traps an Undefined instruction inside the return-to-user path
+     * and the guest dies before /init ever starts. Both are EL0-accessible,
+     * both are 32-bit wide (the write mask is the architecture's, not ours),
+     * and both reset to zero, which is what the oracle's Cortex-A53 shows. */
     {.name = "CNTVOFF_EL1",
      .sel = OEMU_SYSREG_CNTVOFF_EL1,
      .min_el = OEMU_EL1,
@@ -641,9 +710,11 @@ static const oemu_sysreg_row k_rows[] = {
      .sel = OEMU_SYSREG_CNTP_CTL_EL1,
      .min_el = OEMU_EL1,
      .flags = 0,
-     .offset = offsetof(oemu_sysregs, cntp_ctl_el1),
+     .offset = 0,
      .write_mask = ~(uint64_t)0,
-     .reset_value = 0},
+     .reset_value = 0,
+     .get = get_cntp_ctl,
+     .set = set_cntp_ctl},
     {.name = "CNTP_CVAL_EL1",
      .sel = OEMU_SYSREG_CNTP_CVAL_EL1,
      .min_el = OEMU_EL1,
@@ -654,18 +725,21 @@ static const oemu_sysreg_row k_rows[] = {
     {.name = "CNTP_TVAL_EL1",
      .sel = OEMU_SYSREG_CNTP_TVAL_EL1,
      .min_el = OEMU_EL1,
-     .flags = OEMU_SYSREG_F_RO,
+     .flags = 0,
      .offset = 0,
-     .write_mask = 0,
+     .write_mask = ~(uint64_t)0,
      .reset_value = 0,
-     .get = get_cntp_tval},
+     .get = get_cntp_tval,
+     .set = set_cntp_tval},
     {.name = "CNTV_CTL_EL0",
      .sel = OEMU_SYSREG_CNTV_CTL_EL0,
      .min_el = OEMU_EL1,
      .flags = 0,
-     .offset = offsetof(oemu_sysregs, cntv_ctl_el1),
+     .offset = 0,
      .write_mask = ~(uint64_t)0,
-     .reset_value = 0},
+     .reset_value = 0,
+     .get = get_cntv_ctl,
+     .set = set_cntv_ctl},
     {.name = "CNTV_CVAL_EL0",
      .sel = OEMU_SYSREG_CNTV_CVAL_EL0,
      .min_el = OEMU_EL1,
@@ -673,6 +747,15 @@ static const oemu_sysreg_row k_rows[] = {
      .offset = offsetof(oemu_sysregs, cntv_cval_el1),
      .write_mask = ~(uint64_t)0,
      .reset_value = 0},
+    {.name = "CNTV_TVAL_EL0",
+     .sel = OEMU_SYSREG_CNTV_TVAL_EL0,
+     .min_el = OEMU_EL1,
+     .flags = 0,
+     .offset = 0,
+     .write_mask = ~(uint64_t)0,
+     .reset_value = 0,
+     .get = get_cntv_tval,
+     .set = set_cntv_tval},
     /* SP_ELx sits in the op1 bank of the level ABOVE it (op1=4 = EL2+), so
      * SP_EL1 is reachable from EL2 and EL3 only; an EL1 guest uses its own
      * banked SP through SP plus SPSel instead. min_el=OEMU_EL2 here means

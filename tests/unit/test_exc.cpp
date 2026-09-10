@@ -25,10 +25,10 @@ uint64_t BootPstate(oemu_el el) {
   return pstate;
 }
 
-// Entry PSTATE: h-mode of the target, DAIF all set, IL set.
+// Entry PSTATE: h-mode of the target, DAIF all set, IL clear -- the handler
+// runs in a legal state; IL is only ever recorded in a saved SPSR.
 uint64_t EntryPstate(oemu_el el) {
-  return oemu_pstate_mode(el) | (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT) |
-         OEMU_PSTATE_IL;
+  return oemu_pstate_mode(el) | (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT);
 }
 
 constexpr uint64_t kIlBit = 1U << 25;  // ESR IL: raised by a 32-bit instruction
@@ -104,8 +104,11 @@ TEST_F(ExcTest, SvcFromEl0DeliversToTheLowerElVectorGroup) {
 
   EXPECT_EQ(0x400U, regs.pc);
   EXPECT_EQ(EntryPstate(OEMU_EL1), sr.pstate);
-  // The interrupted world is recorded in EL1's banks.
-  EXPECT_EQ(0x3000U, sr.elr_el[OEMU_EL1]);
+  // The interrupted world is recorded in EL1's banks -- and for SVC the recorded
+  // address is the one the call *returns to*, i.e. past the trap: an ELR naming
+  // the svc itself makes the kernel's eret re-issue the system call forever,
+  // with x0 (the fd, for a write) holding the previous return value.
+  EXPECT_EQ(0x3004U, sr.elr_el[OEMU_EL1]);
   EXPECT_EQ(BootPstate(OEMU_EL0), sr.spsr_el[OEMU_EL1]);
   EXPECT_EQ(EcBase(OEMU_EXC_EC_SVC64) | kIlBit | 0x42U, sr.esr_el[OEMU_EL1]);
   // FAR is not an SVC attribute and must stay untouched.
@@ -139,7 +142,7 @@ TEST_F(ExcTest, El3KeepsItsOwnExceptions) {
 
   EXPECT_EQ(0x80200U, regs.pc);  // vbar_el3 0x80000 + 0x200 (same EL, SPSel=1)
   EXPECT_EQ(EntryPstate(OEMU_EL3), sr.pstate);
-  EXPECT_EQ(0x9000U, sr.elr_el[OEMU_EL3]);
+  EXPECT_EQ(0x9004U, sr.elr_el[OEMU_EL3]);  // past the svc: a taken call is not re-run
   EXPECT_EQ(BootPstate(OEMU_EL3), sr.spsr_el[OEMU_EL3]);
   EXPECT_EQ(0x2000U, sr.sp_el[OEMU_EL3]);
 }
@@ -157,6 +160,28 @@ TEST_F(ExcTest, TakeWithIrqKindLeavesEsrAndFarAlone) {
   EXPECT_EQ(0U, sr_.far_el[OEMU_EL1]);
 }
 
+TEST_F(ExcTest, IrqEntrySavesTheConditionFlagsItInterrupted) {
+  // SPSR_ELx holds the *whole* interrupted PSTATE, condition flags included.
+  // They live in the register file rather than the sysreg bank's pstate, so
+  // entry has to fold them in by hand. Saving mode and DAIF alone handed every
+  // ERET a zeroed NZCV, and the interrupted code then branched on whatever its
+  // handler had last left in the flags: measured on issue #28, where an IRQ
+  // landing between a `cmp` and its `b.cond` silently skipped loop iterations.
+  const uint32_t flags = OEMU_NZCV_N | OEMU_NZCV_C | OEMU_NZCV_V; /* N=1 Z=0 C=1 V=1 */
+  oemu_regs_set_nzcv(&regs_, flags);
+  ASSERT_EQ(flags, oemu_regs_nzcv(&regs_));
+  ASSERT_EQ(0ULL, sr_.spsr_el[OEMU_EL1]); /* the interrupted world's SPSR is clear */
+
+  oemu_exc_take(&regs_, &sr_, OEMU_EXC_KIND_IRQ, OEMU_EL1, 0U, 0U, false);
+
+  EXPECT_EQ((uint64_t)flags, sr_.spsr_el[OEMU_EL1] & (uint64_t)OEMU_NZCV_MASK);
+  /* The masks still say masked, and the PC is in the IRQ slot: only the flags
+   * were added to the saved PSTATE, nothing else about the entry state. */
+  EXPECT_NE(0ULL, sr_.spsr_el[OEMU_EL1] &
+                      ((uint64_t)OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT));
+  EXPECT_EQ(0x8000U + 0x200U + 0x080U, regs_.pc);
+}
+
 TEST_F(ExcTest, SerrorWritesEsr) {
   const uint32_t esr = EcBase(OEMU_EXC_EC_SERROR) | kIlBit;
   oemu_exc_take(&regs_, &sr_, OEMU_EXC_KIND_SERROR, OEMU_EL1, esr, 0x6000, false);
@@ -171,10 +196,12 @@ TEST_F(ExcTest, FarIsWrittenOnlyWhenValid) {
   EXPECT_EQ(0x6000U, sr_.far_el[OEMU_EL1]);
 }
 
-TEST_F(ExcTest, EntryAlwaysRecordsIlInSpsrOnNestedExceptions) {
+TEST_F(ExcTest, NestedEntryRecordsTheHandlersLegalPstate) {
+  /* The handler runs with IL clear, so a nested exception saves IL=0. Charging
+   * the handler's own PSTATE with IL=1 made the nested ERET an illegal one. */
   oemu_exc_undefined(&regs_, &sr_, 0);  // entry: SPSR = boot PSTATE (IL=0)
-  oemu_exc_undefined(&regs_, &sr_, 0);  // nested: SPSR = entry PSTATE (IL=1)
-  EXPECT_EQ(OEMU_PSTATE_IL, sr_.spsr_el[OEMU_EL1] & OEMU_PSTATE_IL);
+  oemu_exc_undefined(&regs_, &sr_, 0);  // nested: SPSR = entry PSTATE (IL=0)
+  EXPECT_EQ(0U, sr_.spsr_el[OEMU_EL1] & OEMU_PSTATE_IL);
 }
 
 // --- entry: abort helpers ---------------------------------------------------------
@@ -249,7 +276,9 @@ TEST_F(ExcTest, EretRestoresTheInterruptedWorld) {
 
   oemu_exc_eret(&regs_, &sr_);
 
-  EXPECT_EQ(0x1000U, regs_.pc);  // ELR_EL1
+  // The round trip has to land on the instruction *after* the trap: this is the
+  // contract that makes a system call return rather than re-issue itself.
+  EXPECT_EQ(0x1004U, regs_.pc);  // ELR_EL1
   EXPECT_EQ(boot_pstate, sr_.pstate);
   EXPECT_EQ(0x41000000U, regs_.sp);
   EXPECT_EQ(0U, sr_.pstate & OEMU_PSTATE_IL);
@@ -284,7 +313,8 @@ TEST_F(ExcTest, EretWithIlSetDeliversIllegalEret) {
 
   EXPECT_EQ(EcBase(OEMU_EXC_EC_ILLEGAL_ERET) | kIlBit, sr_.esr_el[OEMU_EL1]);
   EXPECT_EQ(0x8200U, regs_.pc);  // re-entered the same-EL sync vector
-  EXPECT_EQ(OEMU_PSTATE_IL, sr_.pstate & OEMU_PSTATE_IL);
+  /* The illegal-ERET handler itself runs in a legal state. */
+  EXPECT_EQ(0U, sr_.pstate & OEMU_PSTATE_IL);
 }
 
 TEST_F(ExcTest, EretToAHigherElIsUndefined) {
@@ -337,6 +367,28 @@ TEST_F(ExcTest, EcNamesAreStableAndNeverNull) {
   EXPECT_STREQ("IllegalERET", oemu_exc_ec_name(OEMU_EXC_EC_ILLEGAL_ERET));
   EXPECT_STREQ("DAbortLower", oemu_exc_ec_name(OEMU_EXC_EC_DABORT_LOWER));
   EXPECT_STREQ("unknown", oemu_exc_ec_name(static_cast<oemu_exc_ec>(0x3FU)));
+}
+
+TEST_F(ExcTest, TakingAnInterruptAtEl1hStoresTheFrameOnTheLiveStack) {
+  // PSTATE.SP=1 at EL1 makes SP_EL1 the active stack, so an exception entry must
+  // keep using the SP the guest last moved and must not resurrect a stale bank
+  // copy. On the M5 boot the raw sp_el[OEMU_EL1] slot kept holding the boot
+  // stack (0x4ffffff0) long after the kernel had moved to a task stack, which
+  // looks alarming in a trace: it is benign only because the entry path keeps
+  // the live SP (asserted below) and because the guest cannot read SP_EL1 at
+  // EL1 to notice (MRS SP_EL1 is Undefined below EL2, so it never reaches the
+  // stale slot either).
+  oemu_regs_set_sp(&regs_, 0x41000000ULL);
+  sr_.sp_el[OEMU_EL1] = 0x4ffffff0ULL;
+  oemu_exc_take(&regs_, &sr_, OEMU_EXC_KIND_IRQ, OEMU_EL1, 0U, 0U, false);
+  EXPECT_EQ(0x8280U, regs_.pc);  // IRQ slot of the EL1h group: base 0x200 + 0x80
+  EXPECT_EQ(0x41000000ULL, oemu_regs_sp(&regs_));
+  EXPECT_EQ(0x1000U, sr_.elr_el[OEMU_EL1]);
+  // Crossing into another bank and back deposits the live value, so the slot is
+  // refreshed rather than left as whatever the boot path stored there.
+  oemu_sysregs_switch_sp(&sr_, OEMU_PSTATE_M_EL0T);
+  oemu_sysregs_switch_sp(&sr_, OEMU_PSTATE_M_EL1H);
+  EXPECT_EQ(0x41000000ULL, sr_.sp_el[OEMU_EL1]);
 }
 
 }  // namespace

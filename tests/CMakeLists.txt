@@ -369,6 +369,22 @@ oemu_add_test(test_gicv2_internal
   LABELS "unit;whitebox"
 )
 
+# The boot-time virt device tree: read back through the internal FDT reader so
+# the shape the guest driver binds to (chosen/initrd/GIC/timer/PSCI/PL011) is
+# pinned, not merely written.
+oemu_add_test(test_virt_dtb
+  SOURCES unit/test_virt_dtb.cpp
+  INTERNAL
+  LABELS "unit;whitebox"
+)
+
+# The generic-timer expiry predicate: a pure over-(counter,ctl,cval) rule, so
+# the tick that advances an idle guest's jiffies is pinned without a guest.
+oemu_add_test(test_gtimer
+  SOURCES unit/test_gtimer.cpp
+  LABELS unit
+)
+
 # The PSCI/SMCCC conduit: function IDs from the guest's own contract, and the
 # rule that a PSCI-shaped or SMCCC-standard call is always consumed --
 # bouncing one back as an exception is what oopsed the kernel at boot.

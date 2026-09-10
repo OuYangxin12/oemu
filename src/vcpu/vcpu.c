@@ -128,12 +128,25 @@ oemu_status oemu_vcpu_step(oemu_vcpu *vcpu, oemu_insn *insn_out) {
     return OEMU_ERR_TIMEOUT; /* the scheduler owns the re-arm */
   }
 
-  /* The generic timer's counter advances with guest progress. The fixed step
-   * is a modelled clock rate: the counter must move fast enough that a
-   * busy-wait delay (the kernel's __delay_cycles, including calibrate's
-   * 1e6-cycle measurement) finishes in a handful of steps rather than a
-   * million, while the kernel's only requirement is that it be monotonic. */
-  vcpu->sysregs.cntvct += 1000000U;
+  /* The generic timer's counter advances with guest progress, one count per
+   * retired instruction: the modelled core runs at exactly the rate the guest
+   * is told (OEMU_CNTFRQ_EL0_DEFAULT, 62.5 MHz, which is what CNTFRQ_EL0
+   * reports and what arch_timer prints), so the counter is not merely monotonic
+   * but *interpretable* -- a count delta means the same span of guest time to
+   * the guest that it means to us.
+   *
+   * The old step was 1000000 counts per instruction, chosen so that a busy-wait
+   * would retire in a handful of steps. That made the counter 16 million times
+   * faster than the frequency the guest was told, and the guest is entitled to
+   * use that number: at 62.5 MHz the kernel's one-jiffy comparator delta is
+   * 625000 counts, which the old step satisfied with a single instruction, so
+   * every tick fired the instant it was armed (measured: ~5600 IRQ deliveries
+   * per 150M instructions), calibrate_delay() calibrated the loops against a
+   * clock that moved that way, and the guest's whole sense of time -- RCU
+   * grace periods, watchdows, mdelay(), the timer wheel -- ran on it. A
+   * delay loop is then simply an honest O(n) busy wait, which is what it is on
+   * real hardware too. */
+  vcpu->sysregs.cntvct += OEMU_TIMER_COUNTS_PER_INSN;
 
   /* Interrupts are taken before the fetch, so ELR names the instruction that
    * was about to run (precise, and the instruction re-executes after the

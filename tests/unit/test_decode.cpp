@@ -714,6 +714,18 @@ TEST(DecodeDataProcessing, DecodesCrc32) {
   EXPECT_EQ(8u, DecodeOk(0x9ac24c20U).uimm);
 }
 
+TEST(DecodeDataProcessing, DecodesCrc32c) {
+  // The Castagnoli forms sit one field value above the plain ones. Reporting
+  // them unsupported was an undefined-instruction trap on a CPU that does
+  // implement the CRC extension -- Linux's crc32c users hit it.
+  EXPECT_EQ(OEMU_OP_CRC32C, DecodeOk(0x1ac25020U).op);  // crc32cb w0, w1, w2
+  EXPECT_EQ(OEMU_OP_CRC32C, DecodeOk(0x1ac25420U).op);  // crc32ch w0, w1, w2
+  EXPECT_EQ(OEMU_OP_CRC32C, DecodeOk(0x1ac25820U).op);  // crc32cw w0, w1, w2
+  EXPECT_EQ(OEMU_OP_CRC32C, DecodeOk(0x9ac25c20U).op);  // crc32cx x0, x1, x2
+  EXPECT_EQ(1u, DecodeOk(0x1ac25020U).uimm);
+  EXPECT_EQ(8u, DecodeOk(0x9ac25c20U).uimm);
+}
+
 TEST(DecodeDataProcessing, RevIsWidthDependent) {
   // opcode 0b000010 is REV at 32-bit width but REV32 at 64-bit.
   EXPECT_EQ(OEMU_OP_REV, DecodeOk(0x5ac00820U).op);    // rev w0, w1

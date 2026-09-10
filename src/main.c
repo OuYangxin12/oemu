@@ -42,6 +42,7 @@
 #include "oemu/elf.h"
 #include "oemu/exec.h"
 #include "oemu/fdt.h"
+#include "oemu/gtimer.h"
 #include "oemu/image.h"
 #include "oemu/machine.h"
 #include "oemu/memory.h"
@@ -50,6 +51,7 @@
 #include "oemu/sysenv.h"
 #include "oemu/sysreg.h"
 #include "oemu/vcpu.h"
+#include "oemu/virt_dtb.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -62,6 +64,12 @@
 #include "boot_dtb.h" /* generated: the fixture blob as bytes */
 #include "oemu/gicv2.h"
 #include "oemu/pl011.h"
+
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/random.h>
+#include <termios.h>
+#include <unistd.h>
 
 /*
  * Stack policy. A freestanding guest's crt0 only needs a 16-byte-aligned SP --
@@ -100,25 +108,56 @@
  * and size from docs/linux-minimal-qemu.md, image address from the booting.rst
  * protocol, UART address from virt's memory map.
  */
-#define BOOT_RAM_BASE        ((uint64_t)0x40000000ULL)
-#define BOOT_RAM_DEFAULT     ((uint64_t)1024U) /* MiB; the fixture DTB's memory node */
-#define BOOT_DTB_SLOT        1U                /* one more region: the DTB rides the bus too */
-#define BOOT_IMAGE_BASE      ((uint64_t)0x40080000ULL) /* booting.rst kernel load address */
-#define BOOT_UART_BASE       ((uint64_t)0x09000000ULL) /* virt UART0 -- oracle-portable */
-#define BOOT_UART_SIZE       ((uint64_t)0x00001000ULL)
-#define BOOT_GIC_DIST_BASE   ((uint64_t)0x08000000ULL) /* virt GICD -- DT reg[0] */
-#define BOOT_GIC_DIST_SIZE   ((uint64_t)0x00010000ULL)
-#define BOOT_GIC_CPU_BASE    ((uint64_t)0x08010000ULL) /* virt GICC -- DT reg[1] */
-#define BOOT_GIC_CPU_SIZE    ((uint64_t)0x00010000ULL)
-#define BOOT_GIC_LINES       64U              /* two groups: NR_IRQS 64, as the oracle */
-#define BOOT_DTB_MAX         ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
-#define BOOT_CMDLINE_MAX     (256U)           /* writable boot line width */
-#define BOOT_BOOTLINE_LEN    (257U)           /* the fixture property: pad + NUL */
-#define BOOT_REGION_CAPACITY 8U               /* RAM + UART + DTB + room for M4 devices */
+#define BOOT_RAM_BASE      ((uint64_t)0x40000000ULL)
+#define BOOT_RAM_DEFAULT   ((uint64_t)1024U) /* MiB; the fixture DTB's memory node */
+#define BOOT_DTB_SLOT      1U                /* one more region: the DTB rides the bus too */
+#define BOOT_IMAGE_BASE    ((uint64_t)0x40080000ULL) /* booting.rst kernel load address */
+#define BOOT_UART_BASE     ((uint64_t)0x09000000ULL) /* virt UART0 -- oracle-portable */
+#define BOOT_UART_SIZE     ((uint64_t)0x00001000ULL)
+#define BOOT_GIC_DIST_BASE ((uint64_t)0x08000000ULL) /* virt GICD -- DT reg[0] */
+#define BOOT_GIC_DIST_SIZE ((uint64_t)0x00010000ULL)
+#define BOOT_GIC_CPU_BASE  ((uint64_t)0x08010000ULL) /* virt GICC -- DT reg[1] */
+#define BOOT_GIC_CPU_SIZE  ((uint64_t)0x00010000ULL)
+#define BOOT_GIC_LINES     64U /* two groups: NR_IRQS 64, as the oracle */
+/* The PL011's single line: /interrupts = <0 1 4> -> SPI, offset 1 -> id 33. */
+#define BOOT_UART_SPI 33U
+/* The generic timer's PPIs, read off the DT's /timer interrupts in binding
+ * order <1,13> <1,14> <1,11> <1,10>, which the arm,armv8-timer binding reads as
+ * [secure phys, non-secure phys, virtual, hyp] = [29, 30, 27, 26]. Those ids are
+ * the architecture's, not a choice: PPI 26 is the EL2 physical timer, 27 the
+ * non-secure EL1 *virtual* one, 30 the non-secure physical, 29 the secure. Our
+ * guest therefore clocks itself on the virtual comparator -- it writes
+ * CNTV_CTL/CNTV_CVAL and unmasks INTID 27, both measured off QEMU-booted guest
+ * behaviour -- and the earlier wiring here (virtual comparator on 26, the hyp
+ * timer's line) meant its comparator expired against a line the guest never
+ * enabled: no tick, jiffies frozen, the async device probe never ran,
+ * /dev/console never opened, and pid 1 spun in a write() retry loop forever.
+ * So: virtual comparator -> 27, non-secure physical comparator -> 30. The 29
+ * (secure) and 26 (EL2 physical) lines stay undriven because oemu models
+ * neither a secure world nor an EL2 timer, and the distributor keeps a line the
+ * guest never enabled quiet anyway. */
+#define BOOT_TIMER_PHYS_PPI 30U
+#define BOOT_TIMER_VIRT_PPI 27U
+#define BOOT_DTB_MAX        ((size_t)65536U) /* a DTB over 64 KiB is a mistake */
+#define BOOT_CMDLINE_MAX    (256U)           /* writable boot line width */
+#define BOOT_BOOTLINE_LEN   (257U)           /* the fixture property: pad + NUL */
+/* The initrd sits at the three-quarter mark of RAM -- clear of kernel text at
+ * the base, clear of the DTB at the half mark, and clear of the boot stack at
+ * the very top by BOOT_INITRD_MARGIN. A tree that advertises the initrd must
+ * not let it overlap what the kernel unpacks there. */
+#define BOOT_INITRD_MARGIN   ((uint64_t)16U << 20) /* headroom to the RAM top */
+#define BOOT_REGION_CAPACITY 8U                    /* RAM + UART + DTB + room for M4 devices */
 /* Instructions per scheduler slice. One vCPU, so a quantum is purely the
  * latency bound between machine-event polls; 1M keeps a stuck guest inside
  * the 60 s test budget while keeping syscall-free slices cheap. */
 #define BOOT_QUANTUM UINT64_C(1000000)
+/* How often the level-driven interrupt inputs are re-sampled. The pins are the
+ * GIC's word, and the GIC only knows what main.c last pushed into it, so the
+ * sampling period is the staleness of every level line: a comparator the guest
+ * has re-armed into the future keeps its PPI pending until the next sample, and
+ * the guest re-enters the handler every time it unmasks. At the boot slice of
+ * 1e6 that nesting ran the stack down into the page tables. */
+#define BOOT_LEVEL_QUANTUM UINT64_C(64)
 
 /* Round `v` up to a multiple of the power-of-two `align`. */
 static uint64_t align_up(uint64_t v, uint64_t align) {
@@ -134,9 +173,16 @@ static uint64_t stack_base_for(const oemu_elf_image *img) {
 
 static void print_usage(FILE *out) {
   (void)fputs("usage: oemu run <image.elf> [--max-insns N]\n", out);
-  (void)fputs("       oemu boot -kernel <Image> [-append <cmdline>] [-m MiB] [-dtb <file>]\n",
+  (void)fputs(
+      "       oemu boot -kernel <Image> [-initrd <cpio>] [-append <cmdline>] "
+      "[-m MiB] [-dtb <file>]\n",
+      out);
+  (void)fputs("                 [--serial file:PATH|stdio] [--entry ADDR] [--max-insns N]\n",
               out);
-  (void)fputs("                 [--serial file:PATH] [--entry ADDR] [--max-insns N]\n", out);
+  (void)fputs(
+      "       --serial stdio wires the console to our stdin: a guest parked at a\n"
+      "       prompt is waiting for a keystroke, and EOF on stdin ends the run.\n",
+      out);
   (void)fputs("       oemu --help\n", out);
 }
 
@@ -514,23 +560,217 @@ static void boot_hang_report(const oemu_vcpu *vcpu, const char *why, uint64_t in
                 esr, far, elr, spsr);
 }
 
-static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
-                    const oemu_gicv2 *gic, uint64_t max_insns) {
+/* Where a stalled console left the UART: enough state to tell "the guest never
+ * printed it" from "the driver never drained it". A boot that ends with bytes
+ * queued, or with a latched-but-unhandled interrupt, or with the modem flags
+ * flow-controlling transmit, is a device-model bug and says so here. */
+static void boot_uart_report(const oemu_pl011 *uart) {
+  if (uart == NULL) {
+    return;
+  }
+  (void)fprintf(stderr,
+                "oemu:   uart: tx_queued=%u tx_emitted=%" PRIu64 " tx_dropped=%" PRIu64
+                " rx_queued=%u CR=0x%03x FR=0x%02x RIS=0x%03x IMSC=0x%03x\n",
+                uart->tx_count, uart->tx_emitted, uart->tx_dropped, uart->rx_count, uart->cr,
+                uart->fr, uart->ris, uart->imsc);
+}
+
+/* One line to stderr if the console dropped anything: a boot gate decides on
+ * the log it captured, and a truncated log must never be read as "the guest
+ * never printed it". */
+static void boot_console_warn(const oemu_pl011 *uart, uint64_t input_dropped) {
+  if (input_dropped != 0ULL) {
+    (void)fprintf(
+        stderr, "oemu: console dropped %" PRIu64 " input byte(s): the guest never read them\n",
+        input_dropped);
+  }
+  const uint64_t lost = oemu_pl011_tx_dropped(uart);
+  if (lost != 0U) {
+    (void)fprintf(stderr, "oemu: console dropped %" PRIu64 " TX bytes (log is truncated)\n",
+                  lost);
+  }
+}
+
+/* Sample every level-driven interrupt input and hand the GIC's verdict to the
+ * vCPU. Called between sub-slices, because the pending bits are only as fresh
+ * as the last call: a PPI whose comparator the guest has already re-armed must
+ * stop being pending before the guest unmasks again, or it re-enters the
+ * handler and walks the stack down. */
+static void boot_refresh_levels(oemu_vcpu *vcpu, oemu_gicv2 *gic, oemu_pl011 *uart) {
+  /* The PL011 is a level source on GIC SPI 33 (the DT's /interrupts). Refresh
+   * the distributor's pending bit from the UART's live level each slice, so a
+   * received byte reaches the driver as interrupt 33 -- not a flat pin whose
+   * GICC_IAR the driver would read back as spurious. The vCPU's IRQ is then
+   * the GIC's word alone. */
+  oemu_gicv2_set_pending(gic, BOOT_UART_SPI, oemu_pl011_irq_level(uart) != 0);
+  /* The generic timer's clockevent comparator is level-high once the counter
+   * passes it, so refresh the DT-declared PPIs from the live comparator each
+   * slice. Without this the counter moves but jiffies never tick and an idle
+   * guest soft-locks waiting for a timer IRQ that never arrives. */
+  const oemu_sysregs *sr = &vcpu->sysregs;
+  /* /timer's interrupts are <1,13>,<1,14>,<1,11>,<1,10> = PPIs 29, 30, 27, 26,
+   * and the generic arch timer picks its event PPI from that order: a guest
+   * that came up at EL2 (which is what our firmware hands over) programs the
+   * *virtual* comparator and takes PPI 26, while a guest that believes it owns
+   * the physical timer programs CNTP_* and takes PPI 30. Both banks therefore
+   * drive their own PPI -- conflating them is what kept this guest tickless:
+   * the virtual comparator was wired to 30, whose handler is the physical
+   * timer's, so the counter ran, no handler ever ran, jiffies froze at 2, no
+   * async probe ran, /dev/console never opened, and pid 1 spun in a write()
+   * retry loop forever. */
+  oemu_gicv2_set_pending(gic, BOOT_TIMER_VIRT_PPI,
+                         oemu_gtimer_pending(sr->cntvct - sr->cntvoff_el1, sr->cntv_ctl_el1,
+                                             sr->cntv_cval_el1) != 0);
+  oemu_gicv2_set_pending(
+      gic, BOOT_TIMER_PHYS_PPI,
+      oemu_gtimer_pending(sr->cntvct, sr->cntp_ctl_el1, sr->cntp_cval_el1) != 0);
+  oemu_vcpu_set_irq(vcpu, oemu_gicv2_irq_level(gic) != 0);
+}
+
+/* Hand one slice of typed input to the UART, holding back what it cannot take.
+ *
+ * The device refuses a byte while UARTEN|RXE is clear -- correct for a receiver
+ * that is not listening -- but the driver clears RXE as a matter of course
+ * (`pl011_start_tx` disables the receiver before each transmit, half-duplex
+ * style, and `pl011_stop_tx` restores it), and the oracle is forgiving about the
+ * resulting window: measured at an idle shell prompt its CR is 0x0f01, i.e. RXE
+ * clear, yet a line typed there is still delivered and echoed. So a refused byte
+ * must be held and retried, not dropped: the byte has already left the host
+ * terminal, and the old drop-on-refuse meant a keystroke that arrived during a
+ * transmission -- or before /init opened the tty -- simply vanished, which is
+ * exactly how the SHELL_ALIVE marker went missing. The queue is bounded and the
+ * overflow is counted rather than silently lost. */
+#define BOOT_HELD_MAX 256U
+
+/* Deliver what we are holding and keep back what the device refused: the driver
+ * clears RXE every time it transmits (pl011_start_tx, half-duplex), so a
+ * keystroke can be legitimately unwelcome at the moment it arrives. */
+static void boot_inject_held(oemu_pl011 *uart, unsigned char *held, size_t *held_len) {
+  size_t kept = 0U;
+  for (size_t i = 0U; i < *held_len; ++i) {
+    if (oemu_pl011_inject(uart, held[i]) == OEMU_OK) {
+      continue;
+    }
+    held[kept++] = held[i];
+  }
+  *held_len = kept;
+}
+
+static void boot_pump_stdin(oemu_pl011 *uart, unsigned char *held, size_t *held_len,
+                            uint64_t *dropped, bool *eof) {
+  unsigned char c = 0U;
+  for (;;) {
+    /* poll(2), not O_NONBLOCK: the blocking wait below borrows the descriptor
+     * and has to be able to hand it back in any state, and a pump that blocks
+     * in read() never returns to run the guest it just fed -- which is how a
+     * held-over line once sat in the UART ring while the run loop hung. */
+    struct pollfd waiting = {STDIN_FILENO, (short)POLLIN, 0};
+    if (poll(&waiting, 1U, 0) <= 0) {
+      break; /* nothing typed at this instant (or the console is gone) */
+    }
+    const ssize_t got = read(STDIN_FILENO, &c, 1U);
+    if (got < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    if (got == 0) {
+      *eof = true;
+      break; /* the pipe is closed: no keystroke is ever coming */
+    }
+    if (*held_len >= BOOT_HELD_MAX) {
+      (*dropped)++; /* a guest that never opens its console loses input */
+    } else {
+      held[(*held_len)++] = c;
+    }
+  }
+  boot_inject_held(uart, held, held_len);
+}
+
+/* A parked vCPU whose console is wired to our stdin is an *idle* guest, not a
+ * dead one: the shell is sitting in read(2) waiting for someone to type, which is
+ * exactly what the boot gate does -- its interactive line arrives seconds after
+ * the prompt. QEMU's -serial stdio simply blocks in read() here; declaring the
+ * boot blocked instead loses the marker no matter how far the guest got. So wait
+ * for the next byte (with the O_NONBLOCK we set, cleared), feed it, and only give
+ * up once stdin has reported EOF. */
+static bool boot_await_input(oemu_pl011 *uart, unsigned char *held, size_t *held_len,
+                             uint64_t *dropped, bool *eof) {
+  if (*held_len != 0U) {
+    boot_inject_held(uart, held, held_len);
+    if (*held_len != 0U) {
+      return true; /* input is still queued: the guest has a reason to run */
+    }
+  }
+  if (*eof) {
+    return false;
+  }
+  const int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+  if ((flags >= 0) && ((flags & O_NONBLOCK) != 0)) {
+    (void)fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
+  }
+  unsigned char c = 0U;
+  bool got = false;
+  ssize_t n = read(STDIN_FILENO, &c, 1U);
+  while ((n < 0) && (errno == EINTR)) {
+    n = read(STDIN_FILENO, &c, 1U);
+  }
+  if (flags >= 0) {
+    (void)fcntl(STDIN_FILENO, F_SETFL, flags); /* exactly the flags we found */
+  }
+  if (n == 1) {
+    got = true;
+    if (*held_len < BOOT_HELD_MAX) {
+      held[(*held_len)++] = c;
+    } else {
+      (*dropped)++;
+    }
+  } else if (n == 0) {
+    *eof = true;
+    return false;
+  } else {
+    *eof = true; /* a console we cannot read will not become readable */
+    return false;
+  }
+  (void)boot_pump_stdin(uart, held, held_len, dropped, eof); /* the rest of the line */
+  return got;
+}
+
+static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oemu_gicv2 *gic,
+                    bool pump_stdin, uint64_t max_insns) {
   uint64_t budget = max_insns;
+  unsigned char held[BOOT_HELD_MAX];
+  size_t held_len = 0U;
+  uint64_t held_drop = 0U;
+  bool stdin_eof = false;
+  bool idle_announced = false;
   for (;;) {
     const uint64_t slice = (budget < BOOT_QUANTUM) ? budget : BOOT_QUANTUM;
     uint64_t done = 0U;
-    const oemu_status st = oemu_vcpu_run(vcpu, slice, &done);
+    oemu_status st = OEMU_OK;
+    while ((done < slice) && ((st == OEMU_OK) || (st == OEMU_ERR_TIMEOUT))) {
+      const uint64_t remaining = slice - done;
+      const uint64_t chunk = (remaining < BOOT_LEVEL_QUANTUM) ? remaining : BOOT_LEVEL_QUANTUM;
+      uint64_t stepped = 0U;
+      st = oemu_vcpu_run(vcpu, chunk, &stepped);
+      done += stepped;
+      boot_refresh_levels(vcpu, gic, uart);
+      if (stepped == 0U) {
+        break; /* halted: the refresh above decides whether the next slice wakes it */
+      }
+    }
     budget -= done;
     (void)oemu_pl011_pump(uart); /* the console drains on every slice boundary */
-    /* The IRQ line is the OR of every source the machine models. The PL011
-     * still drives it directly (its console is polled, so this stays low in
-     * practice); the GIC aggregates the DT-declared sources -- today none are
-     * wired, so it reads low and the vCPU simply never takes a spurious IRQ. */
-    oemu_vcpu_set_irq(vcpu,
-                      (oemu_pl011_irq_level(uart) != 0) || (oemu_gicv2_irq_level(gic) != 0));
+    /* Interactive console: drain whatever the host typed into the UART RX ring.
+     * A byte the ring cannot hold is dropped, exactly as QEMU drops an early
+     * byte before the driver enables the receiver. */
+    if (pump_stdin) {
+      boot_pump_stdin(uart, held, &held_len, &held_drop, &stdin_eof);
+    }
     const oemu_machine_event ev = oemu_machine_event_peek(machine);
     if (ev == OEMU_MACHINE_EVENT_POWERDOWN) {
+      boot_console_warn(uart, held_drop);
       return machine->exit_code & 0xFF; /* the code travels as a shell sees it */
     }
     if (ev == OEMU_MACHINE_EVENT_RESET) {
@@ -538,7 +778,37 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
       return EXIT_ERROR;
     }
     if (st == OEMU_ERR_BLOCKED) {
+      if (pump_stdin && boot_await_input(uart, held, &held_len, &held_drop, &stdin_eof)) {
+        if (!idle_announced) {
+          idle_announced = true;
+          (void)fputs("oemu: guest idle at the console; handing over input\n", stderr);
+          boot_uart_report(uart); /* did the byte reach the device, or is it still ours? */
+          /* The two ends of the interrupt wire, side by side: a level at the
+           * device that the distributor does not pass, or one it passes that the
+           * core does not take, are different bugs and this line tells them
+           * apart without a rebuild. */
+          (void)fprintf(stderr, "oemu:   irq: device=%d gic=%d into_core=%d\n",
+                        oemu_pl011_irq_level(uart), oemu_gicv2_irq_level(gic),
+                        vcpu->irq_level ? 1 : 0);
+          /* The distributor's whole reason for holding the line back, on one
+           * line: a source that is disabled, masked by the priority mask,
+           * already active, targeted elsewhere, or level-configured but latched
+           * as edge are five different bugs, and each is one field here. */
+          (void)fprintf(stderr,
+                        "oemu:   gic: ctl=0x%x cpu_ctl=0x%x pmr=0x%x running=%u | irq %u"
+                        " en=%u pend=%u act=%u cfg=%u grp=%u pri=0x%02x tgt=0x%02x\n",
+                        gic->ctl, gic->cpu_ctl, gic->cpu_pmr, gic->running_pri, BOOT_UART_SPI,
+                        gic->enable[BOOT_UART_SPI], gic->pending[BOOT_UART_SPI],
+                        gic->active[BOOT_UART_SPI], gic->config[BOOT_UART_SPI],
+                        gic->group[BOOT_UART_SPI], gic->priority[BOOT_UART_SPI],
+                        gic->target[BOOT_UART_SPI]);
+        }
+        boot_refresh_levels(vcpu, gic, uart); /* the byte we just fed may now wake it */
+        oemu_vcpu_rearm(vcpu);
+        continue;
+      }
       boot_hang_report(vcpu, "guest parked", max_insns - budget);
+      boot_uart_report(uart);
       (void)fputs("oemu: guest parked at WFI/WFE with nothing to wake it\n", stderr);
       return EXIT_BLOCKED;
     }
@@ -549,6 +819,8 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
     }
     if (budget == 0U) {
       boot_hang_report(vcpu, "timeout", max_insns);
+      boot_uart_report(uart);
+      boot_console_warn(uart, held_drop);
       return EXIT_TIMEOUT;
     }
     oemu_vcpu_rearm(vcpu);
@@ -559,12 +831,74 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart,
 typedef struct boot_opts {
   const char *kernel;      /* -kernel: required */
   const char *cmdline;     /* -append: NULL when absent */
-  const char *dtb;         /* -dtb:    NULL -> embedded fixture */
+  const char *dtb;         /* -dtb:    NULL -> the generated virt tree */
+  const char *initrd;      /* -initrd: NULL -> no initial ramdisk */
   const char *serial_path; /* --serial file:PATH; NULL -> stdout */
   uint64_t ram_mib;        /* -m:      MiB, defaulting to the fixture's 1 GiB */
   uint64_t entry;          /* --entry: 0 -> the Image header's own entry */
   uint64_t max_insns;      /* --max-insns */
+  bool stdio;              /* -serial stdio: console is interactive (RX wired) */
 } boot_opts;
+
+/* Bytes for /chosen/rng-seed, which the guest's early_init_dt() feeds to
+ * add_bootloader_randomness() before nopping the property out of the live tree.
+ * The oracle always injects a seed, so without one our guest reaches the
+ * initcalls with an uninitialised CRNG -- a divergence no amount of CPU
+ * emulation is going to explain away. Best-effort: on failure the caller omits
+ * the property and the boot carries on, as it always did. */
+static bool boot_rng_seed(void *out, uint32_t len) {
+  if (getrandom(out, len, 0) == (ssize_t)len) {
+    return true;
+  }
+  const int fd = open("/dev/urandom", O_RDONLY);
+  if (fd < 0) {
+    return false;
+  }
+  unsigned char *const bytes = (unsigned char *)out;
+  uint32_t got = 0U;
+  while (got < len) {
+    const ssize_t n = read(fd, bytes + got, (size_t)(len - got));
+    if (n <= 0) {
+      break;
+    }
+    got += (uint32_t)n;
+  }
+  (void)close(fd);
+  return got == len;
+}
+
+/* For `-serial stdio`: put stdin in non-blocking raw mode so the run loop can
+ * drain typed bytes into the UART RX ring between slices without ever blocking
+ * the vCPU. Best-effort -- a redirected or closed stdin just yields EOF. */
+static void boot_arm_stdin(void) {
+  const int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+  if (flags >= 0) {
+    (void)fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+  }
+  struct termios t;
+  if (tcgetattr(STDIN_FILENO, &t) == 0) {
+    /* Raw by hand -- cfmakeraw needs GNU extensions the -std=c11 build hides.
+     * No canonical buffering, no host echo, no flow control: every typed byte
+     * reaches the run loop's read() as-is. */
+    t.c_iflag &= (tcflag_t) ~(BRKINT | ICRNL | INLCR | INPCK | ISTRIP | IXON | IXOFF);
+    t.c_oflag &= (tcflag_t)~OPOST;
+    t.c_lflag &= (tcflag_t) ~(ECHO | ECHOE | ECHONL | ICANON | IEXTEN);
+    t.c_cc[VMIN] = 0;
+    t.c_cc[VTIME] = 0;
+    (void)tcsetattr(STDIN_FILENO, TCSANOW, &t);
+  }
+}
+
+/* Where the initrd goes: the three-quarter mark of RAM. Returns 0 (a signal * the caller turns
+ * into an error) when the ramdisk, plus a margin for the boot stack and kernel heap, would not
+ * fit between that mark and the top of RAM. */
+static uint64_t boot_initrd_addr(uint64_t ram, uint64_t len) {
+  const uint64_t base = BOOT_RAM_BASE + (ram / 4U) * 3U;
+  if ((base + len + BOOT_INITRD_MARGIN) > (BOOT_RAM_BASE + ram)) {
+    return 0U;
+  }
+  return base;
+}
 
 /*
  * Boots an AArch64 Linux Image at EL1 with the M4a boot protocol:
@@ -585,13 +919,20 @@ static int boot(const boot_opts *opts) {
   boot_env benv = {0};
   boot_serial ser = {0};
   oemu_image hdr = {0};
-  unsigned char *dtb = NULL;
+  oemu_buffer initrd = {0};
+  oemu_fdt gen = {0};
+  unsigned char *dtb = NULL;        /* the -dtb blob we own and may patch */
+  const unsigned char *tree = NULL; /* the blob as placed on the bus (read-only view) */
   size_t dtb_len = 0U;
   size_t len = 0U;
   FILE *serial = NULL;
   const uint64_t ram = opts->ram_mib * (1U << 20);
   uint64_t entry = 0U;
   uint64_t dtb_pa = 0U;
+  uint64_t initrd_pa = 0U;
+  size_t initrd_len = 0U;
+  bool generated = (opts->dtb == NULL); /* no -dtb -> build the virt tree ourselves */
+  bool have_initrd = (opts->initrd != NULL);
   oemu_status st = OEMU_OK;
   int result = EXIT_ERROR;
 
@@ -603,29 +944,83 @@ static int boot(const boot_opts *opts) {
     goto done;
   }
   len = oemu_buffer_len(&image);
-  if (dtb_load(opts->dtb, &dtb, &dtb_len) != 0) {
-    (void)fprintf(stderr, "oemu: could not load the device tree\n");
-    goto done;
-  }
-  if ((dtb_len < 40U) || (be32(dtb) != BOOT_FDT_MAGIC) || (be32(dtb + 4U) > dtb_len) ||
-      (dtb_len > BOOT_DTB_MAX)) {
-    (void)fprintf(stderr, "oemu: %s is not a valid device tree blob\n",
-                  opts->dtb != NULL ? opts->dtb : "the embedded fixture");
-    goto done;
-  }
-  if (opts->cmdline != NULL) {
-    if (!dtb_patch_bootline(dtb, dtb_len, opts->cmdline)) {
-      (void)fprintf(stderr, "oemu: -append: this DTB has no /chosen/bootline to write\n");
+  if (have_initrd) {
+    if (oemu_buffer_init(&initrd, 0U) != OEMU_OK) {
+      (void)fputs("oemu: out of memory\n", stderr);
       goto done;
     }
+    if (read_file(opts->initrd, &initrd) != 0) {
+      goto done;
+    }
+    initrd_len = oemu_buffer_len(&initrd);
   }
-  /* The tree's /memory reg must describe the RAM we actually build, or a
-   * guest trusts a lie. The fixture's single memory@40000000 node gets its
-   * size cell rewritten in place -- same width, no layout shift. A tree with
-   * no /memory node (a minimal probe fixture, say) asserts nothing about RAM,
-   * so there is nothing to keep honest: warn and carry on. */
-  if (!dtb_patch_node(dtb, dtb_len, BOOT_RAM_BASE, ram)) {
-    (void)fprintf(stderr, "oemu: note: the device tree has no /memory node to size\n");
+  if (generated) {
+    /* Build the device tree in-process (oemu/fdt): the only way to hand the
+     * guest a /chosen with linux,initrd-start/end without an offline dtc. The
+     * -append command line lands in /chosen/bootargs, the property the kernel
+     * actually reads -- unlike the fixture's decoy /chosen/bootline. */
+    if (oemu_fdt_init(&gen, BOOT_DTB_MAX) != OEMU_OK) {
+      (void)fputs("oemu: out of memory building the device tree\n", stderr);
+      goto done;
+    }
+    if (have_initrd) {
+      initrd_pa = boot_initrd_addr(ram, (uint64_t)initrd_len);
+      if (initrd_pa == 0U) {
+        (void)fprintf(
+            stderr, "oemu: -initrd of %zu bytes does not fit the -m %" PRIu64 " MiB machine\n",
+            initrd_len, opts->ram_mib);
+        goto done;
+      }
+    }
+    /* 32 bytes, the size the oracle injects. */
+    uint8_t rng_seed[32];
+    const bool seeded = boot_rng_seed(rng_seed, (uint32_t)sizeof(rng_seed));
+    if (!seeded) {
+      (void)fputs(
+          "oemu: no host entropy for /chosen/rng-seed; the guest CRNG will stay unseeded\n",
+          stderr);
+    }
+    const oemu_virt_dtb_params vp = {BOOT_RAM_BASE,
+                                     ram,
+                                     initrd_pa,
+                                     initrd_pa + (uint64_t)initrd_len,
+                                     opts->cmdline,
+                                     seeded ? rng_seed : NULL,
+                                     seeded ? (uint32_t)sizeof(rng_seed) : 0U};
+    st = oemu_virt_dtb_build(&gen, &vp);
+    if (st != OEMU_OK) {
+      (void)fprintf(stderr, "oemu: building the device tree failed: %s\n", oemu_status_str(st));
+      goto done;
+    }
+    tree = oemu_fdt_bytes(&gen);
+    dtb_len = oemu_fdt_length(&gen);
+  } else {
+    if (dtb_load(opts->dtb, &dtb, &dtb_len) != 0) {
+      (void)fprintf(stderr, "oemu: could not load the device tree\n");
+      goto done;
+    }
+    if ((dtb_len < 40U) || (be32(dtb) != BOOT_FDT_MAGIC) || (be32(dtb + 4U) > dtb_len) ||
+        (dtb_len > BOOT_DTB_MAX)) {
+      (void)fprintf(stderr, "oemu: %s is not a valid device tree blob\n", opts->dtb);
+      goto done;
+    }
+    if (opts->cmdline != NULL) {
+      if (!dtb_patch_bootline(dtb, dtb_len, opts->cmdline)) {
+        (void)fprintf(stderr, "oemu: -append: this DTB has no /chosen/bootline to write\n");
+        goto done;
+      }
+    }
+    /* The tree's /memory reg must describe the RAM we actually build, or a
+     * guest trusts a lie. A tree with no /memory node asserts nothing, so warn
+     * and carry on. */
+    if (!dtb_patch_node(dtb, dtb_len, BOOT_RAM_BASE, ram)) {
+      (void)fprintf(stderr, "oemu: note: the device tree has no /memory node to size\n");
+    }
+    if (have_initrd) {
+      (void)fprintf(stderr,
+                    "oemu: note: -initrd needs the generated tree; drop -dtb to inject it\n");
+    }
+    tree = dtb;
   }
 
   /* booting.rst: magic, min-version, flags, and the text fitting RAM. */
@@ -704,9 +1099,21 @@ static int boot(const boot_opts *opts) {
   {
     uint64_t pa = dtb_pa;
     for (size_t i = 0U; i < dtb_len; i++, pa++) {
-      st = oemu_aspace_write(&machine.aspace, pa, OEMU_MEM_BYTE, dtb[i]);
+      st = oemu_aspace_write(&machine.aspace, pa, OEMU_MEM_BYTE, tree[i]);
       if (st != OEMU_OK) {
         (void)fprintf(stderr, "oemu: placing the DTB failed: %s\n", oemu_status_str(st));
+        goto done;
+      }
+    }
+  }
+  /* The ramdisk lands where the generated tree promised it. The address was
+   * checked to fit at build time, so a bus write only fails on a real fault. */
+  if (have_initrd) {
+    const unsigned char *ib = oemu_buffer_data(&initrd);
+    for (uint64_t pa = initrd_pa, i = 0U; i < (uint64_t)initrd_len; i++, pa++) {
+      st = oemu_aspace_write(&machine.aspace, pa, OEMU_MEM_BYTE, ib[i]);
+      if (st != OEMU_OK) {
+        (void)fprintf(stderr, "oemu: placing the initrd failed: %s\n", oemu_status_str(st));
         goto done;
       }
     }
@@ -727,15 +1134,60 @@ static int boot(const boot_opts *opts) {
   }
   /* The boot protocol: x0 carries the DTB's physical address. */
   oemu_regs_write(&vcpu.cpu.regs, 0U, OEMU_REG_W64, dtb_pa);
-  result = boot_run(&vcpu, &machine, &uart, &gic, opts->max_insns);
+  if (opts->stdio) {
+    boot_arm_stdin();
+  }
+  result = boot_run(&vcpu, &machine, &uart, &gic, opts->stdio, opts->max_insns);
+  { /* TEMPORARY diagnostic (issue #28): OEMU_DUMP_MEM=pa:size:file dumps guest RAM
+     * at exit, so a suspicion about what the guest did to a page becomes a fact. */
+    const char *m = getenv("OEMU_DUMP_MEM");
+    if (m != NULL) {
+      /* OEMU_DUMP_MEM=<pa>:<len>:<file>, both hex, to look at guest RAM at a chosen
+       * moment. Parsed with strtoull rather than sscanf("%lx"): the conversion
+       * must be checked, the values are uint64_t (no room for an unsigned-long
+       * cast on ILP32), and a hex field is not something sscanf may read past
+       * whitespace for. */
+      char *end = NULL;
+      uint64_t base = 0ULL;
+      uint64_t size = 0ULL;
+      char path[256];
+      const char *colon1 = (m != NULL) ? strchr(m, ':') : NULL;
+      const char *colon2 = (colon1 != NULL) ? strchr(colon1 + 1, ':') : NULL;
+      errno = 0;
+      base = (m != NULL) ? strtoull(m, &end, 16) : 0ULL;
+      size = (end == colon1) ? strtoull(colon1 + 1, &end, 16) : 0ULL;
+      if ((errno == 0) && (colon2 != NULL) && (end == colon2) &&
+          (sscanf(colon2 + 1, "%255s", path) == 1) && (size != 0ULL)) {
+        FILE *f = fopen(path, "wb");
+        if (f != NULL) {
+          for (uint64_t off = 0ULL; off < size; off++) {
+            uint64_t b = 0ULL;
+            if (oemu_aspace_read(&machine.aspace, base + off, OEMU_MEM_BYTE, false, &b) !=
+                OEMU_OK) {
+              b = 0xDEULL;
+            }
+            (void)fputc((int)(b & 0xFFULL), f);
+          }
+          (void)fclose(f);
+        }
+      }
+    }
+  }
   (void)oemu_pl011_pump(&uart); /* whatever the guest queued before it died */
 
 done:
   if ((serial != NULL) && (serial != stdout)) {
     (void)fclose(serial);
   }
-  if (dtb != NULL) {
+  /* The generated tree is owned by the fdt builder (dtb points into it); an
+   * -dtb blob is a lone allocation from dtb_load. Two different owners. */
+  if (generated) {
+    oemu_fdt_dispose(&gen);
+  } else if (dtb != NULL) {
     oemu_allocator_get()->free(dtb, NULL);
+  }
+  if (have_initrd) {
+    oemu_buffer_dispose(&initrd);
   }
   oemu_machine_dispose(&machine);
   oemu_buffer_dispose(&image);
@@ -824,14 +1276,27 @@ int main(int argc, char **argv) {
           opts.dtb = v;
         }
         i++;
+      } else if (strcmp(a, "-initrd") == 0) {
+        if (v == NULL) {
+          print_usage(stderr);
+          return EXIT_USAGE;
+        }
+        opts.initrd = v;
+        i++;
       } else if (strcmp(a, "-m") == 0) {
         if (v == NULL || parse_mib(v, &opts.ram_mib) != 0) {
           print_usage(stderr);
           return EXIT_USAGE;
         }
         i++;
-      } else if (strcmp(a, "--serial") == 0) {
-        if (v == NULL || parse_serial(v, &opts.serial_path) != 0) {
+      } else if (strcmp(a, "--serial") == 0 || strcmp(a, "-serial") == 0) {
+        if (v == NULL) {
+          print_usage(stderr);
+          return EXIT_USAGE;
+        }
+        if (strcmp(v, "stdio") == 0) {
+          opts.stdio = true; /* console to stdout, and stdin feeds the RX ring */
+        } else if (parse_serial(v, &opts.serial_path) != 0) {
           print_usage(stderr);
           return EXIT_USAGE;
         }

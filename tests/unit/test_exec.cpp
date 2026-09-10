@@ -333,12 +333,94 @@ TEST_F(ExecTest, SbfizWrappingFormKeepsFullWidth) {
   EXPECT_EQ(x(23), UINT64_C(0xFFFFFFFFFFFFF870)); /* (0x10E - 0x200) << 3 */
 }
 
+/*
+ * The bitfield family, pinned to values measured under the oracle
+ * (qemu-system-aarch64, `-machine virt -cpu cortex-a53`) rather than computed
+ * here: a freestanding guest executed each encoding with hand-picked operands
+ * and printed the result over the PL011, and every case below is one where the
+ * readings a host might guess -- extract-at-immR, low-`width` bits, rotate,
+ * no-op on a wrapped range -- disagree. The rule they all agree on:
+ *
+ *   len   = (immS < immR) ? regsize - immR + immS + 1 : immS - immR + 1
+ *   value = UBFM's answer: wrapped, the source shifted left by regsize-immR;
+ *           otherwise the field extracted at immR, right-aligned
+ *   BFM   = merge that value into the destination where it already sits --
+ *           field [len-1:0] unwrapped, [len-1:regsize-immR] wrapped
+ *   UBFM / SBFM = overwrite the whole destination with it.
+ *
+ * So BFM is BFXIL, and the wrapping spelling is what every real `bfi` compiles
+ * to: BFI Xd,Xn,#lsb,#width encodes as immR=regsize-lsb, immS=width-1.
+ */
 TEST_F(ExecTest, BfmInsertsOnlyItsOwnField) {
   program({0xb3485c20U}); /* bfxil x0,x1,#8,#16 -> BFM #8,#23 */
   set_x(0, UINT64_C(0xDEADBEEF00000000));
   set_x(1, UINT64_C(0x1122334455667788));
   step_ok(1);
-  EXPECT_EQ(x(0), UINT64_C(0xDEADBEEF00667700));
+  /* x1<23:8> = 0x6677 lands in x0<15:0>, not at immR: BFXIL's contract is
+   * Xd<width-1:0>. This expectation used to read 0xDEADBEEF00667700, which is
+   * what inserting at immR gives -- the oracle says otherwise, and that reading
+   * is half of what broke issue #26. */
+  EXPECT_EQ(x(0), UINT64_C(0xDEADBEEF00006677));
+  program({0xb3485c20U});
+  set_x(0, UINT64_C(0xFFFFFFFFFFFFFFFF));
+  set_x(1, UINT64_C(0x0000000000123400));
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0xFFFFFFFFFFFF1234));
+}
+
+TEST_F(ExecTest, BfiWrappedRangeIsNotANoOp) {
+  /* bfi x2,x0,#32,#32 -> BFM #32,#31, the wrapping spelling. This is the
+   * high-32 splice in lib/lockref.c's lockref_get: executing it as a no-op made
+   * __cmpxchg_case_64 store the OLD packed word back, so a dget left a dentry's
+   * refcount at 1, the matching dput killed and RCU-freed that dentry under the
+   * open file, and the guest died in chown_common+0x48 with FAR=0x28. That is
+   * issue #26 -- a zero-byte regular file in the initramfs killed the boot
+   * while a directory of the same name did not. */
+  program({0xb3607c02U});
+  set_x(0, UINT64_C(0x0000000000000002));
+  set_x(2, UINT64_C(0x0000000100000000));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x0000000200000000));
+  program({0xb3607c02U}); /* source bits above the field are dropped */
+  set_x(0, UINT64_C(0x0000000100000002));
+  set_x(2, UINT64_C(0x0000000100000000));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x0000000200000000));
+  program({0xb3607c02U}); /* the destination's other half survives */
+  set_x(0, UINT64_C(0xDEADBEEF12345678));
+  set_x(2, UINT64_C(0x1111111122222222));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x1234567822222222));
+  program({0xb3607c20U}); /* same splice, Rd = x0: what C emits */
+  set_x(1, UINT64_C(0x0000000012345678));
+  set_x(0, UINT64_C(0xAAAAAAAA55555555));
+  step_ok(1);
+  EXPECT_EQ(x(0), UINT64_C(0x1234567855555555));
+}
+
+TEST_F(ExecTest, BfiWrappedRangeAtAnyLsb) {
+  program({0xb3783c02U}); /* bfi x2,x0,#8,#16 -> BFM #56,#15: field [23:8] */
+  set_x(0, UINT64_C(0xDEADBEEF12345678));
+  set_x(2, UINT64_C(0x1111111122222222));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x1111111122567822));
+  program({0xb37ff802U}); /* bfi x2,x0,#1,#63 -> BFM #63,#62: only bit 0 keeps */
+  set_x(0, UINT64_C(0xDEADBEEF12345678));
+  set_x(2, UINT64_C(0x1111111122222222));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0xBD5B7DDE2468ACF0));
+  program({0xb3709c02U}); /* bfi x2,x0,#16,#40 -> BFM #48,#39: field [55:16],
+                           * so the top byte stays the destination's own -- the
+                           * field is clipped at the register, not at len. */
+  set_x(0, UINT64_C(0xDEADBEEF12345678));
+  set_x(2, UINT64_C(0x1111111122222222));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x11EF123456782222));
+  program({0x33101c02U}); /* bfi w2,w0,#16,#8 -> BFM #16,#7, 32-bit width */
+  set_x(0, UINT64_C(0x00000000AABBCCDD));
+  set_x(2, UINT64_C(0x11111111));
+  step_ok(1);
+  EXPECT_EQ(x(2), UINT64_C(0x0000000011DD1111));
 }
 
 TEST_F(ExecTest, ExtrConcatenatesThenRotates) {
@@ -906,11 +988,17 @@ TEST_F(ExecTest, SysregWhitelistRoundTrips) {
 }
 
 TEST_F(ExecTest, SysregRefusalsAndUnsupportedEncodings) {
-  program({0xd53b4400U}); /* mrs x0,fpcr : outside the whitelist */
-  set_x(0, 0xAAU);
+  program({0xd538cc03U}); /* mrs x3,icc_iar1_el1: the GICv2 CPU interface is
+                             system-register state we do not model yet, and the
+                             answer must be an Undefined instruction, not a
+                             silent zero that the guest would EOI as spurious */
+  set_x(3, 0xAAU);
   EXPECT_EQ(step(), OEMU_ERR_UNSUPPORTED);
-  EXPECT_EQ(x(0), 0xAAU); /* a refusal must not touch the destination */
-  program({0xd51b4400U}); /* msr fpcr,x0 */
+  EXPECT_EQ(x(3), 0xAAU); /* a refusal must not touch the destination */
+  program({0xd518cc23U}); /* msr icc_eoir1_el1,x3 */
+  oemu_regs_set_pc(&cpu_.regs, kText);
+  EXPECT_EQ(step(), OEMU_ERR_UNSUPPORTED);
+  program({0x3dc00020U}); /* ldr q0,[x1]: a scalar SIMD load, still unsupported */
   oemu_regs_set_pc(&cpu_.regs, kText);
   EXPECT_EQ(step(), OEMU_ERR_UNSUPPORTED);
   program({0xd53800a0U}); /* mrs x0,mpidr_el1 : an EL1 register */
@@ -1020,3 +1108,217 @@ TEST_F(ExecTest, MovWideAssemblersMatchTheExpectedBitPattern) {
 }
 
 }  // namespace
+
+TEST_F(ExecTest, UnscaledOffsetAccesses) {
+  /* LDTR/STTR (issue #27): the offset is signed and unscaled, the register is
+   * never written back, and the access is the plain one the base alone names. */
+  store64(kData, UINT64_C(0x1122334455667788));
+  program({0xb8404820U}); /* ldtr w0, [x1, #4] */
+  set_x(1, kData);
+  step_ok(1);
+  EXPECT_EQ(x(0), 0x11223344U); /* the high word of the stored qword, unsigned */
+  program({0xf81f8822U});       /* sttr x2, [x1, #-8] */
+  set_x(2, UINT64_C(0xDEADBEEFCAFEBABE));
+  set_x(1, kData + 8U);
+  step_ok(1);
+  EXPECT_EQ(load64(kData), UINT64_C(0xDEADBEEFCAFEBABE));
+  EXPECT_EQ(x(1), kData + 8U); /* and no writeback */
+  program({0x385f8023U});      /* ldurb w3, [x1, #-8]: the sibling form, still plain */
+  set_x(1, kData + 8U);
+  step_ok(1);
+  EXPECT_EQ(x(3), 0xBEU); /* the byte the sttr above left at kData */
+}
+
+TEST_F(ExecTest, MemcpyTailPathsCopyTheRightBytes) {
+  /* arch/arm64/lib/memcpy.S finishes with three size-specific tails; the M5
+   * boot's blake2s self-test fails exactly one vector and pty_init later sees a
+   * duplicate sysfs dev_t, so a corrupted small copy is the standing suspect.
+   * These are the literal instructions from __memcpy's 8/4/1-3 byte tails. */
+  for (uint64_t len = 1U; len <= 3U; ++len) {
+    for (uint64_t i = 0U; i < 16U; ++i) {
+      store64(kData + (i * 8U), UINT64_C(0xEEEEEEEEEEEEEEEE));
+      store64((kData + 0x800U) + (i * 8U), 0U);
+    }
+    for (uint64_t i = 0U; i < len; ++i) {
+      store64((kData + 0x800U) + i, 0xA0U + i);
+    }
+    program({0xd341fc4eU, /* lsr  x14, x2, #1 */
+             0x39400026U, /* ldrb w6,  [x1] */
+             0x385ff08aU, /* ldurb w10, [x4, #-1] */
+             0x386e6828U, /* ldrb w8,  [x1, x14] */
+             0x39000006U, /* strb w6,  [x0] */
+             0x382e6808U, /* strb w8,  [x0, x14] */
+             0x381ff0aaU, /* sturb w10, [x5, #-1] */
+             0xd65f03c0U});
+    set_x(0, kData);
+    set_x(1, (kData + 0x800U));
+    set_x(2, len);
+    set_x(4, (kData + 0x800U) + len);
+    set_x(5, kData + len);
+    step_ok(8); /* lsr, ldrb, ldurb, ldrb, strb, strb, sturb, ret */
+    for (uint64_t i = 0U; i < len; ++i) {
+      EXPECT_EQ(0xA0U + i, load64(kData + i) & 0xFFU) << "len=" << len << " byte " << i;
+    }
+  }
+  /* 4-byte tail, len = 6 so the two stores land on different halves. */
+  for (uint64_t i = 0U; i < 8U; ++i) {
+    store64(kData + (i * 8U), UINT64_C(0xEEEEEEEEEEEEEEEE));
+    store64((kData + 0x800U) + (i * 8U), 0U);
+  }
+  for (uint64_t i = 0U; i < 6U; ++i) {
+    store64((kData + 0x800U) + i, 0xA0U + i);
+  }
+  program({0xb9400026U, /* ldr  w6, [x1] */
+           0xb85fc088U, /* ldur w8, [x4, #-4] */
+           0xb9000006U, /* str  w6, [x0] */
+           0xb81fc0a8U, /* stur w8, [x5, #-4] */
+           0xd65f03c0U});
+  set_x(0, kData);
+  set_x(1, kData + 0x800U);
+  set_x(4, kData + 0x800U + 6U);
+  set_x(5, kData + 6U);
+  step_ok(5);
+  for (uint64_t i = 0U; i < 6U; ++i) {
+    EXPECT_EQ(0xA0U + i, load64(kData + i) & 0xFFU) << "4-byte tail byte " << i;
+  }
+  /* 8-byte tail, len = 12. */
+  for (uint64_t i = 0U; i < 16U; ++i) {
+    store64((kData + 0x800U) + (i * 8U), 0U);
+  }
+  for (uint64_t i = 0U; i < 12U; ++i) {
+    store64((kData + 0x800U) + i, 0xB0U + i);
+  }
+  program({0xf9400026U, /* ldr  x6, [x1] */
+           0xf85f8087U, /* ldur x7, [x4, #-8] */
+           0xf9000006U, /* str  x6, [x0] */
+           0xf81f80a7U, /* stur x7, [x5, #-8] */
+           0xd65f03c0U});
+  set_x(0, kData);
+  set_x(1, kData + 0x800U);
+  set_x(4, kData + 0x800U + 12U);
+  set_x(5, kData + 12U);
+  step_ok(5);
+  for (uint64_t i = 0U; i < 12U; ++i) {
+    EXPECT_EQ(0xB0U + i, load64(kData + i) & 0xFFU) << "8-byte tail byte " << i;
+  }
+}
+
+TEST_F(ExecTest, MemsetTailPostIndexStoresCoverEveryWidth) {
+  /* arch/arm64/lib/memset.S finishes with post-indexed 8/4/2/1-byte stores.
+   * kzalloc rides on this: a hole here would leave stale bytes in a fresh
+   * allocation, which is the shape of the duplicate sysfs dev_t the M5 boot
+   * hit in pty_init. */
+  for (uint64_t i = 0U; i < 4U; ++i) {
+    store64(kData + (i * 8U), UINT64_C(0xEEEEEEEEEEEEEEEE));
+  }
+  const uint64_t pattern = UINT64_C(0xAABBCCDDEEFF0011);
+  program({0xf8008507U, /* str  x7, [x8], #8 */
+           0xb8004507U, /* str  w7, [x8], #4 */
+           0x78002507U, /* strh w7, [x8], #2 */
+           0x39000107U, /* strb w7, [x8] */
+           0xd65f03c0U});
+  set_x(7, pattern);
+  set_x(8, kData);
+  step_ok(5);
+  EXPECT_EQ(pattern, load64(kData)) << "8-byte post-index store";
+  EXPECT_EQ(pattern & 0xFFFFFFFFU, load64(kData + 8U) & 0xFFFFFFFFU) << "4-byte post-index";
+  EXPECT_EQ(pattern & 0xFFFFU, load64(kData + 12U) & 0xFFFFU) << "2-byte post-index";
+  EXPECT_EQ(pattern & 0xFFU, load64(kData + 14U) & 0xFFU) << "1-byte store";
+  EXPECT_EQ(kData + 14U, x(8)) << "8+4+2 advanced the base; the strb has no writeback";
+}
+
+TEST_F(ExecTest, PreIndexNegativePairOpsAreTheBackwardCopyCore) {
+  /* __memcpy's overlapping (backward) path moves 16 bytes at a time with
+   * ldp/stp [base, #-64]!, the pre-indexed negative pair form. The initramfs
+   * unpack copies file data over memory the allocator may have reused, so this
+   * path runs during the M5 boot. */
+  const uint64_t src = kData + 0x800U;
+  store64(src, UINT64_C(0x0123456789ABCDEF));
+  store64(src + 8U, UINT64_C(0xFEDCBA9876543210));
+  store64(kData, 0U);
+  store64(kData + 8U, 0U);
+  program({0xa9fc348cU, /* ldp x12, x13, [x4, #-64]! */
+           0xa9bc34acU, /* stp x12, x13, [x5, #-64]! */
+           0xd65f03c0U});
+  set_x(4, src + 64U);
+  set_x(5, kData + 64U);
+  step_ok(3);
+  EXPECT_EQ(UINT64_C(0x0123456789ABCDEF), load64(kData)) << "low half";
+  EXPECT_EQ(UINT64_C(0xFEDCBA9876543210), load64(kData + 8U)) << "high half";
+  EXPECT_EQ(src, x(4)) << "ldp writeback";
+  EXPECT_EQ(kData, x(5)) << "stp writeback";
+}
+
+TEST_F(ExecTest, MemcpyOverlapDecisionIsAnUnsignedCompare) {
+  /* __memcpy decides "overlapping, copy backwards" with `sub x14, x0, x1;
+   * cmp x14, x2; b.cc`. When dst < src the difference is a huge unsigned
+   * value, which must NOT take the backwards path -- if the carry were wrong
+   * there, an overlapping copy would run the wrong direction and smear the
+   * source over itself. Encodings from the cross assembler. */
+  const struct {
+    uint64_t diff;
+    uint64_t len;
+    uint64_t lo;
+    uint64_t hs;
+  } cases[] = {
+      {16U, 32U, 1U, 0U},
+      {32U, 16U, 0U, 1U},
+      {0U, 0U, 0U, 1U},
+      {UINT64_MAX, 16U, 0U, 1U},
+      {UINT64_C(0x8000000000000000), 1U, 0U, 1U},
+      {UINT64_C(0x8000000000000000), UINT64_C(0x8000000000000001), 1U, 0U},
+  };
+  for (const auto &c : cases) {
+    program({0xeb0201dfU, /* cmp  x14, x2 */
+             0x1a9f27e0U, /* cset w0, lo */
+             0x1a9f37e1U, /* cset w1, hs */
+             0xd65f03c0U});
+    set_x(14, c.diff);
+    set_x(2, c.len);
+    step_ok(4);
+    EXPECT_EQ(c.lo, x(0)) << "diff=" << c.diff << " len=" << c.len;
+    EXPECT_EQ(c.hs, x(1)) << "diff=" << c.diff << " len=" << c.len;
+  }
+}
+
+TEST_F(ExecTest, VectorPairLoadStoreRoundTrip) {
+  store64(kData, UINT64_C(0xAAAAAAAAAAAAAAAA));
+  store64(kData + 8U, UINT64_C(0xBBBBBBBBBBBBBBBB));
+  store64(kData + 16U, UINT64_C(0xCCCCCCCCCCCCCCCC));
+  store64(kData + 24U, UINT64_C(0xDDDDDDDDDDDDDDDD));
+  program({0xad400420U}); /* ldp q0, q1, [x1] : 16 bytes and stride 16 each */
+  set_x(1, kData);
+  step_ok(1);
+  uint64_t lo = 0U;
+  uint64_t hi = 0U;
+  ASSERT_EQ(oemu_vec_read(&cpu_, 0U, &lo, &hi), OEMU_OK);
+  EXPECT_EQ(lo, UINT64_C(0xAAAAAAAAAAAAAAAA));
+  EXPECT_EQ(hi, UINT64_C(0xBBBBBBBBBBBBBBBB));
+  ASSERT_EQ(oemu_vec_read(&cpu_, 1U, &lo, &hi), OEMU_OK);
+  EXPECT_EQ(lo, UINT64_C(0xCCCCCCCCCCCCCCCC));
+  EXPECT_EQ(hi, UINT64_C(0xDDDDDDDDDDDDDDDD));
+  program({0xad810420U}); /* stp q0, q1, [x1, #32]! */
+  set_x(1, kData);
+  step_ok(1);
+  EXPECT_EQ(load64(kData + 32U), UINT64_C(0xAAAAAAAAAAAAAAAA));
+  EXPECT_EQ(load64(kData + 40U), UINT64_C(0xBBBBBBBBBBBBBBBB));
+  EXPECT_EQ(x(1), kData + 32U); /* pre-index writeback of the base */
+  store64(kData + 16U, UINT64_C(0xCCCCCCCCCCCCCCCC));
+  store64(kData + 24U, UINT64_C(0xDDDDDDDDDDDDDDDD));
+  ASSERT_EQ(
+      oemu_vec_write(&cpu_, 4U, UINT64_C(0xFFFFFFFFFFFFFFFF), UINT64_C(0xFFFFFFFFFFFFFFFF)),
+      OEMU_OK);
+  program({0x2d421424U}); /* ldp s4, s5, [x1, #16] : single precision zeroes the
+                             upper 96 bits of both registers, as the
+                             architecture requires */
+  set_x(1, kData);
+  step_ok(1);
+  ASSERT_EQ(oemu_vec_read(&cpu_, 4U, &lo, &hi), OEMU_OK);
+  EXPECT_EQ(lo, UINT64_C(0x00000000CCCCCCCC));
+  EXPECT_EQ(hi, 0U);
+  program({0x6d3e1c26U}); /* stp d6, d7, [x1, #-32] : only eight bytes each */
+  set_x(1, kData + 64U);
+  step_ok(1);
+  EXPECT_EQ(load64(kData + 32U), 0U);
+  EXPECT_EQ(load64(kData + 40U), 0U); /* q6/q1 never stored anything there */
+}

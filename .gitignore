@@ -75,3 +75,7 @@ bench/guest/coremark-src/
 
 # clangd editor config (machine-absolute paths); regenerate locally
 /.clangd
+
+# boot scratch logs
+dbg.err
+con.out

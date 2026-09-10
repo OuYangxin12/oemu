@@ -96,20 +96,32 @@ void oemu_exc_take(oemu_regs *regs, oemu_sysregs *sysregs, oemu_exc_kind kind, o
       sysregs->vbar_el[target] +
       oemu_exc_vector_offset(from == target, oemu_pstate_sp_sel(old_pstate) != 0U, kind);
 
-  /* Entry PSTATE: h-mode of the target (entry always selects SP_ELx), all
-   * four interrupt masks set, IL=1. DAIF is taken from QEMU's entry path --
-   * it writes DAIF=0b1111 on every exception type; the ARM ARM's sync
-   * variant preserves I/F, a distinction only a guest that relies on
-   * in-handler unmasking would notice, and the kernel entry code masks
-   * first thing either way. */
-  const uint64_t entry_pstate = oemu_pstate_mode(target) |
-                                (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT) |
-                                OEMU_PSTATE_IL;
+  /* Entry PSTATE: h-mode of the target (entry always selects SP_ELx) and all
+   * four interrupt masks set. DAIF is taken from QEMU's entry path -- it
+   * writes DAIF=0b1111 on every exception type; the ARM ARM's sync variant
+   * preserves I/F, a distinction only a guest that relies on in-handler
+   * unmasking would notice, and the kernel entry code masks first thing
+   * either way.
+   *
+   * IL is deliberately *clear*. It records an illegal execution state, and the
+   * hardware copies the interrupted PSTATE into SPSR_ELx and enters the
+   * handler in a legal one. Setting it here made every nested exception save
+   * SPSR.IL = 1, so the nested handler's own ERET tripped the illegal-ERET
+   * tripwire below -- an exception the guest never asked for. */
+  const uint64_t entry_pstate =
+      oemu_pstate_mode(target) | (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT);
   /* Bank switch first (it still sees the interrupted PSTATE as "from"), then
    * record the interrupted world in the target's banks. */
   oemu_sysregs_switch_sp(sysregs, entry_pstate);
 
-  sysregs->spsr_el[target] = old_pstate;
+  /* SPSR_ELx is the *whole* interrupted PSTATE, and the condition flags live
+   * in the register file, not in sysregs->pstate, so they are folded in by
+   * hand (masked first: a pstate adopted from a guest MSR SPSR can carry
+   * stale flag bits). Leaving NZCV out meant every ERET restored a zeroed
+   * flags field and the interrupted code branched on whatever the handler
+   * had last left in the flags (issue #28: an IRQ landing between a cmp and
+   * its b.cond skipped loop iterations and corrupted kernel state). */
+  sysregs->spsr_el[target] = (old_pstate & ~(uint64_t)OEMU_NZCV_MASK) | oemu_regs_nzcv(regs);
   /* ELR = the faulting instruction's address: callers invoke this before the
    * PC advances, so regs->pc still names it (precise-exception contract). */
   sysregs->elr_el[target] = regs->pc;
@@ -156,8 +168,12 @@ void oemu_exc_eret(oemu_regs *regs, oemu_sysregs *sysregs) {
   }
 
   /* Restore: the shared switch saves the pre-ERET SP into its bank, loads
-   * the returned-to bank, and adopts the restored PSTATE in one step. */
-  oemu_sysregs_switch_sp(sysregs, saved);
+   * the returned-to bank, and adopts the restored PSTATE in one step. The
+   * NZCV field is stripped here -- the register file owns the live flags --
+   * and applied to it separately, so the interrupted code sees its own
+   * condition flags again rather than the handler's leftovers. */
+  oemu_sysregs_switch_sp(sysregs, saved & ~(uint64_t)OEMU_NZCV_MASK);
+  oemu_regs_set_nzcv(regs, (uint32_t)(saved & OEMU_NZCV_MASK));
   regs->pc = sysregs->elr_el[cur];
 }
 
@@ -169,7 +185,17 @@ void oemu_exc_undefined(oemu_regs *regs, oemu_sysregs *sysregs, uint32_t insn) {
                 oemu_exc_internal_esr_undefined(insn), 0, false);
 }
 
+/* SVC and HVC are the two exceptions whose preferred exception return address is
+ * the instruction *after* the one that trapped (DDI 0487 D1.4.5, "the address of
+ * the instruction following the SVC"): the system call has been taken, it is not
+ * re-run. Every other entry point here records the trapping instruction, so the
+ * advance belongs to these two callers rather than to oemu_exc_take. Without it
+ * ELR names the svc itself, the kernel's eret re-executes the system call with
+ * x0 holding the previous return value -- so write(1,...) is followed forever by
+ * write(8,...), write(-9,...), and a /init that prints its first line and never
+ * finishes its second (measured on issue #28: 294k identical -EBADF returns). */
 void oemu_exc_svc(oemu_regs *regs, oemu_sysregs *sysregs, uint16_t imm16) {
+  regs->pc += OEMU_INSN_SIZE;
   oemu_exc_take(regs, sysregs, OEMU_EXC_KIND_SYNC,
                 oemu_exc_route(oemu_pstate_el(sysregs->pstate)),
                 oemu_exc_internal_esr_imm16(OEMU_EXC_EC_SVC64, imm16), 0, false);
@@ -191,6 +217,7 @@ void oemu_exc_smc(oemu_regs *regs, oemu_sysregs *sysregs, uint16_t imm16) {
 }
 
 void oemu_exc_hvc(oemu_regs *regs, oemu_sysregs *sysregs, uint16_t imm16) {
+  regs->pc += OEMU_INSN_SIZE; /* the call is taken, not re-run */
   oemu_exc_undefined(regs, sysregs, 0xD4000002U | ((uint32_t)imm16 << 5));
 }
 

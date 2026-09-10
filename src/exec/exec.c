@@ -23,6 +23,270 @@
 
 #include "exec_internal.h"
 
+/* --- TEMPORARY: issue #28 hunt, env-gated bus tracer. REMOVE BEFORE MERGE ---
+ *
+ * OEMU_TRACE_FILE  path of the binary trace (records only while latched on)
+ * OEMU_TRACE_ENTER hex PC whose first execution latches tracing on
+ * OEMU_TRACE_EXIT  hex PC whose first execution (while on) latches tracing off
+ * OEMU_TRACE_HIT   hex PC reported to stderr on every execution
+ * OEMU_TRACE_VA    hex VA: watch this window from the first instruction (no PC latch)
+ * OEMU_TRACE_VA_SIZE  window size (default 0x1000)
+ * OEMU_TRACE_W     "w" restricts the watch to stores
+ * OEMU_TRACE_MAX   stop recording after this many records (default 400000)
+ * OEMU_TRACE_SVC   log each supervisor call with the value it handed back
+ * OEMU_TRACE_HIST  sample the PC every Nth instruction into a histogram, so a
+ *                  run that merely times out can say where it was spinning
+ *
+ * Record: count, pc, va, value, size, kind (kind 1 = load, 2 = store).
+ */
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+  uint64_t count;
+  uint64_t pc;
+  uint64_t va;
+  uint64_t value;
+  uint32_t size;
+  uint32_t kind;
+} oemu_tr_record;
+
+static struct {
+  FILE *file;
+  uint64_t count;
+  uint64_t enter_pc;
+  uint64_t exit_pc;
+  uint64_t hit_pc;
+  uint64_t va_lo;
+  uint64_t va_hi;
+  uint64_t max;
+  uint64_t entered;
+  uint64_t hits;
+  bool svc;
+  bool svc_pending;
+  uint64_t svc_insn;
+  uint64_t svc_nr;
+  int64_t svc_a0;
+  int64_t svc_fd;
+  int64_t svc_n3;
+  uint64_t hist_step;
+  uint64_t hist_samples;
+  bool stores_only;
+  bool watch_reported;
+  bool on;
+  bool inited;
+} g_tr = {.file = NULL,
+          .count = 0ULL,
+          .enter_pc = 0ULL,
+          .exit_pc = 0ULL,
+          .hit_pc = 0ULL,
+          .va_lo = 0ULL,
+          .va_hi = 0ULL,
+          .max = 0ULL,
+          .entered = 0ULL,
+          .hits = 0ULL,
+          .svc = false,
+          .svc_pending = false,
+          .svc_insn = 0ULL,
+          .svc_nr = 0ULL,
+          .svc_fd = 0,
+          .svc_n3 = 0,
+          .hist_step = 0ULL,
+          .hist_samples = 0ULL,
+          .stores_only = false,
+          .watch_reported = false,
+          .on = false,
+          .inited = false}; /* designators: a positional
+                             * list here silently shifts
+                             * when a field is added */
+
+/* An address knob is hex, with or without the 0x: System.map prints bare hex, and
+ * strtoull(..., 0) would read "ffffffc08014f730" as *decimal*, i.e. as zero -- a
+ * latch that silently never trips. Sizes keep base 0 so 0x and decimal both work. */
+static uint64_t tr_hex(const char *text) {
+  return strtoull(text, NULL, 16);
+}
+
+static void oemu_tr_init(void) {
+  const char *path = getenv("OEMU_TRACE_FILE");
+  const char *enter = getenv("OEMU_TRACE_ENTER");
+  const char *exitp = getenv("OEMU_TRACE_EXIT");
+  const char *hit = getenv("OEMU_TRACE_HIT");
+  if (enter != NULL) {
+    g_tr.enter_pc = tr_hex(enter);
+  }
+  if (exitp != NULL) {
+    g_tr.exit_pc = tr_hex(exitp);
+  }
+  if (hit != NULL) {
+    g_tr.hit_pc = tr_hex(hit);
+  }
+  {
+    const char *va = getenv("OEMU_TRACE_VA");
+    const char *vasize = getenv("OEMU_TRACE_VA_SIZE");
+    const char *wonly = getenv("OEMU_TRACE_W");
+    const char *max = getenv("OEMU_TRACE_MAX");
+    if (va != NULL) {
+      g_tr.va_lo = tr_hex(va);
+      const uint64_t span = (vasize != NULL) ? strtoull(vasize, NULL, 0) : 0x1000ULL;
+      /* Clamp, never wrap. A window running off the top of the address space
+       * used to land at va_hi == 0, and the range test then rejected *every*
+       * access -- a two-byte window asking about the whole upper half of the
+       * address space came back as "no device traffic at all", which is the
+       * most misleading kind of zero. */
+      g_tr.va_hi = ((span == 0ULL) || ((UINT64_MAX - g_tr.va_lo) < span)) ? UINT64_MAX
+                                                                          : g_tr.va_lo + span;
+      g_tr.on = true; /* a VA watch is armed from the very first instruction */
+    }
+    if ((wonly != NULL) && (wonly[0] == 'w')) {
+      g_tr.stores_only = true;
+    }
+    g_tr.max = (max != NULL) ? strtoull(max, NULL, 0) : 400000ULL;
+    g_tr.svc = getenv("OEMU_TRACE_SVC") != NULL;
+    const char *hist = getenv("OEMU_TRACE_HIST");
+    if (hist != NULL) {
+      const unsigned long long step = strtoull(hist, NULL, 0);
+      g_tr.hist_step = (step > 0ULL) ? step : 64ULL;
+    }
+  }
+  if (path != NULL) {
+    g_tr.file = fopen(path, "wb");
+    if (g_tr.file == NULL) {
+      perror("g_tr: OEMU_TRACE_FILE");
+    }
+  }
+}
+
+/* --- PC histogram -----------------------------------------------------------
+ * "The guest is still alive but makes no progress" is the most common failure in
+ * a boot emulator, and a single sampled PC (the one the run happened to stop on)
+ * answers it about as well as a photograph of one frame answers "why is the film
+ * stuck". So the tracer can also sample the PC every Nth instruction into a
+ * fixed table of heavy hitters, which the run loop prints when it gives up.
+ * Collisions replace the smaller count: lossy on purpose, but the loop that eats
+ * 99% of the budget is never the small count. */
+#define OEMU_TR_HIST_BUCKETS 4096U
+typedef struct oemu_tr_hist {
+  uint64_t pc;
+  uint64_t count;
+} oemu_tr_hist;
+static oemu_tr_hist g_tr_hist[OEMU_TR_HIST_BUCKETS];
+
+void oemu_exec_internal_hist_add(uint64_t pc) {
+  unsigned slot = (unsigned)((pc >> 2U) & (OEMU_TR_HIST_BUCKETS - 1U));
+  oemu_tr_hist *victim = NULL;
+  for (unsigned probe = 0U; probe < 8U; ++probe) {
+    oemu_tr_hist *b = &g_tr_hist[slot];
+    if ((b->count == 0ULL) || (b->pc == pc)) {
+      b->pc = pc;
+      b->count++;
+      return;
+    }
+    if ((victim == NULL) || (b->count < victim->count)) {
+      victim = b; /* the weakest resident seen: displaced if we run out of slots */
+    }
+    slot = (unsigned)((slot + 1U) & (OEMU_TR_HIST_BUCKETS - 1U));
+  }
+  if (victim != NULL) {
+    victim->pc = pc;
+    victim->count = 1ULL;
+  }
+}
+
+unsigned oemu_exec_trace_report(FILE *out, unsigned top) {
+  if ((out == NULL) || (g_tr.hist_step == 0ULL)) {
+    return 0U;
+  }
+  /* Sort a copy of the buckets; the table is small and this runs once, at the
+   * point where a human is about to read it. */
+  oemu_tr_hist sorted[OEMU_TR_HIST_BUCKETS];
+  unsigned used = 0U;
+  for (unsigned i = 0U; i < OEMU_TR_HIST_BUCKETS; ++i) {
+    if (g_tr_hist[i].count != 0ULL) {
+      sorted[used++] = g_tr_hist[i];
+    }
+  }
+  for (unsigned i = 0U; i < used; ++i) {
+    for (unsigned j = i + 1U; j < used; ++j) {
+      if (sorted[j].count > sorted[i].count) {
+        const oemu_tr_hist t = sorted[i];
+        sorted[i] = sorted[j];
+        sorted[j] = t;
+      }
+    }
+  }
+  unsigned n = (top < used) ? top : used;
+  fprintf(out, "oemu:   pc histogram (%llu samples, every %llu insns):\n",
+          (unsigned long long)g_tr.hist_samples, (unsigned long long)g_tr.hist_step);
+  for (unsigned i = 0U; i < n; ++i) {
+    fprintf(out, "oemu:     %6.2f%%  0x%016llx\n",
+            (g_tr.hist_samples != 0ULL)
+                ? (100.0 * (double)sorted[i].count / (double)g_tr.hist_samples)
+                : 0.0,
+            (unsigned long long)sorted[i].pc);
+  }
+  return n;
+}
+
+static void oemu_tr_step(uint64_t pc) {
+  if (!g_tr.inited) {
+    g_tr.inited = true;
+    oemu_tr_init();
+  }
+  g_tr.count++;
+  /* With a PC latch configured, the histogram describes the latched region and
+   * nothing else: a boot's samples are dominated by early boot, and mixing them
+   * in hides exactly the loop the question is about. */
+  if ((g_tr.hist_step != 0ULL) && ((g_tr.enter_pc == 0ULL) || g_tr.on) &&
+      ((g_tr.count % g_tr.hist_step) == 0ULL)) {
+    g_tr.hist_samples++;
+    oemu_exec_internal_hist_add(pc);
+  }
+  if ((g_tr.hit_pc != 0U) && (pc == g_tr.hit_pc)) {
+    /* A latch is often pointed at a loop, so the print must not be able to fill
+     * the disk: the first eight hits, then one in every 4096 -- enough to tell
+     * "entered once and never again" from "spinning here". */
+    g_tr.hits++;
+    if ((g_tr.hits <= 8ULL) || ((g_tr.hits & 0xfffULL) == 0ULL)) {
+      fprintf(stderr, "[tr] hit pc=0x%llx n=%llu insn=%llu\n", (unsigned long long)pc,
+              (unsigned long long)g_tr.hits, (unsigned long long)g_tr.count);
+    }
+  }
+  if (!g_tr.on && (g_tr.enter_pc != 0U) && (pc == g_tr.enter_pc)) {
+    g_tr.on = true;
+    fprintf(stderr, "[tr] ON count=%llu\n", (unsigned long long)g_tr.count);
+    return;
+  }
+  if (g_tr.on && (g_tr.exit_pc != 0U) && (pc == g_tr.exit_pc)) {
+    g_tr.on = false;
+    fprintf(stderr, "[tr] OFF count=%llu\n", (unsigned long long)g_tr.count);
+    if (g_tr.file != NULL) {
+      fflush(g_tr.file);
+    }
+  }
+}
+
+static void oemu_tr_rec(uint32_t kind, uint64_t pc, uint64_t va, uint32_t size,
+                        uint64_t value) {
+  if (!g_tr.on || (g_tr.file == NULL)) {
+    return;
+  }
+  if ((g_tr.va_lo != 0ULL) && ((va < g_tr.va_lo) || (va >= g_tr.va_hi))) {
+    return; /* VA watch: only the window, whoever touches it */
+  }
+  if (g_tr.stores_only && (kind != 2U)) {
+    return;
+  }
+  if (g_tr.entered >= g_tr.max) {
+    return;
+  }
+  g_tr.entered++;
+  const oemu_tr_record r = {g_tr.count, pc, va, value, size, kind};
+  (void)fwrite(&r, sizeof r, 1U, g_tr.file);
+}
+
+/* --- end temporary tracer ------------------------------------------------------- */
+
 /* --- sysreg encoding constants ----------------------------------------------- */
 
 /*
@@ -45,6 +309,8 @@ static uint64_t read_g(const oemu_cpu *cpu, unsigned n, bool sp_form, oemu_reg_w
   return sp_form ? oemu_regs_read_sp_form(&cpu->regs, n, width)
                  : oemu_regs_read(&cpu->regs, n, width);
 }
+
+static oemu_status do_pair_vector(oemu_cpu *cpu, const oemu_memops *mem, const oemu_insn *in);
 
 static void write_g(oemu_cpu *cpu, unsigned n, bool sp_form, oemu_reg_width width,
                     uint64_t value) {
@@ -344,7 +610,7 @@ static void note_store(oemu_cpu *cpu, uint64_t addr, uint64_t nbytes) {
   }
 }
 
-static oemu_status do_mrs(oemu_cpu *cpu, const oemu_insn *in) {
+static oemu_status do_mrs(oemu_cpu *cpu, const oemu_sysregs *sr, const oemu_insn *in) {
   const uint32_t sel = in->sysreg & SYSREG_MASK;
   uint64_t value;
   switch (sel) {
@@ -364,15 +630,22 @@ static oemu_status do_mrs(oemu_cpu *cpu, const oemu_insn *in) {
       value = 0U; /* read-only, and nothing here sets it */
       break;
     default:
-      /* CurrentEL and every other register: at EL0 there is nothing honest to
-       * return except a refusal. */
-      return OEMU_ERR_UNSUPPORTED;
+      /* Everything else -- FPCR/FPSR, the counters, the ID registers -- is the
+       * sysreg table's business, and the table is where accessibility is
+       * decided: a row that does not exist, or one whose min_el is above the
+       * current EL, or a read-only row answers with a refusal, which is the
+       * architecturally right answer (an Undefined instruction) and is what the
+       * old flat whitelist did by hand for the five registers it knew. */
+      if ((sr == NULL) || (oemu_sysreg_read(sr, sel, &value) != OEMU_OK)) {
+        return OEMU_ERR_UNSUPPORTED;
+      }
+      break;
   }
   write_g(cpu, in->rd, false, OEMU_REG_W64, value);
   return OEMU_OK;
 }
 
-static oemu_status do_msr(oemu_cpu *cpu, const oemu_insn *in) {
+static oemu_status do_msr(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_insn *in) {
   const uint32_t sel = in->sysreg & SYSREG_MASK;
   const uint64_t value = read_g(cpu, in->rd, false, OEMU_REG_W64);
   switch (sel) {
@@ -385,8 +658,15 @@ static oemu_status do_msr(oemu_cpu *cpu, const oemu_insn *in) {
     case SYSREG_TPIDRUR_EL0:
       cpu->tpidrur_el0 = value;
       break;
-    default: /* TPIDRRO_EL0 is read-only; the rest are outside the subset */
-      return OEMU_ERR_UNSUPPORTED;
+    default:
+      /* The same fall-through as the read side: FPCR/FPSR and every other
+       * writable row the table carries, with the table's own write mask,
+       * min_el and read-only verdicts applied. TPIDRRO_EL0 has no row, so it
+       * still refuses. */
+      if ((sr == NULL) || (oemu_sysreg_write(sr, sel, value) != OEMU_OK)) {
+        return OEMU_ERR_UNSUPPORTED;
+      }
+      break;
   }
   return OEMU_OK;
 }
@@ -456,12 +736,83 @@ static oemu_status do_pair(oemu_cpu *cpu, const oemu_memops *mem, const oemu_ins
     v2 = read_g(cpu, in->rt2, false, in->width);
     access_or_panic(mem->write(mem->ctx, addr, in->mem_size, v1));
     access_or_panic(mem->write(mem->ctx, addr2, in->mem_size, v2));
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr, 1U << (unsigned)in->mem_size, v1);
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr2, 1U << (unsigned)in->mem_size, v2);
     note_store(cpu, addr, transfer * 2U);
   } else {
     access_or_panic(mem->read(mem->ctx, addr, in->mem_size, in->is_signed_load, &v1));
     access_or_panic(mem->read(mem->ctx, addr2, in->mem_size, in->is_signed_load, &v2));
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr, 1U << (unsigned)in->mem_size, v1);
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr2, 1U << (unsigned)in->mem_size, v2);
     write_g(cpu, in->rd, false, in->width, v1);
     write_g(cpu, in->rt2, false, in->width, v2);
+  }
+  if (in->index_mode != OEMU_INDEX_NONE) {
+    write_g(cpu, in->rn, true, OEMU_REG_W64, writeback);
+  }
+  return OEMU_OK;
+}
+
+/*
+ * LDP/STP over V0-V31: two registers, each `stride` bytes apart, where the
+ * stride is the transfer size -- 4 for the S form, 8 for D, 16 for Q. A
+ * 128-bit register is moved as two 64-bit bus accesses, so nothing new reaches
+ * the bus, the MMU or a device; a narrower form writes the low bits and
+ * clears the rest of the destination, which is what the architecture requires
+ * rather than an optimisation.
+ */
+static oemu_status do_pair_vector(oemu_cpu *cpu, const oemu_memops *mem, const oemu_insn *in) {
+  uint64_t addr = 0U;
+  uint64_t writeback = 0U;
+  (void)resolve_mem_addr(cpu, in, &addr, &writeback);
+  const oemu_mem_size piece = (in->mem_size == OEMU_MEM_128) ? OEMU_MEM_DWORD : in->mem_size;
+  const uint64_t stride = UINT64_C(1) << (unsigned)in->mem_size;
+  const unsigned pieces = (in->mem_size == OEMU_MEM_128) ? 2U : 1U;
+  const uint64_t bytes = (stride < 8U) ? stride : 8U; /* the two-S form moves 4 */
+  const bool is_store = (in->op == OEMU_OP_STP);
+  const uint32_t perm = is_store ? OEMU_PERM_WRITE : OEMU_PERM_READ;
+
+  /* Every piece of both registers is validated first, so an abort leaves the
+   * pair, the register file and the base register untouched. */
+  for (unsigned r = 0U; r < 2U; r++) {
+    for (unsigned p = 0U; p < pieces; p++) {
+      if (mem->validate(mem->ctx, addr + r * stride + p * 8U, bytes, perm) != OEMU_OK) {
+        return OEMU_ERR_FAULT;
+      }
+    }
+  }
+
+  for (unsigned r = 0U; r < 2U; r++) {
+    const unsigned reg = (r == 0U) ? in->rd : in->rt2;
+    const uint64_t a = addr + r * stride;
+    uint64_t lo = 0U;
+    uint64_t hi = 0U;
+    if (is_store) {
+      lo = cpu->v[reg][0];
+      hi = cpu->v[reg][1];
+      access_or_panic(mem->write(mem->ctx, a, piece, lo));
+      if (pieces == 2U) {
+        access_or_panic(mem->write(mem->ctx, a + 8U, OEMU_MEM_DWORD, hi));
+      }
+      oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), a, (uint32_t)bytes, lo);
+      if (pieces == 2U) {
+        oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), a + 8U, 8U, hi);
+      }
+    } else {
+      access_or_panic(mem->read(mem->ctx, a, piece, false, &lo));
+      if (pieces == 2U) {
+        access_or_panic(mem->read(mem->ctx, a + 8U, OEMU_MEM_DWORD, false, &hi));
+      }
+      oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), a, (uint32_t)bytes, lo);
+      if (pieces == 2U) {
+        oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), a + 8U, 8U, hi);
+      }
+      cpu->v[reg][0] = lo; /* a sub-128-bit transfer zeroes the rest */
+      cpu->v[reg][1] = hi;
+    }
+  }
+  if (is_store) {
+    note_store(cpu, addr, stride * 2U);
   }
   if (in->index_mode != OEMU_INDEX_NONE) {
     write_g(cpu, in->rn, true, OEMU_REG_W64, writeback);
@@ -494,9 +845,11 @@ static oemu_status do_single_mem(oemu_cpu *cpu, const oemu_memops *mem, const oe
   if (is_store) {
     value = read_g(cpu, in->rd, false, in->width);
     access_or_panic(mem->write(mem->ctx, addr, size, value));
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr, (uint32_t)nbytes, value);
     note_store(cpu, addr, nbytes);
   } else {
     access_or_panic(mem->read(mem->ctx, addr, size, in->is_signed_load, &value));
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr, (uint32_t)nbytes, value);
     write_g(cpu, in->rd, false, in->width, value);
   }
   if (has_writeback) {
@@ -519,6 +872,7 @@ static oemu_status do_exclusive(oemu_cpu *cpu, const oemu_memops *mem, const oem
   if (is_load) {
     uint64_t value = 0U;
     access_or_panic(mem->read(mem->ctx, addr, in->mem_size, false, &value));
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr, (uint32_t)nbytes, value);
     write_g(cpu, in->rd, false, in->width, value);
     cpu->monitor_addr = addr;
     cpu->monitor_size = nbytes;
@@ -534,6 +888,7 @@ static oemu_status do_exclusive(oemu_cpu *cpu, const oemu_memops *mem, const oem
   if (success) {
     const uint64_t value = read_g(cpu, in->rd, false, in->width);
     access_or_panic(mem->write(mem->ctx, addr, in->mem_size, value));
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr, (uint32_t)nbytes, value);
   }
   write_g(cpu, in->rm, false, OEMU_REG_W32, success ? UINT64_C(0) : UINT64_C(1));
   return OEMU_OK;
@@ -586,12 +941,35 @@ static oemu_status do_bitfield(oemu_cpu *cpu, const oemu_insn *in) {
   uint64_t field = rot & mask;
 
   if (in->op == OEMU_OP_BFM) {
-    /* BFM with a wrapped range is the reserved encoding: behave as a no-op. */
-    if (msb < lsb) {
-      return OEMU_OK;
-    }
+    /*
+     * BFM is UBFM's extracted value *merged into* the destination instead of
+     * overwriting it, and it lands where that value already sits -- not at
+     * `immR`. A non-wrapped range right-aligns the extract, so the field is
+     * [len-1:0]; that is BFXIL Xd,Xn,#lsb,#width, whose definition (Xd<width-1:
+     * 0> = Xn<lsb+width-1:lsb>) is exactly this rule. A wrapped range has been
+     * shifted up by regsize-immR, so the field is [len-1:regsize-immR], clipped
+     * to the register by construction because a wrapped range has len <=
+     * regsize. Either way: mask the field, leave every other destination bit
+     * alone.
+     *
+     * The old code refused to play at all. It took a wrapped BFM -- the
+     * spelling every real `bfi` uses, since BFI Xd,Xn,#lsb,#width encodes as
+     * immR=regsize-lsb, immS=width-1 -- for the reserved no-op it superficially
+     * resembles, and inserted at `immR` in the non-wrapped case. That is issue
+     * #26: `bfi x2, x0, #32, #32` is the splice inside lib/lockref.c's
+     * lockref_get, so the instruction vanished, __cmpxchg_case_64 stored the
+     * OLD packed word back, the dentry's refcount never went 1 -> 2, the very
+     * next dput killed and RCU-freed a dentry the open struct still pointed at,
+     * and Linux read d_inode == 0 out of the freed object and died in
+     * chown_common+0x48 with FAR=0x28. Only regular files trip it: they are the
+     * only initramfs entries whose populate path takes that dget/dput pair.
+     */
+    const unsigned bottom = (msb < lsb) ? (bits - lsb) : 0U;
+    const unsigned fbits = len - bottom; /* wrapped: msb + 1; non-wrapped: len */
+    const uint64_t dm =
+        (fbits == bits) ? width_mask : (((UINT64_C(1) << fbits) - UINT64_C(1)) << bottom);
     const uint64_t old = read_g(cpu, in->rd, false, in->width);
-    field = (old & ~((mask << lsb) & width_mask)) | ((field << lsb) & width_mask);
+    field = (old & ~dm) | (field & dm);
   } else if ((in->op == OEMU_OP_SBFM) && (((field >> (len - 1U)) & UINT64_C(1)) != 0U)) {
     /* Sign-extend inside the register width, then let write_g truncate. */
     field |= width_mask & ~mask;
@@ -600,20 +978,34 @@ static oemu_status do_bitfield(oemu_cpu *cpu, const oemu_insn *in) {
   return OEMU_OK;
 }
 
-uint32_t oemu_exec_internal_crc32(uint32_t crc_in, uint64_t data, unsigned bytes) {
-  /* The architecture's CRC() pseudocode verbatim: XOR the running sum's MSB
-   * with the incoming data LSB, shift the sum left, feed the data right, and
-   * fold in the polynomial where they differ. LSB-first => the reflected
-   * CRC-32 the guest's crc32() returns. */
-  const uint32_t poly = 0x04C11DB7U;
+uint32_t oemu_exec_internal_crc32(uint32_t crc_in, uint64_t data, unsigned bytes,
+                                  bool castagnoli) {
+  /* One step of a reflected (LSB-first) LFSR: fold a byte into the low byte of
+   * the state, then shift right eight times, XORing the *reflected* polynomial
+   * wherever a set bit drops off the bottom. Reflected forms of the two
+   * architecturally named polynomials: 0x04C11DB7 -> 0xEDB88320, and
+   * 0x1EDC6F41 -> 0x82F63B78 for the C variants.
+   *
+   * The version this replaces claimed to be "the architecture's CRC() pseudocode
+   * verbatim" but inverted the data operand (it fed the stream out of `data`
+   * LSB-first while the pseudocode reads `data<N-1-j>`, MSB-first) and paired
+   * that with the non-reflected polynomial. Two inversions that do not cancel:
+   * it disagreed with the architecture on 400 of 400 random vectors. That is
+   * what the boot log's `OF: fdt: not creating '/sys/firmware/fdt': CRC check
+   * failed` was reporting -- Linux computes the devicetree CRC with its generic
+   * C table early, before the ARM64_HAS_CRC32 capability is applied, then
+   * recomputes it late through these instructions, and only our half of that
+   * comparison was wrong. */
+  const uint32_t poly = castagnoli ? UINT32_C(0x82F63B78) : UINT32_C(0xEDB88320);
   uint32_t crc = crc_in;
-  const unsigned nbits = bytes * 8U;
-  for (unsigned j = 0U; j < nbits; ++j) {
-    const uint32_t topbit = ((crc >> 31) ^ (uint32_t)(data & UINT64_C(1))) & UINT32_C(1);
-    crc <<= 1;
-    data >>= 1;
-    if (topbit != 0U) {
-      crc ^= poly;
+  for (unsigned i = 0U; i < bytes; ++i) {
+    crc ^= (uint32_t)((data >> (8U * i)) & UINT64_C(0xFF));
+    for (unsigned bit = 0U; bit < 8U; ++bit) {
+      const uint32_t out = crc & UINT32_C(1);
+      crc >>= 1;
+      if (out != 0U) {
+        crc ^= poly;
+      }
     }
   }
   return crc;
@@ -804,8 +1196,10 @@ static oemu_status do_msr_immediate(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_
       if (oemu_sysreg_read(sr, OEMU_SYSREG_DAIF, &daif) != OEMU_OK) {
         return OEMU_ERR_FAULT;
       }
-      const uint64_t next =
-          (op2 == MSR_IMM_DAIFSET) ? (daif | (uint64_t)imm) : (daif & (uint64_t)(~imm & 0xfU));
+      /* The immediate forms carry a compact 4-bit field (D=bit3 .. F=bit0)
+       * while the DAIF register itself uses the PSTATE positions, so shift. */
+      const uint64_t mask = ((uint64_t)imm & 0xfU) << OEMU_PSTATE_DAIF_SHIFT;
+      const uint64_t next = (op2 == MSR_IMM_DAIFSET) ? (daif | mask) : (daif & ~mask);
       st = oemu_sysreg_write(sr, OEMU_SYSREG_DAIF, next);
       break;
     }
@@ -892,6 +1286,7 @@ static oemu_status do_sys(oemu_cpu *cpu, oemu_sysregs *sr, const oemu_memops *me
     /* Validated above; a validated access cannot fail (no provider re-shapes
      * between calls), so a refusal here is a bug, not a guest event. */
     access_or_panic(mem->write(mem->ctx, line + off, OEMU_MEM_DWORD, 0U));
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), line + (uint64_t)off, 8U, 0U);
   }
   return OEMU_OK;
 }
@@ -918,10 +1313,34 @@ oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
     return OEMU_ERR_INVALID_ARG;
   }
 
+  /* The vCPU's per-instruction entry, so the PC knobs see *every* instruction:
+   * the hints and system instructions (bti, wfi, eret) never reach the bus
+   * dispatch, and a function prologue usually starts with one of them, so a
+   * latch on a function's entry PC stayed silent while the function ran. The
+   * matching hook in oemu_exec_step_bus covers the standalone step API, and
+   * neither path traverses the other, so nothing double-counts. The call is
+   * unconditional on purpose: the environment is only read inside, so gating it
+   * on the parsed knobs -- as this once did -- means the knobs are never read,
+   * and a latch that is never armed reports exactly the same silence as a guest
+   * that never ran the function. */
+  oemu_tr_step(oemu_regs_pc(&cpu->regs)); /* inits itself; see the note there */
+
   /* An if-chain, not a switch: -Wswitch-enum would demand every opcode be
+   * named here even though everything not listed is deliberately left to the
+   * shared switch below. */  /* An if-chain, not a switch: -Wswitch-enum would demand every opcode be
    * named here even though everything not listed is deliberately left to the
    * shared switch below. */
   if (in->op == OEMU_OP_SVC) {
+    if (g_tr.svc) {
+      /* x8 names the call at the trap; the answer only exists when the kernel
+       * returns, which is the next ERET into EL0t -- see below. */
+      g_tr.svc_pending = true;
+      g_tr.svc_insn = g_tr.count;
+      g_tr.svc_nr = oemu_regs_read(&cpu->regs, 8U, OEMU_REG_W64);
+      g_tr.svc_a0 = (int64_t)oemu_regs_read(&cpu->regs, 0U, OEMU_REG_W64);
+      g_tr.svc_fd = (int64_t)oemu_regs_read(&cpu->regs, 1U, OEMU_REG_W64);
+      g_tr.svc_n3 = (int64_t)oemu_regs_read(&cpu->regs, 2U, OEMU_REG_W64);
+    }
     oemu_exc_svc(&cpu->regs, sr, (uint16_t)in->imm);
     return OEMU_OK;
   }
@@ -955,6 +1374,19 @@ oemu_status oemu_exec_internal_dispatch_system(oemu_cpu *cpu, oemu_sysregs *sr,
     return OEMU_OK;
   }
   if (in->op == OEMU_OP_ERET) {
+    const unsigned cur_el = (unsigned)((sr->pstate >> 2U) & 3U);
+    const uint64_t x0 = oemu_regs_read(&cpu->regs, 0U, OEMU_REG_W64);
+    if (g_tr.svc_pending && ((sr->spsr_el[cur_el] & 0xCULL) == 0ULL)) {
+      /* Returning to EL0t with a pending request is the syscall's answer, and
+       * x0 carries it. A write() that produces no output but returns -EAGAIN or
+       * -ERESTARTSYS is invisible from the console and indistinguishable from a
+       * hang, which is precisely the difference this line settles. */
+      fprintf(stderr, "[tr] svc insn=%llu nr=%llu a0=0x%llx a1=0x%llx a2=0x%llx -> x0=0x%llx\n",
+              (unsigned long long)g_tr.svc_insn, (unsigned long long)g_tr.svc_nr,
+              (unsigned long long)g_tr.svc_a0, (unsigned long long)g_tr.svc_fd,
+              (unsigned long long)g_tr.svc_n3, (unsigned long long)x0);
+      g_tr.svc_pending = false;
+    }
     /* oemu_exc_eret gates at EL0 itself (Undefined there). */
     oemu_exc_eret(&cpu->regs, sr);
     return OEMU_OK;
@@ -1198,14 +1630,16 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       break;
     }
 
-    case OEMU_OP_CRC32: {
-      /* Reflected CRC-32 (poly 0x04C11DB7). The data operand is Rm: its low
-       * `in->uimm` bytes (all 8 for CRC32X, read from the full 64-bit
-       * register); the seed is Rn's low 32 bits; the result is 32-bit. */
+    case OEMU_OP_CRC32:
+    case OEMU_OP_CRC32C: {
+      /* The data operand is Rm: its low `in->uimm` bytes (all 8 for CRC32X,
+       * read from the full 64-bit register), taken little-endian first; the
+       * seed is Rn's low 32 bits; the result is 32-bit. */
       const uint32_t seed = (uint32_t)read_g(cpu, in->rn, false, OEMU_REG_W32);
       const uint64_t data = read_g(cpu, in->rm, false, OEMU_REG_W64);
-      write_g(cpu, in->rd, false, OEMU_REG_W32,
-              oemu_exec_internal_crc32(seed, data, (unsigned)in->uimm));
+      write_g(
+          cpu, in->rd, false, OEMU_REG_W32,
+          oemu_exec_internal_crc32(seed, data, (unsigned)in->uimm, in->op == OEMU_OP_CRC32C));
       break;
     }
     case OEMU_OP_RBIT:
@@ -1364,6 +1798,8 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       break;
     case OEMU_OP_LDP:
     case OEMU_OP_STP:
+      st = in->is_vector ? do_pair_vector(cpu, mem, in) : do_pair(cpu, mem, in);
+      break;
     case OEMU_OP_LDPSW:
       st = do_pair(cpu, mem, in);
       break;
@@ -1396,10 +1832,13 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
     case OEMU_OP_BARRIER:
       break; /* architecturally observable: nothing happens */
     case OEMU_OP_MRS:
-      st = do_mrs(cpu, in);
+      /* The user-mode path has no sysreg state to consult -- no oemu_sysregs at
+       * all -- so it hands down a null table and keeps the old refusal for every
+       * selector outside its five. */
+      st = do_mrs(cpu, NULL, in);
       break;
     case OEMU_OP_MSR:
-      st = do_msr(cpu, in);
+      st = do_msr(cpu, NULL, in);
       break;
     case OEMU_OP_MSR_IMM:
       /* The user-mode subset does not touch privileged mode bits; system mode
@@ -1448,6 +1887,10 @@ oemu_status oemu_cpu_init(oemu_cpu *cpu, uint64_t entry_pc, uint64_t initial_sp)
   cpu->monitor_size = 0U;
   cpu->monitor_valid = false;
   cpu->tpidrur_el0 = 0U;
+  for (unsigned i = 0U; i < 32U; i++) {
+    cpu->v[i][0] = 0U;
+    cpu->v[i][1] = 0U;
+  }
   return OEMU_OK;
 }
 
@@ -1456,6 +1899,14 @@ oemu_status oemu_exec_step_bus(oemu_cpu *cpu, const oemu_memops *mem, const oemu
   if (cpu == NULL || mem == NULL) {
     return OEMU_ERR_INVALID_ARG;
   }
+  /* The PC-latching knobs (ENTER/EXIT/HIT) have to see every instruction, and
+   * this is the one choke point that both the single-step and the run-loop path
+   * pass through. The hook used to live in the bus dispatch, where it only ever
+   * saw loads, stores and system instructions: a function-entry latch there
+   * quietly never tripped, and a run that printed nothing looked like a guest
+   * that never ran the function. */
+  oemu_tr_step(oemu_regs_pc(&cpu->regs)); /* inits itself; see the note there */
+
   uint32_t word = 0U;
   const oemu_status fetch = mem->fetch32(mem->ctx, oemu_regs_pc(&cpu->regs), &word);
   if (fetch != OEMU_OK) {
@@ -1527,4 +1978,27 @@ oemu_status oemu_exec_run(oemu_cpu *cpu, oemu_memory *mem, oemu_sysenv *env, uin
   const oemu_env_ops environment = oemu_sysenv_envops(env);
   return oemu_exec_run_bus(cpu, &bus, (env != NULL) ? &environment : NULL, max_insns,
                            completed_out);
+}
+
+oemu_status oemu_vec_read(const oemu_cpu *cpu, unsigned n, uint64_t *lo, uint64_t *hi) {
+  OEMU_REQUIRE(cpu != NULL, "NULL cpu in oemu_vec_read");
+  if ((lo == NULL) || (hi == NULL)) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  if (n >= OEMU_VEC_REGS) {
+    return OEMU_ERR_INVALID_ARG; /* there is no register 32 to read */
+  }
+  *lo = cpu->v[n][0];
+  *hi = cpu->v[n][1];
+  return OEMU_OK;
+}
+
+oemu_status oemu_vec_write(oemu_cpu *cpu, unsigned n, uint64_t lo, uint64_t hi) {
+  OEMU_REQUIRE(cpu != NULL, "NULL cpu in oemu_vec_write");
+  if (n >= OEMU_VEC_REGS) {
+    return OEMU_ERR_INVALID_ARG;
+  }
+  cpu->v[n][0] = lo;
+  cpu->v[n][1] = hi;
+  return OEMU_OK;
 }

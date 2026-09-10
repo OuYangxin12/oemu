@@ -35,7 +35,10 @@ constexpr uint32_t kSev = 0xD503209FU;         // sev
 constexpr uint32_t kYield = 0xD503203FU;       // yield (advances harmlessly)
 constexpr uint32_t kDcZvaX0 = 0xD50B7420U;     // dc    zva, x0
 constexpr uint32_t kStrX0X1 = 0xF9000020U;     // str   x0, [x1]
-constexpr uint32_t kLdrX2X3 = 0xF9400062U;     // ldr   x2, [x3]
+constexpr uint32_t kLdrX2X3 = 0xF9400062U;
+constexpr uint32_t kMsrDaifX2 = 0xD51B4222U;    // msr   daif, x2 (Linux IRQ entry)
+constexpr uint32_t kMsrDaifSet2 = 0xD50342DFU;  // msr   daifset, #0x2
+constexpr uint32_t kMsrDaifClr2 = 0xD50342FFU;  // msr   daifclr, #0x2     // ldr   x2, [x3]
 
 constexpr uint64_t kIlBit = UINT64_C(1) << 25;
 constexpr uint32_t EcBase(oemu_exc_ec ec) {
@@ -172,7 +175,7 @@ TEST_F(VcpuTest, El0BootRoutesToEl1Vectors) {
   /* From EL0 the lower-EL AArch64 group applies, and delivery is EL1. */
   EXPECT_EQ(oemu_vcpu_step(&el0, nullptr), OEMU_OK);
   EXPECT_EQ(oemu_regs_pc(&el0.cpu.regs), kVectors + 0x400U);
-  EXPECT_EQ(el0.sysregs.elr_el[OEMU_EL1], kText);
+  EXPECT_EQ(el0.sysregs.elr_el[OEMU_EL1], kText + 4U); /* past the svc */
   EXPECT_EQ(oemu_pstate_el(el0.sysregs.pstate), OEMU_EL1);
 }
 
@@ -227,7 +230,9 @@ TEST_F(VcpuTest, SvcTrapsIntoTheVectorTableNotTheHost) {
   EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x200U);
   EXPECT_EQ(vcpu_.sysregs.esr_el[OEMU_EL1],
             EcBase(OEMU_EXC_EC_SVC64) | (uint32_t)kIlBit | 0x123U);
-  EXPECT_EQ(vcpu_.sysregs.elr_el[OEMU_EL1], kText);
+  /* An SVC's preferred exception return address is the next instruction: the
+   * call has been taken, and re-executing it would re-issue the system call. */
+  EXPECT_EQ(vcpu_.sysregs.elr_el[OEMU_EL1], kText + 4U);
   /* Entry masks everything and sets IL. */
   EXPECT_EQ(oemu_pstate_daif(vcpu_.sysregs.pstate), OEMU_PSTATE_DAIF_MASK);
 }
@@ -254,9 +259,13 @@ TEST_F(VcpuTest, EretRoundTripsThroughTheHandler) {
   place(kVectors + 0x200U, {kEret});
   ASSERT_EQ(step(), OEMU_OK); /* SVC delivered */
   ASSERT_EQ(step(), OEMU_OK); /* handler's ERET */
-  /* ELR names the SVC itself: a synchronous trap retries its instruction,
-   * and it is the handler's job to have moved ELR past it. */
-  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText);
+  /* The round trip lands on the instruction after the trap. (A synchronous
+   * trap *does* normally retry its instruction -- but only for traps the handler
+   * can repair: aborts and undefined instructions. SVC/HVC/BRK are the
+   * architecturally exempt ones, and getting this wrong is not a detail: the
+   * kernel's eret re-issued every system call with x0 holding the previous
+   * return value, so a guest /init wrote to fd 8, then fd -9, forever.) */
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText + 4U);
   /* Returned exactly to the interrupted state: the masked boot PSTATE. */
   EXPECT_EQ(vcpu_.sysregs.pstate,
             OEMU_PSTATE_M_EL1H | (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT));
@@ -525,6 +534,34 @@ TEST_F(VcpuTest, PendingButMaskedInterruptStillWakesWfi) {
   EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText + OEMU_INSN_SIZE);
 }
 
+/* Linux's el1_interrupt opens with `mov x2, #0xc0; msr daif, x2` so the IRQ
+ * handler runs with IRQ and FIQ masked. 0xc0 is I|F where those bits sit in
+ * PSTATE (bits [9:6]), the way MRS Xt, NZCV uses [31:28]. Treating the operand
+ * as a compact 4-bit field reads 0xc0 as 0, which unmasks the interrupt the
+ * guest just masked: the handler is re-entered at the very next instruction
+ * (el1_interrupt+0x1c), the stack descends 0x170 per entry, and the boot dies
+ * inside its own entry path. */
+TEST_F(VcpuTest, MsrDaifRegisterFormMasksWherePstateKeepsTheField) {
+  program({kMsrDaifX2});
+  oemu_regs_write(&vcpu_.cpu.regs, 2U, OEMU_REG_W64, 0xC0U);
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(0xC0U, vcpu_.sysregs.pstate & 0xC0U) << "I and F must stay masked";
+  oemu_vcpu_set_irq(&vcpu_, true);
+  EXPECT_FALSE(oemu_vcpu_take_pending(&vcpu_)) << "a masked guest must not be interrupted";
+}
+
+/* The immediate forms are the other convention on purpose: their imm4 is the
+ * compact field (D=bit3 .. F=bit0), so daifset #2 sets I. */
+TEST_F(VcpuTest, DaifSetAndClrUseTheCompactImmediateField) {
+  program({kMsrDaifClr2, kMsrDaifSet2});
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(0U, vcpu_.sysregs.pstate & 0x80U) << "daifclr #2 clears I";
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_EQ(0x80U, vcpu_.sysregs.pstate & 0x80U) << "daifset #2 sets I";
+  oemu_vcpu_set_irq(&vcpu_, true);
+  EXPECT_FALSE(oemu_vcpu_take_pending(&vcpu_));
+}
+
 TEST_F(VcpuTest, DeliveryChargesTheQuantum) {
   oemu_vcpu small{};
   const oemu_memops bus = oemu_memory_memops(&mem_);
@@ -535,6 +572,44 @@ TEST_F(VcpuTest, DeliveryChargesTheQuantum) {
   oemu_vcpu_set_irq(&small, true);
   ASSERT_EQ(oemu_vcpu_step(&small, nullptr), OEMU_OK); /* delivery, no instruction */
   EXPECT_EQ(oemu_vcpu_step(&small, nullptr), OEMU_ERR_TIMEOUT);
+}
+
+TEST_F(VcpuTest, CounterStepsAtTheRateTheGuestIsTold) {
+  program({kYield, kYield, kYield});
+  const uint64_t before = vcpu_.sysregs.cntvct;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(step(), OEMU_OK);
+  }
+  /* One count per retired instruction: the modelled core runs at exactly the
+   * frequency CNTFRQ_EL0 reports, so a count delta means the same interval to
+   * the guest as it means to us. Any other step is a clock the guest cannot
+   * use: a Linux HZ=100 tick arms CNTV_CVAL 625000 counts past `now`, and if a
+   * single instruction can cross that delta the tick fires the moment it is
+   * armed -- the timer wheel, RCU and every mdelay() in the kernel then run on
+   * a clock that does not exist, and an interrupt is pending on every
+   * instruction the guest retires. */
+  EXPECT_EQ(vcpu_.sysregs.cntvct - before, 3ULL * OEMU_TIMER_COUNTS_PER_INSN);
+  EXPECT_LT(OEMU_TIMER_COUNTS_PER_INSN, OEMU_CNTFRQ_EL0_DEFAULT / 100U)
+      << "one instruction may not retire a whole guest tick";
+}
+
+TEST_F(VcpuTest, DeliveredIrqLeavesTheGuestMaskedSoItCannotNestImmediately) {
+  /* The M5 boot livelocked on nested IRQs taken inside the kernel's
+   * el1_interrupt prologue, seven instructions into the handler and before it
+   * ever reached gic_read_iar -- which is only possible if the mask the entry
+   * writes is not in force. This pins the invariant the whole handler design
+   * rests on: once oemu_vcpu_take_pending() has delivered, the DAIF field says
+   * masked and a second call cannot deliver again until the guest unmasks. */
+  program({kMsrDaifXzr});
+  ASSERT_EQ(step(), OEMU_OK); /* unmask, so a pending line is deliverable */
+  oemu_vcpu_set_irq(&vcpu_, true);
+  ASSERT_TRUE(oemu_vcpu_take_pending(&vcpu_));
+  EXPECT_EQ(0xFU, oemu_pstate_daif(vcpu_.sysregs.pstate));
+  EXPECT_FALSE(oemu_vcpu_take_pending(&vcpu_)); /* still asserted, still masked */
+  /* The guest unmasks; only then may the still-asserted line deliver again. */
+  program({kMsrDaifXzr});
+  ASSERT_EQ(step(), OEMU_OK);
+  EXPECT_TRUE(oemu_vcpu_take_pending(&vcpu_));
 }
 
 }  // namespace

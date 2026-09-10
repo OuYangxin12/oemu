@@ -131,7 +131,7 @@ TEST_F(SysregInternalTest, CallbackRowsSeeTheBootState) {
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_SPSEL, &value));
   EXPECT_EQ(1u, value);
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_DAIF, &value));
-  EXPECT_EQ(0xFu, value);
+  EXPECT_EQ(OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT, value);
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_CURRENT_EL, &value));
   EXPECT_EQ(4u, value);
   EXPECT_EQ(OEMU_OK, oemu_sysreg_read(&sr_, OEMU_SYSREG_NZCV, &value));

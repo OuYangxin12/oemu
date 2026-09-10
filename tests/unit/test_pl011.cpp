@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 
 #include "dev/pl011_internal.h"
+#include "oemu/gicv2.h"
 #include "oemu/pl011.h"
 
 namespace {
@@ -33,6 +34,19 @@ constexpr uint64_t kRamBase = 0x40000000ULL;
 constexpr uint64_t kRamSize = 0x00010000ULL; /* 64 KiB: plenty, we never touch RAM */
 constexpr uint64_t kUart = 0x09000000ULL;
 constexpr uint64_t kUartSize = 0x1000ULL;
+
+/* A distributor to hand the console's interrupt to, and the handful of its
+ * registers this test touches. Offsets are the GICv2 TRM's, spelled as literals
+ * for the same reason the UART's are: this suite reads the bus, not the model. */
+constexpr uint64_t kGicDist = 0x08000000ULL;
+constexpr uint64_t kGicCpu = 0x08010000ULL;
+constexpr uint64_t kGicSize = 0x10000ULL;
+constexpr uint64_t GICD_CTL = 0x000U;        /* bit0: distributor enable */
+constexpr uint64_t GICD_ISENABLER0 = 0x100U; /* word n -> lines 32n..32n+31 */
+constexpr uint64_t GICC_CTLR = 0x000U;       /* bit0: CPU interface enable */
+constexpr uint64_t GICC_PMR = 0x004U;        /* drop lines at or above this */
+constexpr uint64_t GICC_IAR = 0x00CU;        /* acknowledge: reads the id */
+constexpr unsigned kConsoleIrq = 33U;        /* /pl011@9000000's SPI */
 
 /* A sink that appends every emitted byte, so TX order is observable. */
 std::vector<unsigned char> g_sink;
@@ -69,6 +83,47 @@ class Pl011 : public ::testing::Test {
   oemu_machine machine_{};
   oemu_pl011 uart_{};
 };
+
+// --- the console's promise to the interrupt controller ----------------------
+
+// The seam the whole interactive console hangs on, and which no component test
+// covers: the byte is in the device, the run loop copies the device's level into
+// the distributor once a slice, and the CPU is therefore holding interrupt 33 --
+// with the routing left at its reset value, because a driver with no reason to move
+// an affinity will not move it. The device and the controller each had tests of
+// their own; the *composition* is what measured `device=1 gic=0` for hours and
+// turned a received keystroke into silence, so the composition is what is asserted
+// here. The one `set_pending` call below is exactly what the boot loop does.
+TEST_F(Pl011, AReceivedByteEndsUpPendingOnTheCpu) {
+  oemu_gicv2 gic;
+  oemu_gicv2_init(&gic, 64U);
+  ASSERT_EQ(OEMU_OK,
+            oemu_aspace_attach_device(&machine_.aspace, kGicDist, kGicSize, &gic.dist_ops));
+  ASSERT_EQ(OEMU_OK,
+            oemu_aspace_attach_device(&machine_.aspace, kGicCpu, kGicSize, &gic.cpu_ops));
+  const auto gic_wr = [&](uint64_t reg, uint32_t v) {
+    EXPECT_EQ(OEMU_OK, oemu_aspace_write(&machine_.aspace, reg, OEMU_MEM_WORD, v));
+  };
+  const auto gic_rd = [&](uint64_t reg) {
+    uint64_t v = 0xDEADBEEFULL;
+    EXPECT_EQ(OEMU_OK, oemu_aspace_read(&machine_.aspace, reg, OEMU_MEM_WORD, false, &v));
+    return (uint32_t)v;
+  };
+  // The driver's opening state: receiver on, RX and RX-timeout interrupts unmasked.
+  enable_no_loopback();
+  wr(PL011_REG_INTIM, PL011_INT_RX);
+  gic_wr(kGicCpu + GICC_PMR, 0xFFU);
+  gic_wr(kGicCpu + GICC_CTLR, 1U);
+  gic_wr(kGicDist + GICD_CTL, 1U);
+  gic_wr(kGicDist + GICD_ISENABLER0 + 4U, 1U << (kConsoleIrq % 32U)); /* enable 33 */
+
+  ASSERT_EQ(OEMU_OK, oemu_pl011_inject(&uart_, 'e'));
+  EXPECT_NE(0, oemu_pl011_irq_level(&uart_)); /* the device raised its line */
+
+  oemu_gicv2_set_pending(&gic, kConsoleIrq, oemu_pl011_irq_level(&uart_) != 0);
+  EXPECT_EQ(1, oemu_gicv2_irq_level(&gic));           /* ... and the controller passes it on */
+  EXPECT_EQ(kConsoleIrq, gic_rd(kGicCpu + GICC_IAR)); /* ... and the driver can name it */
+}
 
 // --- reset state ------------------------------------------------------------
 
@@ -151,23 +206,28 @@ TEST_F(Pl011, TxRingDropsOldestWhenOverflowed) {
    * bytes and count, not hide, the loss -- TX is never allowed to block the
    * vCPU. */
   wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE | PL011_CR_FEN);
-  for (unsigned i = 0U; i < 70U; i++) {
+  for (unsigned i = 0U; i < OEMU_PL011_TX_RING + 6U; i++) {
     wr(PL011_REG_DR, 'A' + (i % 26U));
   }
-  EXPECT_EQ(OEMU_PL011_TX_RING, uart_.tx_count); /* 64 kept */
-  EXPECT_EQ(6ULL, uart_.tx_dropped);             /* 70 - 64 lost */
+  EXPECT_EQ(OEMU_PL011_TX_RING, uart_.tx_count); /* the ring holds all it can */
+  EXPECT_EQ(6ULL, uart_.tx_dropped);             /* exactly the overflow */
 }
 
-TEST_F(Pl011, FlagsShowBusyWhileTxQueuedThenEmptyAfterPump) {
+TEST_F(Pl011, TxFlagsNeverAdvertiseBusyForAQueuedByte) {
+  /* A queued byte must not read as "FIFO full". The driver's transmit loop
+   * polls FR.TXFF and its tty room callback returns 0 when it is set, so a byte
+   * that is merely waiting for the host to drain the ring put /init's second
+   * write to sleep on tty->write_wait with nothing left to wake it -- the drain
+   * was a host-side event and raised no interrupt. The oracle's chardev drains
+   * as it writes, so FR reads TXFE with TXFF and BUSY clear even mid-burst. */
   wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE | PL011_CR_FEN);
   wr(PL011_REG_DR, 'x');
-  const uint32_t busy = rd(PL011_REG_FR);
-  EXPECT_NE(0U, busy & PL011_FR_BUSY);
-  EXPECT_EQ(0U, busy & PL011_FR_TXFE); /* queue not drained: TX not empty */
-  (void)oemu_pl011_pump(&uart_);
-  const uint32_t idle = rd(PL011_REG_FR);
-  EXPECT_NE(0U, idle & PL011_FR_TXFE); /* drained: TXFE reasserted */
-  EXPECT_EQ(0U, idle & PL011_FR_BUSY);
+  const uint32_t queued = rd(PL011_REG_FR);
+  EXPECT_NE(0U, queued & PL011_FR_TXFE);
+  EXPECT_EQ(0U, queued & PL011_FR_TXFF);
+  EXPECT_EQ(0U, queued & PL011_FR_BUSY);
+  EXPECT_EQ(1U, oemu_pl011_pump(&uart_)); /* the byte is queued, not lost */
+  EXPECT_NE(0U, rd(PL011_REG_FR) & PL011_FR_TXFE);
 }
 
 // --- RIS / interrupt state --------------------------------------------------
@@ -175,7 +235,7 @@ TEST_F(Pl011, FlagsShowBusyWhileTxQueuedThenEmptyAfterPump) {
 TEST_F(Pl011, TransmitIntStatusSetsOnDataWrite) {
   enable_no_loopback();
   wr(PL011_REG_DR, 'z');
-  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TIEM);
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TXIS);
 }
 
 TEST_F(Pl011, IntStatusWriteIsIgnored) {
@@ -189,19 +249,19 @@ TEST_F(Pl011, IntStatusWriteIsIgnored) {
 TEST_F(Pl011, IntClearRetiresTheSelectedBits) {
   enable_no_loopback();
   wr(PL011_REG_DR, 'z');
-  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TIEM);
-  wr(PL011_REG_INTCLR, PL011_INT_TIEM);
-  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_TIEM);
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TXIS);
+  wr(PL011_REG_INTCLR, PL011_INT_TXIS);
+  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_TXIS);
 }
 
 TEST_F(Pl011, IrqLevelFollowsMaskedStatus) {
   enable_no_loopback();
-  wr(PL011_REG_INTIM, PL011_INT_TIEM);        /* unmask transmit */
+  wr(PL011_REG_INTIM, PL011_INT_TXIS);        /* unmask transmit */
   EXPECT_EQ(0, oemu_pl011_irq_level(&uart_)); /* no event yet */
   wr(PL011_REG_DR, 'z');                      /* raises RIS.TIEM */
   EXPECT_EQ(1, oemu_pl011_irq_level(&uart_)); /* masked and raised: line high */
-  EXPECT_NE(0U, rd(PL011_REG_MIS) & PL011_INT_TIEM);
-  wr(PL011_REG_INTCLR, PL011_INT_TIEM);
+  EXPECT_NE(0U, rd(PL011_REG_MIS) & PL011_INT_TXIS);
+  wr(PL011_REG_INTCLR, PL011_INT_TXIS);
   EXPECT_EQ(0, oemu_pl011_irq_level(&uart_)); /* cleared: line low */
 }
 
@@ -210,9 +270,9 @@ TEST_F(Pl011, MaskedEventLeavesTheLineLow) {
   /* imsc still zero (reset): an unmasked-by-omission event raises RIS but
    * never the line. */
   wr(PL011_REG_DR, 'z');
-  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TIEM);
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_TXIS);
   EXPECT_EQ(0, oemu_pl011_irq_level(&uart_));
-  EXPECT_EQ(0U, rd(PL011_REG_MIS) & PL011_INT_TIEM);
+  EXPECT_EQ(0U, rd(PL011_REG_MIS) & PL011_INT_TXIS);
 }
 
 // --- RX: injection is gated, ringed, and clears on drain --------------------
@@ -227,12 +287,33 @@ TEST_F(Pl011, InjectThenReadBackAndRetire) {
   enable_no_loopback(); /* UARTEN|TXE|RXE: the receiver is live */
   ASSERT_EQ(OEMU_OK, oemu_pl011_inject(&uart_, 'Q'));
   EXPECT_EQ(1U, uart_.rx_count);
-  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_RLIS);
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_RX);
   EXPECT_EQ(0U, rd(PL011_REG_FR) & PL011_FR_RXFE); /* a byte is waiting */
   EXPECT_EQ((uint32_t)'Q', rd(PL011_REG_DR));      /* DR read pops it */
   EXPECT_EQ(0U, uart_.rx_count);
-  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_RLIS); /* last byte read: bit retires */
-  EXPECT_NE(0U, rd(PL011_REG_FR) & PL011_FR_RXFE);   /* empty again */
+  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_RX); /* last byte read: bit retires */
+  EXPECT_NE(0U, rd(PL011_REG_FR) & PL011_FR_RXFE); /* empty again */
+}
+
+TEST_F(Pl011, ReceivedByteRaisesTheBitTheDriverMasksFor) {
+  /* The regression the missing SHELL_ALIVE marker came from: a received byte has
+   * to assert RXIS (bit 4), which is the bit the driver masks (RXIM) and the bit
+   * its ISR dispatches on. Raising bit 0 instead -- which reads as an RI
+   * modem-status change -- let the ISR take the modem branch and throw the byte
+   * away, so a fed keystroke never reached the guest while every other RX
+   * assertion still passed. */
+  enable_no_loopback();
+  wr(PL011_REG_INTIM, PL011_INT_RXIS | PL011_INT_RTIS); /* the driver's mask */
+  ASSERT_EQ(OEMU_OK, oemu_pl011_inject(&uart_, 'e'));
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_RXIS);
+  EXPECT_NE(0U, rd(PL011_REG_MIS) & PL011_INT_RXIS);
+  /* A byte below the trigger level also raises receive timeout: that is the
+   * interrupt a driver waiting for one typed character actually gets. */
+  EXPECT_NE(0U, rd(PL011_REG_RIS) & PL011_INT_RTIS);
+  EXPECT_EQ(0U, rd(PL011_REG_RIS) & PL011_INT_RIMIS); /* bit 0 is RI: it stays quiet on RX */
+  EXPECT_EQ(1, oemu_pl011_irq_level(&uart_));         /* the GIC line really moves */
+  wr(PL011_REG_INTCLR, PL011_INT_RX);
+  EXPECT_EQ(0, oemu_pl011_irq_level(&uart_));
 }
 
 TEST_F(Pl011, InjectFillsTheRingThenRefuses) {
@@ -249,6 +330,28 @@ TEST_F(Pl011, InjectWithNullDeviceIsAnArgumentError) {
 }
 
 // --- loopback ---------------------------------------------------------------
+
+/* The reset CR is TXE|LBE with the receiver off (measured off QEMU). Writing
+ * the console then must not look like lost output: with RXE clear there is no
+ * receiver to mirror into, and charging those bytes to tx_dropped made the M5
+ * boot gate refuse a log that was complete (2939 phantom drops). */
+TEST_F(Pl011, ResetLoopbackWithoutReceiverIsNotConsoleLoss) {
+  EXPECT_EQ(PL011_CR_TXE | PL011_CR_LBE, rd(PL011_REG_CR));
+  for (unsigned i = 0U; i < 200U; i++) {
+    wr(PL011_REG_DR, 'x');
+  }
+  EXPECT_EQ(0ULL, uart_.tx_dropped) << "no TX byte was lost";
+  EXPECT_EQ(0ULL, uart_.rx_dropped) << "no receiver was enabled, so nothing to lose";
+}
+
+TEST_F(Pl011, LoopbackOverflowCountsAsRxLossOnly) {
+  wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE | PL011_CR_LBE);
+  for (unsigned i = 0U; i < OEMU_PL011_RX_RING + 4U; i++) {
+    wr(PL011_REG_DR, 'y');
+  }
+  EXPECT_EQ(0ULL, uart_.tx_dropped) << "TX never lost a byte";
+  EXPECT_EQ(4ULL, uart_.rx_dropped) << "the receiver had no room for the tail";
+}
 
 TEST_F(Pl011, LoopbackMirrorsTxIntoRx) {
   /* With the receiver live and loopback set, a DR write lands in RX as well
@@ -278,11 +381,11 @@ TEST_F(Pl011, IntMaskIsWrittenWhole) {
    * whole IMSC in one access. A write therefore overwrites the mask, it does
    * not accumulate -- the earlier model's phantom SET/CLR registers were not
    * part of the real register file. */
-  wr(PL011_REG_INTIM, PL011_INT_RLIS);
-  EXPECT_EQ(PL011_INT_RLIS, rd(PL011_REG_INTIM) & PL011_INT_RLIS);
-  wr(PL011_REG_INTIM, PL011_INT_TIEM); /* whole-mask overwrite */
-  EXPECT_EQ(0U, rd(PL011_REG_INTIM) & PL011_INT_RLIS);
-  EXPECT_NE(0U, rd(PL011_REG_INTIM) & PL011_INT_TIEM);
+  wr(PL011_REG_INTIM, PL011_INT_RX);
+  EXPECT_EQ(PL011_INT_RX, rd(PL011_REG_INTIM) & PL011_INT_RX);
+  wr(PL011_REG_INTIM, PL011_INT_TXIS); /* whole-mask overwrite */
+  EXPECT_EQ(0U, rd(PL011_REG_INTIM) & PL011_INT_RX);
+  EXPECT_NE(0U, rd(PL011_REG_INTIM) & PL011_INT_TXIS);
 }
 
 TEST_F(Pl011, SinklessPumpStillDrainsAndCounts) {
@@ -302,6 +405,29 @@ TEST_F(Pl011, SinklessPumpStillDrainsAndCounts) {
   EXPECT_EQ(1U, oemu_pl011_pump(&bare));
   EXPECT_EQ(1ULL, bare.tx_emitted);
   EXPECT_TRUE(g_sink.empty());
+}
+
+TEST_F(Pl011, TxDroppedCountsExactlyTheBytesLostToAFullRing) {
+  /* TX must never block the vCPU, so a byte arriving at a full ring drops the
+   * oldest and the loss is counted rather than hidden. The counter is the only
+   * way a caller can tell a short log from a quiet guest -- scripts/boot-linux-gate.sh
+   * refuses a run that reports any loss, so the meaning of the number has to be
+   * pinned: exactly one per dropped byte, and none at all while the ring drains. */
+  wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_FEN);
+  for (unsigned i = 0U; i < OEMU_PL011_TX_RING + 2U; ++i) {
+    wr(PL011_REG_DR, static_cast<unsigned char>('a' + (i % 26U)));
+  }
+  EXPECT_EQ(2U, oemu_pl011_tx_dropped(&uart_));
+  EXPECT_EQ(OEMU_PL011_TX_RING, uart_.tx_count);
+}
+
+TEST_F(Pl011, TxDroppedStaysZeroWhileSomebodyPumps) {
+  wr(PL011_REG_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_FEN);
+  for (unsigned i = 0U; i < OEMU_PL011_TX_RING * 3U; ++i) {
+    wr(PL011_REG_DR, static_cast<unsigned char>('a' + (i % 26U)));
+    (void)oemu_pl011_pump(&uart_);
+  }
+  EXPECT_EQ(0U, oemu_pl011_tx_dropped(&uart_));
 }
 
 }  // namespace
