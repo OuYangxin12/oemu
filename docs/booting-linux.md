@@ -104,6 +104,35 @@ write(-9, ...)         -> -EBADF   # 从此每 256 条指令一次，294,542 次
 * 探针夹具 `tests/guest/probe.c` 报的"第二个 write 不返回"是夹具自身的错（它的 `say()` 忽略返回值，
   于是上面那串 -EBADF 在日志里完全隐形）。教训：**用项目自己的夹具下结论**，探针只提供问题。
 
+## 门禁通过后补的两环（M5 完成）
+
+标记齐了仍然 `exit code 1 != expected 0`，因为字符进到 RX ring 之后还有两处断链：
+
+**一、`GICD_ITROUTERn` 是"每个中断一个寄存器"，且复位值指向 CPU0。**
+它位于 `0x800 + 4n`，只有低字节（目标 CPU 列表）有效。我原先按"一个 32 位字装四条线"
+实现——那是上面几百字节那组 enable 寄存器的形状——于是 guest 往 `0x884`（SPI 1 自己的
+路由器）写的 "CPU0" 落到了第 132 条线上。而 SPI 路由器**复位值为 `0b00000001`**，我的实现
+清零；guest 有权不改一个它没理由动的亲和性（`gic_dist_init()` 只把分发器打开），
+于是复位值成了唯一依据。测量形式：`irq 33 en=1 tgt=0x00`，而设备侧 `device=1`——
+中断举进了一个不肯路由它的分发器，看起来跟"键盘丢字符"一模一样。
+`Gicv2.SpiTargetsThisCpuFromReset` 现在只碰 enable 寄存器就交付一个电平 SPI，
+钉住"驱动可以不动路由"这一条。旧的 `SgiPpiTargetFixedSpiProgrammable`
+把两个错误信念都钉住了（复位读 0、一字四线），是在**保护**这个 bug。
+
+**二、`/init` 夹具说的是另一个内核的 `reboot(2)` ABI。**
+`guest/` 下的内核被厂商改过：`_reboot()` 要**两个** magic
+（`LINUX_REBOOT_MAGIC1=0xfee1dead` 与四个 `MAGIC2*` 之一），且
+`LINUX_REBOOT_CMD_POWER_OFF=0x4321FEDC`（mainline 是 `0x4321fed5`）。夹具用的是上古的
+`RB_POWERDOWN=0x4321FDA1`，在本树的 switch 里没有任何 case 处理它 ⇒ `-EINVAL` ⇒
+init 返回 ⇒ `Kernel panic - not syncing: Attempted to kill init`——三个标记都在，
+只是"模拟器不会关机"这个结论是错的。常量现在抄自被启动的那棵树的
+`include/uapi/linux/reboot.h`：夹具唯一该忠实的 ABI 就是它启动的那个内核。
+
+```
+scripts/boot-linux-gate.sh
+boot-linux-gate: PASS (markers: BOOT OK MINIMAL-BOOT-CHECK-PASSED SHELL_ALIVE; exit: 0)
+```
+
 ## 本轮把"沉默的零"变成可查的东西
 
 `OEMU_TRACE_*` 的三个缺陷都是同一个类型：探针不响，却读成"guest 没执行"。
