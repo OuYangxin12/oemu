@@ -778,6 +778,25 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
           idle_announced = true;
           (void)fputs("oemu: guest idle at the console; handing over input\n", stderr);
           boot_uart_report(uart); /* did the byte reach the device, or is it still ours? */
+          /* The two ends of the interrupt wire, side by side: a level at the
+           * device that the distributor does not pass, or one it passes that the
+           * core does not take, are different bugs and this line tells them
+           * apart without a rebuild. */
+          (void)fprintf(stderr, "oemu:   irq: device=%d gic=%d into_core=%d\n",
+                        oemu_pl011_irq_level(uart), oemu_gicv2_irq_level(gic),
+                        vcpu->irq_level ? 1 : 0);
+          /* The distributor's whole reason for holding the line back, on one
+           * line: a source that is disabled, masked by the priority mask,
+           * already active, targeted elsewhere, or level-configured but latched
+           * as edge are five different bugs, and each is one field here. */
+          (void)fprintf(stderr,
+                        "oemu:   gic: ctl=0x%x cpu_ctl=0x%x pmr=0x%x running=%u | irq %u"
+                        " en=%u pend=%u act=%u cfg=%u grp=%u pri=0x%02x tgt=0x%02x\n",
+                        gic->ctl, gic->cpu_ctl, gic->cpu_pmr, gic->running_pri, BOOT_UART_SPI,
+                        gic->enable[BOOT_UART_SPI], gic->pending[BOOT_UART_SPI],
+                        gic->active[BOOT_UART_SPI], gic->config[BOOT_UART_SPI],
+                        gic->group[BOOT_UART_SPI], gic->priority[BOOT_UART_SPI],
+                        gic->target[BOOT_UART_SPI]);
         }
         boot_refresh_levels(vcpu, gic, uart); /* the byte we just fed may now wake it */
         oemu_vcpu_rearm(vcpu);
