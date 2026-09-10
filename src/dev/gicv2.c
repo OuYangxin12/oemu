@@ -144,11 +144,16 @@ void oemu_gicv2_init(oemu_gicv2 *gic, unsigned lines) {
   gic->iidr = 0U;
   /* Every line starts disabled with a middling priority, as the real reset.
    * SGI (0-15) and PPI (16-31) targets are architecturally fixed to the
-   * single CPU, so they start addressed here (bit0 set) and the driver never
-   * rewrites them; only SPI (32+) targets are programmable and start clear. */
+   * single CPU. SPI (32+) targets are programmable, and GICD_ITROUTER_n
+   * *resets to 0b00000001* -- addressed to CPU0. That reset value is load
+   * bearing: Linux's GIC driver does not rewrite the affinity of an interrupt it
+   * has no reason to move, so a distributor that resets these to zero silently
+   * un-plumbs every device whose interrupt the guest never re-targets. Measured
+   * as GICD_ITROUTER(33) reading 0 with the driver having raised the line, and
+   * the symptom was a received character that never reached the driver. */
   for (unsigned i = 0U; i < OEMU_GICV2_LINES; ++i) {
     gic->priority[i] = 0x80U;
-    gic->target[i] = (i < 32U) ? 1U : 0U;
+    gic->target[i] = 1U;
   }
 }
 
@@ -212,12 +217,14 @@ static oemu_status dist_read(void *ctx, uint64_t offset, oemu_mem_size size,
       const unsigned line = word * 4U + b;
       v |= (uint32_t)((line < OEMU_GICV2_LINES) ? gic->priority[line] : 0U) << (b * 8U);
     }
-  } else if ((offset >= DIST_TARGET0) && (offset < (DIST_TARGET0 + 0x100U))) {
-    const unsigned word = (unsigned)((offset - DIST_TARGET0) / 4U);
-    for (unsigned b = 0U; b < 4U; ++b) {
-      const unsigned line = word * 4U + b;
-      v |= (uint32_t)((line < OEMU_GICV2_LINES) ? gic->target[line] : 0U) << (b * 8U);
-    }
+  } else if ((offset >= DIST_TARGET0) && (offset < (DIST_TARGET0 + (4U * lines_of(gic))))) {
+    /* GICD_ITROUTERn: one 32-bit register *per interrupt*, at 0x800 + 4n, of
+     * which only the low byte (the target CPU list) is implemented and only for
+     * SPIs. Treating these as one word per four lines -- the shape of the enable
+     * banks just above -- sends every affinity write the guest makes to a
+     * different line than the one it meant. */
+    const unsigned line = (unsigned)((offset - DIST_TARGET0) / (4U));
+    v = (line < lines_of(gic)) ? (uint32_t)gic->target[line] : 0U;
   } else if ((offset >= DIST_CFG0) && (offset < (DIST_CFG0 + 0x40U))) {
     const unsigned word = (unsigned)((offset - DIST_CFG0) / 4U);
     for (unsigned b = 0U; b < 16U; ++b) {
@@ -304,14 +311,11 @@ static oemu_status dist_write(void *ctx, uint64_t offset, oemu_mem_size size, ui
         gic->priority[line] = (uint8_t)((v >> (b * 8U)) & 0xFFU);
       }
     }
-  } else if ((offset >= DIST_TARGET0) && (offset < (DIST_TARGET0 + 0x100U))) {
-    const unsigned word = (unsigned)((offset - DIST_TARGET0) / 4U);
-    for (unsigned b = 0U; b < 4U; ++b) {
-      const unsigned line = word * 4U + b;
-      /* Only SPI (>= 32) targets are writable; SGI/PPI targets are fixed. */
-      if ((line < OEMU_GICV2_LINES) && (line >= 32U)) {
-        gic->target[line] = (uint8_t)((v >> (b * 8U)) & 0xFFU);
-      }
+  } else if ((offset >= DIST_TARGET0) && (offset < (DIST_TARGET0 + (4U * lines_of(gic))))) {
+    const unsigned line = (unsigned)((offset - DIST_TARGET0) / (4U));
+    /* One register per interrupt, low byte only; SGI/PPI targets are fixed. */
+    if ((line < lines_of(gic)) && (line >= 32U)) {
+      gic->target[line] = (uint8_t)(v & 0xFFU);
     }
   } else if ((offset >= DIST_CFG0) && (offset < (DIST_CFG0 + 0x40U))) {
     const unsigned word = (unsigned)((offset - DIST_CFG0) / 4U);

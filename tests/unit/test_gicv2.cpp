@@ -113,6 +113,27 @@ TEST_F(Gicv2, SpuriousAckWhenNothingPending) {
   EXPECT_EQ(0, oemu_gicv2_irq_level(&gic_));
 }
 
+// GICD_ITROUTER_n resets to 0b00000001 -- addressed to CPU0 -- and the guest is
+// entitled to rely on that: Linux's gic_dist_init() brings up the distributor and
+// leaves the affinity of an interrupt it has no reason to move. So a raised SPI
+// has to be deliverable with *no* write to ITROUTER at all. Ours reset these to
+// zero, measured as ITROUTER(33) == 0 with the console's line asserted: every
+// device the guest never re-targeted was quietly un-plumbed, and the symptom was
+// a received character that never reached its driver.
+TEST_F(Gicv2, SpiTargetsThisCpuFromReset) {
+  cpwr(CPU_PMR, 0xFFU);
+  cpwr(CPU_CTL, 1U);
+  wr(DIST_CTL, 1U);
+  wr(DIST_ISENABLER0 + 4U, 0x2U);             /* enable line 33; routing left at reset */
+  EXPECT_EQ(1U, rd(DIST_TARGET0 + 4U * 33U)); /* line 33's own router register */
+
+  oemu_gicv2_set_pending(&gic_, 33U, true); /* the level source asserts */
+  EXPECT_EQ(1, oemu_gicv2_irq_level(&gic_));
+  EXPECT_EQ(33U, cprd(CPU_IAR));
+  oemu_gicv2_set_pending(&gic_, 33U, false); /* ...and the level drops */
+  EXPECT_EQ(0, oemu_gicv2_irq_level(&gic_));
+}
+
 // --- the acknowledge / EOI handshake ---------------------------------------
 
 // Arm one SPI end-to-end the way the driver would: target, enable, pending
@@ -120,9 +141,9 @@ TEST_F(Gicv2, SpuriousAckWhenNothingPending) {
 // acknowledge it and the EOI retire it. Targets/priorities are one byte per
 // line, so SPI 33 lives in word 8 (offset +0x20), byte 1.
 TEST_F(Gicv2, SpiHandshakeRoundTrip) {
-  wr(DIST_TARGET0 + 0x20U, 0x100U); /* line 33 -> cpu 0 (word 8, byte 1) */
-  wr(DIST_ISENABLER0 + 4U, 0x2U);   /* enable word 1 -> line 33 */
-  wr(DIST_ISPENDR0 + 4U, 0x2U);     /* pend  word 1 -> line 33 */
+  wr(DIST_TARGET0 + 4U * 33U, 0x1U); /* line 33's own register -> cpu 0 */
+  wr(DIST_ISENABLER0 + 4U, 0x2U);    /* enable word 1 -> line 33 */
+  wr(DIST_ISPENDR0 + 4U, 0x2U);      /* pend  word 1 -> line 33 */
   cpwr(CPU_PMR, 0xFFU);
   cpwr(CPU_CTL, 1U);
   wr(DIST_CTL, 1U);
@@ -182,15 +203,24 @@ TEST_F(Gicv2, EnableBankReadsBack) {
 }
 
 TEST_F(Gicv2, SgiPpiTargetFixedSpiProgrammable) {
-  // Target registers hold one byte per line: SGI/PPI (0-31) are architecturally
-  // fixed to the single CPU, so every one of lines 0-3 reads back as 0x01.
-  EXPECT_EQ(0x01010101U, rd(DIST_TARGET0)); /* lines 0-3 -> cpu0 */
-  wr(DIST_TARGET0, 0x000000FFU);            /* ignored for lines 0-3 */
-  EXPECT_EQ(0x01010101U, rd(DIST_TARGET0));
-  // SPI (32+) start clear and are writable: target SPI line 32 (word 8, byte 0).
-  EXPECT_EQ(0x00000000U, rd(DIST_TARGET0 + 0x20U));
-  wr(DIST_TARGET0 + 0x20U, 0x00000001U);
-  EXPECT_EQ(0x00000001U, rd(DIST_TARGET0 + 0x20U));
+  // GICD_ITROUTERn is one register per interrupt, only the low byte implemented:
+  // line 0's router reads back as 0x01, and a whole-word write is not four
+  // targets. SGI/PPI (0-31) are fixed to the single CPU, so writes there are
+  // ignored.
+  EXPECT_EQ(0x00000001U, rd(DIST_TARGET0));
+  wr(DIST_TARGET0, 0x000000FFU); /* ignored for line 0 */
+  EXPECT_EQ(0x00000001U, rd(DIST_TARGET0));
+  // The bytes above the target list are RES0: a write of 0xFF000000 must not
+  // appear as an affinity, or a driver that writes a full word gets a ghost CPU.
+  wr(DIST_TARGET0 + 4U * 34U, 0xFF000000U);
+  EXPECT_EQ(0x00000000U, rd(DIST_TARGET0 + 4U * 34U));
+  // SPI (32+) reset to 0b00000001 -- CPU0 -- and are writable (word 8 = lines
+  // 32+). Reading zero here was pinning half the bug: the driver may leave a
+  // reset value alone, and then a level interrupt from a device is raised into a
+  // distributor that will not route it. See SpiTargetsThisCpuFromReset.
+  EXPECT_EQ(0x00000001U, rd(DIST_TARGET0 + 4U * 33U)); /* SPI 1 == interrupt 33 */
+  wr(DIST_TARGET0 + 4U * 33U, 0x00000001U);
+  EXPECT_EQ(0x00000001U, rd(DIST_TARGET0 + 4U * 33U));
 }
 
 // --- RAZ/WI and no-fault contract ------------------------------------------
