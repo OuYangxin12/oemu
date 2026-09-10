@@ -66,6 +66,7 @@
 #include "oemu/pl011.h"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/random.h>
 #include <termios.h>
 #include <unistd.h>
@@ -654,12 +655,20 @@ static void boot_pump_stdin(oemu_pl011 *uart, unsigned char *held, size_t *held_
                             uint64_t *dropped, bool *eof) {
   unsigned char c = 0U;
   for (;;) {
+    /* poll(2), not O_NONBLOCK: the blocking wait below borrows the descriptor
+     * and has to be able to hand it back in any state, and a pump that blocks
+     * in read() never returns to run the guest it just fed -- which is how a
+     * held-over line once sat in the UART ring while the run loop hung. */
+    struct pollfd waiting = {STDIN_FILENO, (short)POLLIN, 0};
+    if (poll(&waiting, 1U, 0) <= 0) {
+      break; /* nothing typed at this instant (or the console is gone) */
+    }
     const ssize_t got = read(STDIN_FILENO, &c, 1U);
     if (got < 0) {
       if (errno == EINTR) {
         continue;
       }
-      break; /* EAGAIN: nothing typed at this instant */
+      break;
     }
     if (got == 0) {
       *eof = true;
@@ -702,8 +711,8 @@ static bool boot_await_input(oemu_pl011 *uart, unsigned char *held, size_t *held
   while ((n < 0) && (errno == EINTR)) {
     n = read(STDIN_FILENO, &c, 1U);
   }
-  if ((flags >= 0) && ((flags & O_NONBLOCK) == 0)) {
-    (void)fcntl(STDIN_FILENO, F_SETFL, flags); /* back to polling for the loop */
+  if (flags >= 0) {
+    (void)fcntl(STDIN_FILENO, F_SETFL, flags); /* exactly the flags we found */
   }
   if (n == 1) {
     got = true;
@@ -767,7 +776,8 @@ static int boot_run(oemu_vcpu *vcpu, oemu_machine *machine, oemu_pl011 *uart, oe
       if (pump_stdin && boot_await_input(uart, held, &held_len, &held_drop, &stdin_eof)) {
         if (!idle_announced) {
           idle_announced = true;
-          (void)fputs("oemu: guest idle at the console; waiting for input\n", stderr);
+          (void)fputs("oemu: guest idle at the console; handing over input\n", stderr);
+          boot_uart_report(uart); /* did the byte reach the device, or is it still ours? */
         }
         boot_refresh_levels(vcpu, gic, uart); /* the byte we just fed may now wake it */
         oemu_vcpu_rearm(vcpu);
