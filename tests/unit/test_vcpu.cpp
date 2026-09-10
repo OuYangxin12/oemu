@@ -175,7 +175,7 @@ TEST_F(VcpuTest, El0BootRoutesToEl1Vectors) {
   /* From EL0 the lower-EL AArch64 group applies, and delivery is EL1. */
   EXPECT_EQ(oemu_vcpu_step(&el0, nullptr), OEMU_OK);
   EXPECT_EQ(oemu_regs_pc(&el0.cpu.regs), kVectors + 0x400U);
-  EXPECT_EQ(el0.sysregs.elr_el[OEMU_EL1], kText);
+  EXPECT_EQ(el0.sysregs.elr_el[OEMU_EL1], kText + 4U); /* past the svc */
   EXPECT_EQ(oemu_pstate_el(el0.sysregs.pstate), OEMU_EL1);
 }
 
@@ -230,7 +230,9 @@ TEST_F(VcpuTest, SvcTrapsIntoTheVectorTableNotTheHost) {
   EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kVectors + 0x200U);
   EXPECT_EQ(vcpu_.sysregs.esr_el[OEMU_EL1],
             EcBase(OEMU_EXC_EC_SVC64) | (uint32_t)kIlBit | 0x123U);
-  EXPECT_EQ(vcpu_.sysregs.elr_el[OEMU_EL1], kText);
+  /* An SVC's preferred exception return address is the next instruction: the
+   * call has been taken, and re-executing it would re-issue the system call. */
+  EXPECT_EQ(vcpu_.sysregs.elr_el[OEMU_EL1], kText + 4U);
   /* Entry masks everything and sets IL. */
   EXPECT_EQ(oemu_pstate_daif(vcpu_.sysregs.pstate), OEMU_PSTATE_DAIF_MASK);
 }
@@ -257,9 +259,13 @@ TEST_F(VcpuTest, EretRoundTripsThroughTheHandler) {
   place(kVectors + 0x200U, {kEret});
   ASSERT_EQ(step(), OEMU_OK); /* SVC delivered */
   ASSERT_EQ(step(), OEMU_OK); /* handler's ERET */
-  /* ELR names the SVC itself: a synchronous trap retries its instruction,
-   * and it is the handler's job to have moved ELR past it. */
-  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText);
+  /* The round trip lands on the instruction after the trap. (A synchronous
+   * trap *does* normally retry its instruction -- but only for traps the handler
+   * can repair: aborts and undefined instructions. SVC/HVC/BRK are the
+   * architecturally exempt ones, and getting this wrong is not a detail: the
+   * kernel's eret re-issued every system call with x0 holding the previous
+   * return value, so a guest /init wrote to fd 8, then fd -9, forever.) */
+  EXPECT_EQ(oemu_regs_pc(&vcpu_.cpu.regs), kText + 4U);
   /* Returned exactly to the interrupted state: the masked boot PSTATE. */
   EXPECT_EQ(vcpu_.sysregs.pstate,
             OEMU_PSTATE_M_EL1H | (OEMU_PSTATE_DAIF_MASK << OEMU_PSTATE_DAIF_SHIFT));

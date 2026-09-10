@@ -185,7 +185,17 @@ void oemu_exc_undefined(oemu_regs *regs, oemu_sysregs *sysregs, uint32_t insn) {
                 oemu_exc_internal_esr_undefined(insn), 0, false);
 }
 
+/* SVC and HVC are the two exceptions whose preferred exception return address is
+ * the instruction *after* the one that trapped (DDI 0487 D1.4.5, "the address of
+ * the instruction following the SVC"): the system call has been taken, it is not
+ * re-run. Every other entry point here records the trapping instruction, so the
+ * advance belongs to these two callers rather than to oemu_exc_take. Without it
+ * ELR names the svc itself, the kernel's eret re-executes the system call with
+ * x0 holding the previous return value -- so write(1,...) is followed forever by
+ * write(8,...), write(-9,...), and a /init that prints its first line and never
+ * finishes its second (measured on issue #28: 294k identical -EBADF returns). */
 void oemu_exc_svc(oemu_regs *regs, oemu_sysregs *sysregs, uint16_t imm16) {
+  regs->pc += OEMU_INSN_SIZE;
   oemu_exc_take(regs, sysregs, OEMU_EXC_KIND_SYNC,
                 oemu_exc_route(oemu_pstate_el(sysregs->pstate)),
                 oemu_exc_internal_esr_imm16(OEMU_EXC_EC_SVC64, imm16), 0, false);
@@ -207,6 +217,7 @@ void oemu_exc_smc(oemu_regs *regs, oemu_sysregs *sysregs, uint16_t imm16) {
 }
 
 void oemu_exc_hvc(oemu_regs *regs, oemu_sysregs *sysregs, uint16_t imm16) {
+  regs->pc += OEMU_INSN_SIZE; /* the call is taken, not re-run */
   oemu_exc_undefined(regs, sysregs, 0xD4000002U | ((uint32_t)imm16 << 5));
 }
 

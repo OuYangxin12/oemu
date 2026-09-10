@@ -104,8 +104,11 @@ TEST_F(ExcTest, SvcFromEl0DeliversToTheLowerElVectorGroup) {
 
   EXPECT_EQ(0x400U, regs.pc);
   EXPECT_EQ(EntryPstate(OEMU_EL1), sr.pstate);
-  // The interrupted world is recorded in EL1's banks.
-  EXPECT_EQ(0x3000U, sr.elr_el[OEMU_EL1]);
+  // The interrupted world is recorded in EL1's banks -- and for SVC the recorded
+  // address is the one the call *returns to*, i.e. past the trap: an ELR naming
+  // the svc itself makes the kernel's eret re-issue the system call forever,
+  // with x0 (the fd, for a write) holding the previous return value.
+  EXPECT_EQ(0x3004U, sr.elr_el[OEMU_EL1]);
   EXPECT_EQ(BootPstate(OEMU_EL0), sr.spsr_el[OEMU_EL1]);
   EXPECT_EQ(EcBase(OEMU_EXC_EC_SVC64) | kIlBit | 0x42U, sr.esr_el[OEMU_EL1]);
   // FAR is not an SVC attribute and must stay untouched.
@@ -139,7 +142,7 @@ TEST_F(ExcTest, El3KeepsItsOwnExceptions) {
 
   EXPECT_EQ(0x80200U, regs.pc);  // vbar_el3 0x80000 + 0x200 (same EL, SPSel=1)
   EXPECT_EQ(EntryPstate(OEMU_EL3), sr.pstate);
-  EXPECT_EQ(0x9000U, sr.elr_el[OEMU_EL3]);
+  EXPECT_EQ(0x9004U, sr.elr_el[OEMU_EL3]);  // past the svc: a taken call is not re-run
   EXPECT_EQ(BootPstate(OEMU_EL3), sr.spsr_el[OEMU_EL3]);
   EXPECT_EQ(0x2000U, sr.sp_el[OEMU_EL3]);
 }
@@ -273,7 +276,9 @@ TEST_F(ExcTest, EretRestoresTheInterruptedWorld) {
 
   oemu_exc_eret(&regs_, &sr_);
 
-  EXPECT_EQ(0x1000U, regs_.pc);  // ELR_EL1
+  // The round trip has to land on the instruction *after* the trap: this is the
+  // contract that makes a system call return rather than re-issue itself.
+  EXPECT_EQ(0x1004U, regs_.pc);  // ELR_EL1
   EXPECT_EQ(boot_pstate, sr_.pstate);
   EXPECT_EQ(0x41000000U, regs_.sp);
   EXPECT_EQ(0U, sr_.pstate & OEMU_PSTATE_IL);
