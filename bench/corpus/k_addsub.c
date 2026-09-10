@@ -63,7 +63,12 @@ uint64_t oemu_k_addsub(uint64_t seed) {
     acc = sub_shifted(acc, (uint64_t)i * 8u + 1u);
 
     p.lo = acc;
-    p.hi = (uint64_t)(int64_t)-(int64_t)acc;
+    /* Parenthesised so no clang-format version has to guess whether this is a unary
+     * minus against a binary one: Ubuntu 24.04 ships clang-format 18, which
+     * splits the operators with spaces (and 21 rejects that), while the
+     * surrounding casts read one way to each of them. The expression is a
+     * sign-extended negation either way. */
+    p.hi = (uint64_t)(int64_t)(-(int64_t)acc);
     q.lo = (uint64_t)i ^ 0x1000000010000000ull;
     q.hi = acc >> 63u;
     acc = add128(p, q).lo;
