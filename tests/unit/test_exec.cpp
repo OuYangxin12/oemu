@@ -998,7 +998,7 @@ TEST_F(ExecTest, SysregRefusalsAndUnsupportedEncodings) {
   program({0xd518cc23U}); /* msr icc_eoir1_el1,x3 */
   oemu_regs_set_pc(&cpu_.regs, kText);
   EXPECT_EQ(step(), OEMU_ERR_UNSUPPORTED);
-  program({0x3dc00020U}); /* ldr q0,[x1]: a scalar SIMD load, still unsupported */
+  program({0x3d000000U}); /* str b0,[x0]: single-element vector store, refused */
   oemu_regs_set_pc(&cpu_.regs, kText);
   EXPECT_EQ(step(), OEMU_ERR_UNSUPPORTED);
   program({0xd53800a0U}); /* mrs x0,mpidr_el1 : an EL1 register */

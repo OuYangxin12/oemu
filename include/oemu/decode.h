@@ -202,9 +202,14 @@ typedef enum oemu_opcode {
   OEMU_OP_MSR,
   OEMU_OP_MSR_IMM, /* MSR (immediate): SPSel/DAIF/PAN/DIT/SSBS/UAIR; insn.uimm
                     * holds the op2 register select, insn.imm the 4-bit value */
-  OEMU_OP_SYS      /* SYS/SYSL (DC/IC/TLBI/AT...): insn.sysreg names the operation,
+  OEMU_OP_SYS,     /* SYS/SYSL (DC/IC/TLBI/AT...): insn.sysreg names the operation,
                     * decoded so the executor can distinguish it from Undefined
                     * encoding space; M3 wires the data-management ones */
+  OEMU_OP_VEC_DUP  /* DUP (general): duplicate the byte insn.uimm selects from
+                    * GPR insn.rm into every byte of Vd. The one AdvSIMD
+                    * instruction the v8.0 baseline guarantees and glibc's
+                    * memset needs; see decode_vec_dup. insn.is_vector names
+                    * the Vd destination */
 } oemu_opcode;
 
 /*

@@ -1,8 +1,9 @@
 # 任务卡：M5 — initrd + busybox shell（终点门）
 
-> 状态：进行中——内核态已打通到 `Run /init`（issue #26 的 initramfs populate 崩溃已修，
-> `fa6fc54`）；用户态卡在 issue #27（LDTR/STTR 未实现）。依据：`roadmap-linux-boot.md`
-> M5 验收门 = 完整复现 `docs/linux-minimal-qemu.md` 的验收输出。
+> 状态：完成——issue #26（initramfs populate，`fa6fc54`）与 #27（LDTR/STTR，`e3bd58a`）
+> 均已修复并关闭；M5 门（手写 `/init` fixture）PASS（`docs/roadmap-linux-boot.md` §5，
+> 17 s）。busybox 复验的结论见 `docs/task-cards/m5-closeout.md` 与 issue #30。
+> 依据：`roadmap-linux-boot.md` M5 验收门 = 完整复现 `docs/linux-minimal-qemu.md` 的验收输出。
 
 ## 范围
 

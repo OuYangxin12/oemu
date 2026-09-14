@@ -1,8 +1,9 @@
 # Roadmap: from user-mode interpreter to full-system emulator
 
-Status: approved plan, 2025. This document is the committed form of the
-roadmap; phases are merged in order and each ends green under
-`make test` and `make asan`.
+Status: M1–M5 merged, 2026-09. The boot gate (`scripts/boot-linux-gate.sh`)
+is green on the hand-written `/init` fixture; the busybox re-check is filed
+as issue #30 with its measured boundary. Phases merged in order, each ended
+green under `make test` and `make asan`.
 
 ## End goal
 

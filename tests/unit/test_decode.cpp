@@ -919,7 +919,18 @@ TEST(DecodeScope, RejectsSimdAsUnsupported) {
 
 TEST(DecodeScope, RejectsSimdLoadStoreAsUnsupported) {
   oemu_insn insn{};
-  EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_decode(0x3d800020U, kPc, &insn));  // str q0, [x1]
+  // Single-element vector accesses stay outside the subset...
+  EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_decode(0x3d000000U, kPc, &insn));  // str b0, [x0]
+  EXPECT_EQ(OEMU_ERR_UNSUPPORTED, oemu_decode(0xfd000000U, kPc, &insn));  // str d0, [x0]
+  // ...while the 16-byte Q form now decodes: glibc's memset stores with it,
+  // and refusing it killed init. See decode_ldst_vector.
+  const oemu_insn stq = DecodeOk(0x3d800020U);  // str q0, [x1]
+  EXPECT_EQ(OEMU_OP_STR, stq.op);
+  EXPECT_TRUE(stq.is_vector);
+  EXPECT_EQ(OEMU_MEM_128, stq.mem_size);
+  const oemu_insn ldq = DecodeOk(0x3dc00020U);  // ldr q0, [x1]
+  EXPECT_EQ(OEMU_OP_LDR, ldq.op);
+  EXPECT_TRUE(ldq.is_vector);
 }
 
 TEST(DecodeException, DecodesEretHvcAndSmc) {

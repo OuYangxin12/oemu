@@ -51,6 +51,41 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
 
+  # L2/L3: the cross toolchain turns the guest suite from silent skips into
+  # real assertions (roadmap M4b: "CI ... gains a `guest` job installing
+  # gcc-aarch64-linux-gnu"), and the boot gate replays the oracle's markers
+  # whenever a kernel Image is on hand. The roadmap's standing assumption is
+  # that images stay out of the tree, so the gate skips cleanly rather than
+  # failing -- a skip that names why is honest; a green that hides a skip is not.
+  guest:
+    name: guest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libgtest-dev libgmock-dev gcc-aarch64-linux-gnu
+
+      - name: Configure
+        run: cmake --preset debug
+
+      - name: Build
+        run: cmake --build build/debug --parallel
+
+      - name: "L2 guest tests (real run: the cross pair above is why this job exists)"
+        run: ctest --preset debug -L guest --output-on-failure
+
+      - name: L3 Linux boot gate (skips cleanly when the Image is absent)
+        run: |
+          if [ -f guest/build/Image ]; then
+            scripts/boot-linux-gate.sh
+          else
+            echo "skipped: guest/build/Image is not on the runner (kernel images stay out of the tree)"
+          fi
+
   coverage:
     name: coverage
     runs-on: ubuntu-24.04

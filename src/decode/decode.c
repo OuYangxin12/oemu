@@ -1213,6 +1213,102 @@ static oemu_status decode_ldst_reg_offset(uint32_t word, oemu_insn *insn) {
  * of FPCR/FPSR, and Linux 6.6 runs them on every return to and switch out of
  * userspace. Refusing them costs the boot its first init.
  */
+/*
+ * DUP (general): fixed bits (word & 0xBFFFFC00) == 0x0E010C00, leaving Q at
+ * bit 30 and Rn (the source GPR) at [9:5], Rd (the destination V) at [4:0].
+ * The mask/value pair is not transcribed from a table but *derived*: every
+ * legal DUP (general) the cross assembler (guest/toolchain binutils 2.46,
+ * the oracle) emits agrees on exactly those bits, and every near neighbour
+ * that must stay refused -- DUP (indexed), INS, SMOV/UMOV, the 3d800020
+ * vector store the DecodeScope test pins, even FADD -- differs inside the
+ * mask.
+ *
+ * Semantics (ARM ARM C6.2.101, the one AdvSIMD instruction FEAT_AdvSIMD --
+ * mandatory at the v8.0 baseline -- puts inside reach of every guest): each
+ * byte of the *entire* 64-bit GPR is copied to the same-numbered byte of the
+ * vector; the upper half of a .16b destination, and of any destination after
+ * a .8b write, is zeroed. No arithmetic, no lanes: the whole operation is
+ * `Vd[63:0] = Xn; Vd[127:64] = 0`.
+ *
+ * This single instruction is what stood between oemu and a busybox boot:
+ * glibc 2.39's aarch64 memset/memcpy ifunc implementations open with
+ * `dup v0.16b, w1` (0x4E010C20), and PID 1 -- init, running that memset
+ * inside its first libc calls -- took SIGILL for it, while QEMU's
+ * cortex-a53 ran it happily. See docs/booting-linux.md.
+ */
+static oemu_status decode_vec_dup(uint32_t word, oemu_insn *insn) {
+  insn->op = OEMU_OP_VEC_DUP;
+  insn->rd = field_rd(word);
+  insn->rm = field_rn(word);             /* the GPR source sits in Rn, not Rm */
+  insn->operand_kind = OEMU_OPERAND_REG; /* rm identifies the single source */
+  insn->is_vector = true;
+  insn->mem_size = (BIT(word, 30) != 0U) ? OEMU_MEM_128 : OEMU_MEM_DWORD;
+  return OEMU_OK; /* the .8b and .16b forms execute identically: hi always clears */
+}
+
+/*
+ * Single vector register (16 bytes) against memory: the three addressing
+ * forms glibc's memset/memcpy move their 128-bit payloads with, and nothing
+ * narrower -- a 16-byte transfer is the only vector access this subset
+ * claims, because it is the only one the guest path executes. The b/h/s/d
+ * single-element forms (encodings with bits[31:30] != 00) stay refused.
+ *
+ * Fixed shape (bit 26 set, so we are in the SIMD&FP load/store half):
+ * bits[29:28] == 3, bits[31:30] == 0, bit 25 == 0. The element size is the
+ * three-bit field {bits[31:30], bit23}: 000 B, 010 H, 100 S, 110 D, 001 Q.
+ * Only Q is claimed. bit 24 splits the families: 1 = unsigned immediate
+ * (imm10 at bits[21:12], offset = imm10 * 16), 0 = the unscaled family
+ * selected by bits[11:10] (0 LDUR/STUR, 1 post-index,
+ * 3 pre-index; 2 is the unprivileged pair, refused with the rest of the
+ * unprivileged space). bit 22 = L. Derived from, and re-checked against,
+ * the cross assembler: str q0,[x0] = 0x3D800000, ldr q7,[x21,#48] =
+ * 0x3DC00EA7, str q0,[x0],#16 = 0x3C810400, str q0,[x0,#16]! =
+ * 0x3C810C00.
+ */
+static oemu_status decode_ldst_vector(uint32_t word, oemu_insn *insn) {
+  /* The vector element size is the three-bit field {bits[31:30], bit23},
+   * measured against the cross assembler: B=000, H=010, S=100, D=110,
+   * Q=001. Only Q is claimed; a b/h/s/d transfer must not execute the
+   * 16-byte path. */
+  if ((BITS(word, 30, 2) != 0U) || (BIT(word, 23) == 0U)) {
+    return OEMU_ERR_UNSUPPORTED; /* size B, H, S or D: not this subset */
+  }
+  const bool is_load = BIT(word, 22) != 0U;
+  insn->op = is_load ? OEMU_OP_LDR : OEMU_OP_STR;
+  insn->is_vector = true;
+  insn->mem_size = OEMU_MEM_128;
+  insn->rd = field_rd(word);
+  insn->rn = field_rn(word);
+  insn->operand_kind = OEMU_OPERAND_MEM;
+  insn->rn_is_sp_form = true;
+  if (BIT(word, 24) != 0U) {
+    /* Unsigned immediate: imm10 at bits[21:12], the offset is imm10 * 16 --
+     * a multiple of 16 is structural, not a constraint to re-check.
+     * str q0,[x3,#16] = 0x3D800460 pins the field position. */
+    insn->index_mode = OEMU_INDEX_NONE;
+    insn->imm = (int64_t)BITS(word, 12, 10) << 4;
+    insn->uimm = (uint64_t)insn->imm;
+    return OEMU_OK;
+  }
+  switch (BITS(word, 10, 2)) {
+    case 0x0:
+      insn->index_mode = OEMU_INDEX_NONE; /* LDUR/STUR */
+      break;
+    case 0x1:
+      insn->index_mode = OEMU_INDEX_POST;
+      break;
+    case 0x3:
+      insn->index_mode = OEMU_INDEX_PRE;
+      break;
+    default:
+      return OEMU_ERR_UNSUPPORTED; /* form 2: unprivileged, not modelled */
+  }
+  /* The 9-bit immediate is signed and never scaled. */
+  insn->imm = oemu_decode_internal_sign_extend(BITS(word, 12, 9), 9U);
+  insn->uimm = (uint64_t)insn->imm;
+  return OEMU_OK;
+}
+
 static oemu_status decode_ldst_pair_vector(uint32_t word, oemu_insn *insn) {
   const uint32_t opc = BITS(word, 30, 2);
   const bool is_load = BIT(word, 22) != 0U;
@@ -1383,6 +1479,12 @@ static oemu_status decode_load_store(uint32_t word, uint64_t pc, oemu_insn *insn
    * emulated subset, and saying so keeps `ldr q0, [x0]` a clean refusal
    * rather than a mis-decoded general-register access. */
   if (BIT(word, 26) != 0U) {
+    /* Single 16-byte vector accesses (see decode_ldst_vector). Checked
+     * before the pair family: a one-register transfer also carries bit 26,
+     * and it is the form the guest's memset actually uses. */
+    if ((BITS(word, 28, 2) == 0x3U) && (BITS(word, 30, 2) == 0U) && (BITS(word, 25, 1) == 0U)) {
+      return decode_ldst_vector(word, insn);
+    }
     if ((op0 == 0x2U) && (BITS(word, 25, 1) == 0U)) {
       return decode_ldst_pair_vector(word, insn);
     }
@@ -1452,6 +1554,16 @@ oemu_status oemu_decode(uint32_t word, uint64_t pc, oemu_insn *out) {
       break;
     case 0x7: /* x111: SIMD and floating point */
     case 0xF:
+      /* The SIMD group is refused with one exception: DUP (general), fixed
+       * bits (word & 0xBFFFFC00) == 0x0E010C00. The group test here is on
+       * bits[28:25] only (op0, already extracted), so bit 29 -- where DUP
+       * differs from the vector-load encodings this group also holds -- is
+       * deliberately not filtered until the precise mask below. See
+       * decode_vec_dup for why this one instruction is on the guest's
+       * critical path. */
+      if (((word & 0xBFFFFC00U) == 0x0E010C00U)) {
+        return decode_vec_dup(word, out);
+      }
       status = OEMU_ERR_UNSUPPORTED;
       break;
     default:
@@ -1470,6 +1582,8 @@ oemu_status oemu_decode(uint32_t word, uint64_t pc, oemu_insn *out) {
 
 const char *oemu_opcode_name(oemu_opcode op) {
   switch (op) {
+    case OEMU_OP_VEC_DUP:
+      return "dup";
     case OEMU_OP_UNKNOWN:
       return "unknown";
     case OEMU_OP_ADD:
