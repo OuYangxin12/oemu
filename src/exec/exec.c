@@ -820,6 +820,50 @@ static oemu_status do_pair_vector(oemu_cpu *cpu, const oemu_memops *mem, const o
   return OEMU_OK;
 }
 
+/*
+ * STR/LDR of a single 16-byte vector register: the same two-piece move
+ * do_pair_vector makes per register -- validated fully before either half
+ * commits, so an abort leaves the register file, the base register and the
+ * memory as if the access had not been attempted, and a narrower-looking
+ * first half never appears alone.
+ */
+static oemu_status do_single_vector(oemu_cpu *cpu, const oemu_memops *mem,
+                                    const oemu_insn *in) {
+  const bool is_store = (in->op == OEMU_OP_STR);
+  const uint32_t perm = is_store ? OEMU_PERM_WRITE : OEMU_PERM_READ;
+  uint64_t addr = 0U;
+  uint64_t writeback = 0U;
+  (void)resolve_mem_addr(cpu, in, &addr, &writeback);
+
+  for (unsigned p = 0U; p < 2U; p++) {
+    if (mem->validate(mem->ctx, addr + ((uint64_t)p * 8U), 8U, perm) != OEMU_OK) {
+      return OEMU_ERR_FAULT;
+    }
+  }
+
+  uint64_t lo = 0U;
+  uint64_t hi = 0U;
+  if (is_store) {
+    lo = cpu->v[in->rd][0];
+    hi = cpu->v[in->rd][1];
+    access_or_panic(mem->write(mem->ctx, addr, OEMU_MEM_DWORD, lo));
+    access_or_panic(mem->write(mem->ctx, addr + 8U, OEMU_MEM_DWORD, hi));
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr, 8U, lo);
+    oemu_tr_rec(2U, oemu_regs_pc(&cpu->regs), addr + 8U, 8U, hi);
+  } else {
+    access_or_panic(mem->read(mem->ctx, addr, OEMU_MEM_DWORD, false, &lo));
+    access_or_panic(mem->read(mem->ctx, addr + 8U, OEMU_MEM_DWORD, false, &hi));
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr, 8U, lo);
+    oemu_tr_rec(1U, oemu_regs_pc(&cpu->regs), addr + 8U, 8U, hi);
+    cpu->v[in->rd][0] = lo;
+    cpu->v[in->rd][1] = hi;
+  }
+  if (in->index_mode != OEMU_INDEX_NONE) {
+    write_g(cpu, in->rn, true, OEMU_REG_W64, writeback);
+  }
+  return OEMU_OK;
+}
+
 static oemu_status do_single_mem(oemu_cpu *cpu, const oemu_memops *mem, const oemu_insn *in) {
   const bool is_store = (in->op == OEMU_OP_STR || in->op == OEMU_OP_STLR);
   const oemu_mem_size size = in->mem_size;
@@ -1791,6 +1835,8 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
 
     case OEMU_OP_LDR:
     case OEMU_OP_STR:
+      st = in->is_vector ? do_single_vector(cpu, mem, in) : do_single_mem(cpu, mem, in);
+      break;
     case OEMU_OP_LDRS:
     case OEMU_OP_LDAR:
     case OEMU_OP_STLR:
@@ -1825,6 +1871,15 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       /* A guest-initiated trap stops the run exactly like a fault. */
       st = OEMU_ERR_FAULT;
       break;
+    case OEMU_OP_VEC_DUP: {
+      /* DUP (general): Vd[63:0] = Xn, Vd[127:64] = 0 -- every byte of the
+       * GPR to the same-numbered byte lane, upper half cleared, both .8b
+       * and .16b spellings identical. See decode_vec_dup: this is glibc's
+       * memset prologue, and the reason the first busybox init SIGILLed. */
+      cpu->v[in->rd][0] = read_g(cpu, in->rm, false, OEMU_REG_W64);
+      cpu->v[in->rd][1] = UINT64_C(0);
+      break;
+    }
     case OEMU_OP_NOP:
     case OEMU_OP_HINT:
     case OEMU_OP_WFI:
@@ -1838,12 +1893,11 @@ oemu_status oemu_exec_internal_dispatch_bus(oemu_cpu *cpu, const oemu_memops *me
       st = do_mrs(cpu, NULL, in);
       break;
     case OEMU_OP_MSR:
-      st = do_msr(cpu, NULL, in);
-      break;
+    /* MSR (immediate) shares the fall-through: with no system-register table
+     * in hand, do_msr's refusal answers both the same way. System mode
+     * intercepts both opcodes before the shared switch. */
     case OEMU_OP_MSR_IMM:
-      /* The user-mode subset does not touch privileged mode bits; system mode
-       * intercepts this before the shared switch. */
-      st = OEMU_ERR_UNSUPPORTED;
+      st = do_msr(cpu, NULL, in);
       break;
 
     default:

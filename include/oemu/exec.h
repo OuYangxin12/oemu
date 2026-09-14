@@ -57,11 +57,11 @@ typedef struct oemu_cpu {
    * system_supports_fpsimd() is ARM64_HAS_NO_FPSIMD, a capability no CPU
    * feature ever sets in this tree. So the register file has to exist before
    * an /init can run, whatever the ID registers claim.
-   *
-   * No FP arithmetic is modelled, and none is needed to boot the guest we
-   * boot: the kernel touches the state only as opaque 512 bytes, and our
-   * /init is compiled without SIMD. Feature registers still say no SIMD;
-   * running a NEON-using binary remains the M6 horizon item.
+   * No FP arithmetic is modelled. The one vector instruction the v8.0
+   * baseline guarantees and a real initramfs needs is DUP (general) --
+   * glibc's aarch64 memset prologue is `dup v0.16b, w1` -- and that one is
+   * executed (OEMU_OP_VEC_DUP). Full NEON/FP arithmetic remains the M6
+   * horizon item; the feature registers still say no SIMD.
    */
   uint64_t v[32][2];
 } oemu_cpu;
