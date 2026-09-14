@@ -175,12 +175,11 @@ fi
 if [ $failed -ne 0 ]; then
   tail -n 12 "$log" | sed 's/^/    | /' >&2
   if [ "$allow_blocked" -eq 1 ]; then
-    # #28 is an open oemu-side defect on this exact path (a synchronous abort
-    # taken against a context whose stack lands on the guest's own page
-    # table). Until it is fixed the gate is expected to be red; --allow-blocked
-    # turns that one specific failure into a skip so CI can run the gate
-    # without pretending it passed.
-    echo "boot-linux-gate: SKIPPED as known-blocked (see issue #28); log kept at $log" >&2
+    # --allow-blocked was the workaround for issue #28, a synchronous abort on
+    # this path that is now fixed (d600158) and closed; the gate runs red or
+    # green. The flag survives as the documented escape hatch for exactly the
+    # failure it was born for: any red turns into exit 3 (skip, never pass).
+    echo "boot-linux-gate: SKIPPED as blocked (issue #28 was fixed in d600158; a red now means a new defect); log kept at $log" >&2
     rm -f "$fifo"
     exit 3
   fi

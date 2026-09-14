@@ -8,9 +8,11 @@ with two modes over the same decode/exec engine:
   regression facade as the system stack grows underneath it.
 - **`oemu boot`** — full-system mode: a `virt`-like machine that raises the
   shared engine through exception levels, an MMU and real devices, ending with
-  a booted Linux. Under development; the committed plan is
-  [`docs/roadmap-full-system.md`](docs/roadmap-full-system.md) (M1–M5, with M1
-  and the register/exception layers of M2 merged).
+  a booted Linux. M1–M5 are merged: the `docs/linux-minimal-qemu.md` baseline
+  kernel boots to an interactive serial shell, and `make boot-linux` replays
+  the whole marker chain (`BOOT OK` → poweroff → PSCI SYSTEM_OFF → exit 0).
+  The committed plan is [`docs/roadmap-full-system.md`](docs/roadmap-full-system.md);
+  `--smp N`, FP/SIMD arithmetic and the JIT live on the M6 horizon.
 
 Production code is C11 with hidden visibility and no C++ dependency. Only the
 test translation units are C++17, linking against the C library through

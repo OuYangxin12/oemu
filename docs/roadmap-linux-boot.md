@@ -117,3 +117,8 @@ boot-linux-gate: PASS (markers: BOOT OK MINIMAL-BOOT-CHECK-PASSED SHELL_ALIVE; e
 `SHELL_ALIVE`，足以判定"提示符可交互 + 干净关机"。第 4 节风险表里"实证基线用静态
 busybox"那条还没在 oemu 上复验——换 busybox 只换 initramfs 的内容，门禁判据不变，
 所以记作 M5 的后续项，不算缺口。
+
+该后续项已于 2026-09-14 复验完毕（`docs/task-cards/m5-closeout.md`）：oracle
+全绿；oemu 侧踩到静态 glibc 的 FP/SIMD 算术墙，顺带修掉两个真实的 v8.0
+强制指令缺口（DUP general、16 字节向量存取，均有测试钉住）。边界记
+issue #30，busybox 夹具转为 M6 验收夹具——"M6 完成"自此等价于那条门转绿。

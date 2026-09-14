@@ -41,7 +41,7 @@ make boot-linux
     --max-insns 4000000000 -serial stdio
 ```
 
-## 当前状态：红（以下只记实测，不记解释）
+## 当前状态：红（以下只记实测，不记解释）〔历史存档：此红已由 #28 的修复 `d600158` 翻绿；M5 门自 2026-09-10 为绿。保留全文以存排查方法〕
 
 门禁不通过。原因不是脚本、判据或夹具，而是 oemu 侧一处尚未定位的机器级偏差。串口日志固定停在
 `CPU: All CPU(s) started at EL1`，`Run /init` 不出现；已确认非控制台丢字节（`tx_dropped` 恒 0，
@@ -132,6 +132,34 @@ init 返回 ⇒ `Kernel panic - not syncing: Attempted to kill init`——三个
 scripts/boot-linux-gate.sh
 boot-linux-gate: PASS (markers: BOOT OK MINIMAL-BOOT-CHECK-PASSED SHELL_ALIVE; exit: 0)
 ```
+
+## busybox 复验（M5 收尾）：踩到的墙与钉死的两块砖
+
+`scripts/build-busybox-initramfs.sh` 按 `linux-minimal-qemu.md` 的配方重建
+了基线的用户态（busybox 1.37.0 静态，`-fno-stack-protector
+-fno-tree-vectorize`——ID 寄存器宣告无 SIMD，编译就该按它编）。oracle 全绿：
+三标记 + `reboot: Power down` + exit 0（`guest/build/oracle-busybox.log`）。
+
+oemu 侧 `Run /init` 即 SIGILL。一次性 UNDEF 探针（打印 EL、指令字、PC，
+提交前已回退）量到的因果链：
+
+1. `dup v0.16b, w1`（`0x4E010C20`，DUP general）——glibc memset 的序言。
+   v8.0 强制指令（FEAT_AdvSIMD mandatory），QEMU 执行、oemu 拒 ⇒ oemu bug。
+   已实现（`OEMU_OP_VEC_DUP`；编码由交叉汇编器反推、与近邻无碰撞）。
+2. `str q0, [x0]`（`0x3D800000` 族）——同一条 memset 的存储形态。已实现
+   （`decode_ldst_vector`/`do_single_vector`；size 三字段 {31,30,23}：
+   Q=001，其余照拒）。
+3. 陷阱推进到 `0x46f890`：`movi v31.4s, #0`，glibc printf 机器室。反汇编
+   计数（fmov 508 / movi 223 / fmadd 203 / fadd 185 / fmul 172 / fsub 135 /
+   fcmpe 109 / fcvtzs 27 ……）说明剩下的不是寻指令，是 **FP 算术全家**：
+   舍入、次正规、NaN 传播、FPCR/FPSR——M6 的寄存器组与 FP 管线本身。
+   记 issue #30；busybox 夹具与 oracle 日志转为 **M6 验收夹具**："M6 完成"
+   从此有了客观含义：这条门转绿。默认门（手写 `/init`）不动，仍是 M5 判据。
+
+方法上的收获：编码不许抄记忆。本卡所有位型（DUP 的 `0xBFFFFC00/0x0E010C00`、
+向量 size 的 Q=001）都由 `aarch64-linux-gnu-as` 现场反推并做邻指令碰撞检查
+——第一次手推 DUP 位型连错两处（`BITS(29,4)` 越界、Q 值反了），oracle 一轮
+就纠了出来。
 
 ## 本轮把"沉默的零"变成可查的东西
 
