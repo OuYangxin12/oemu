@@ -4,6 +4,7 @@
 #
 # usage: scripts/qemu-oracle.sh <image.bin> <MARKER>... [--expect-exit N]
 #        [--timeout SEC] [--stdin STR] [--stdin-delay SEC]
+#        [--initrd PATH] [--append STR]
 #
 # The QEMU half of the L4 differential discipline (docs/verification-strategy.md):
 # QEMU is the oracle, so a guest's expected serial output is captured HERE
@@ -38,6 +39,8 @@ expect_exit=""
 timeout_sec=20
 stdin_text=""
 stdin_delay=0
+initrd=""
+append=""
 markers=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,6 +48,8 @@ while [ $# -gt 0 ]; do
     --timeout) timeout_sec=$2; shift 2 ;;
     --stdin) stdin_text=$2; shift 2 ;;
     --stdin-delay) stdin_delay=$2; shift 2 ;;
+    --initrd) initrd=$2; shift 2 ;;
+    --append) append=$2; shift 2 ;;
     -*) usage ;;
     *) markers+=("$1"); shift ;;
   esac
@@ -69,9 +74,17 @@ else
   : > "$feed" &
 fi
 
-"$qemu" -machine virt,virtualization=off -cpu cortex-a53 -m 256M \
-  -nographic \
-  -kernel "$image" < "$feed" > "$log" 2>&1 &
+# The initrd/append pair is what lets the oracle replay the busybox baseline of
+# docs/linux-minimal-qemu.md, not just a bare -kernel payload.
+qemu_args=(-machine virt,virtualization=off -cpu cortex-a53 -m 256M -nographic
+           -kernel "$image")
+if [ -n "$initrd" ]; then
+  [ -f "$initrd" ] || { echo "qemu-oracle: no such initrd: $initrd" >&2; exit 2; }
+  qemu_args+=(-initrd "$initrd")
+fi
+[ -n "$append" ] && qemu_args+=(-append "$append")
+
+"${qemu_args[@]}" < "$feed" > "$log" 2>&1 &
 qemu_pid=$!
 qemu_rc=timeout
 ( while kill -0 "$qemu_pid" 2>/dev/null; do sleep 0.2; done ) & watcher=$!
