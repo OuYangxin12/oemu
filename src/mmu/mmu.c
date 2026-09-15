@@ -796,6 +796,21 @@ static oemu_status mmu_validate(void *ctx, uint64_t va, uint64_t size, uint32_t 
   const oemu_el cur = oemu_pstate_el(mmu->sysregs->pstate);
   const bool is_fetch = (perms & OEMU_PERM_EXEC) != 0U;
   const bool is_write = (perms & OEMU_PERM_WRITE) != 0U;
+  /* Alignment, checked exactly as the access paths check it: an unaligned
+   * data access faults (Alignment fault, DFSC 0x21) when the SCTLR bits for
+   * this EL say SA, and read/write refuse it. A validate that answered "yes"
+   * to such an access while the matching read said "no" would turn a
+   * deliverable guest event -- the kernel's own alignment fixup runs on it --
+   * into a broken access-or-panic contract inside the executor, so the probe
+   * has to refuse first. The granularity is min(size, 8): scalar accesses
+   * require their own width, and the only wider probe that reaches here is a
+   * cache-management line (DC ZVA), which the architecture aligns at 8. */
+  if (!is_fetch && oemu_mmu_internal_alignment_required(mmu->sysregs, cur == OEMU_EL0)) {
+    const uint64_t align = (size <= 8U) ? size : 8U;
+    if ((va & (align - 1U)) != 0U) {
+      return refuse(mmu, cur, false, is_write, OEMU_MMU_FAULT_ALIGNMENT, -1, va);
+    }
+  }
   uint64_t off = 0U;
   while (off < size) {
     const uint64_t page_off = (va + off) & (MMU_PAGE_SIZE - 1U);

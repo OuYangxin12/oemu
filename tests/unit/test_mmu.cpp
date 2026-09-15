@@ -459,6 +459,26 @@ TEST_F(MmuTest, AlignmentPolicyFollowsSctlrA) {
   ASSERT_EQ(view_.read(view_.ctx, kRam + 1U, OEMU_MEM_WORD, false, &v), OEMU_OK);
 }
 
+TEST_F(MmuTest, ValidateMirrorsTheAlignmentRefusal) {
+  /* The executor validates and then accesses, and trusts that a passed
+   * validate cannot meet a refused access -- that trust is what lets
+   * access_or_panic call a refusal a bug. So the alignment verdict has to be
+   * the validate's too, or a guest whose kernel fixes up unaligned accesses
+   * (the normal arrangement) dies in an abort instead of a fixup. */
+  l1_block(kL1, kRam, kRam, 0U);
+  write_u64(kRam, 0U);
+  sr_.sctlr_el1 = kSctlrM | kSctlrA;
+  ASSERT_EQ(view_.validate(view_.ctx, kRam + 1U, 4U, OEMU_PERM_READ), OEMU_ERR_FAULT);
+  EXPECT_EQ(pending_esr(), EcBase(OEMU_EXC_EC_DABORT_SAME) | kIlBit | kAlign);
+  /* aligned: the probe stays silent and the access path serves it */
+  ASSERT_EQ(view_.validate(view_.ctx, kRam + 8U, 4U, OEMU_PERM_WRITE), OEMU_OK);
+  /* policy off: validate again answers yes, and the split path serves it */
+  sr_.sctlr_el1 = kSctlrM;
+  ASSERT_EQ(view_.validate(view_.ctx, kRam + 1U, 4U, OEMU_PERM_READ), OEMU_OK);
+  uint64_t v = 0U;
+  ASSERT_EQ(view_.read(view_.ctx, kRam + 1U, OEMU_MEM_WORD, false, &v), OEMU_OK);
+}
+
 TEST_F(MmuTest, El0AlignmentFollowsSa0) {
   l1_block(kL1, kRam, kRam, kAp1);
   write_u64(kRam, 0U);
